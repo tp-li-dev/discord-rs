@@ -50,6 +50,7 @@ async fn independent_commands_manage_a_persistent_core() {
         if runtime.join("core.json").exists() {
             break;
         }
+
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let output = cli(&runtime, port, "status").await;
@@ -98,4 +99,36 @@ async fn independent_commands_manage_a_persistent_core() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("fixture cleanup failed");
+}
+
+#[tokio::test]
+async fn botctl_accepts_target_syntax_and_exposes_new_commands() {
+    let help = Command::new(env!("CARGO_BIN_EXE_botctl"))
+        .output()
+        .await
+        .unwrap();
+    assert!(help.status.success());
+    let help_text = String::from_utf8_lossy(&help.stdout);
+    assert!(help_text.contains("rollback"));
+    assert!(help_text.contains("doctor"));
+
+    let runtime = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target-codex-verify")
+        .join(format!("botctl-cli-test-{}", std::process::id()));
+    std::fs::create_dir_all(&runtime).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let doctor = Command::new(env!("CARGO_BIN_EXE_botctl"))
+        .arg("doctor")
+        .arg("mybot")
+        .env("DISCORD_CORE_DIR", &runtime)
+        .env("DISCORD_CORE_PORT", port.to_string())
+        .output()
+        .await
+        .unwrap();
+    assert!(!doctor.status.success());
+    assert!(!String::from_utf8_lossy(&doctor.stderr).contains("引数が多すぎます"));
+    std::fs::remove_dir_all(runtime).unwrap();
 }

@@ -203,10 +203,22 @@ async fn core(binary: PathBuf) -> Result<(), ErrorBox> {
         let mut exit = false;
         let action: Result<String, ErrorBox> = async {
             match input.command.as_str() {
-                "status" => Ok(format!("{}\n直近のエラー: {}\n自動再起動: {}/3\nログ: {}", match &bot {
-                    Some(process) => format!("コア: 稼働中 (PID: {})\nBotプロセス: 稼働中 (PID: {})\nDiscord接続: Botのログで確認してください", std::process::id(), process.id().unwrap_or_default()),
-                    None => format!("コア: 稼働中 (PID: {})\nBotプロセス: 停止中", std::process::id()),
-                }, last_failure.as_deref().unwrap_or("なし"), failures, runtime_dir().join("core.log").display())),
+                "status" | "doctor" => {
+                    let status = format!("{}\n直近のエラー: {}\n自動再起動: {}/3\nログ: {}", match &bot {
+                        Some(process) => format!("コア: 稼働中 (PID: {})\nBotプロセス: 稼働中 (PID: {})\nDiscord接続: Botのログで確認してください", std::process::id(), process.id().unwrap_or_default()),
+                        None => format!("コア: 稼働中 (PID: {})\nBotプロセス: 停止中", std::process::id()),
+                    }, last_failure.as_deref().unwrap_or("なし"), failures, runtime_dir().join("core.log").display());
+                    if input.command == "doctor" {
+                        Ok(format!(
+                            "{status}\n診断:\n- runtime_dir: {}\n- worker_file: {}\n- core_port: {}",
+                            runtime_dir().display(),
+                            src::worker::worker_file().display(),
+                            port()?
+                        ))
+                    } else {
+                        Ok(status)
+                    }
+                }
                 "start" => {
                     if bot.is_some() { return Ok("Botは既に稼働中です".into()); }
                     let process = spawn_bot(&binary)?;
@@ -230,6 +242,7 @@ async fn core(binary: PathBuf) -> Result<(), ErrorBox> {
                     if !output.status.success() { return Err(format!("更新できませんでした。コアのログを確認してください。{stderr}").into()); }
                     Ok(stdout.trim().to_owned())
                 }
+                "rollback" => Err("rollback は未実装です。今後のCore世代管理で対応予定です".into()),
                 "shutdown" => { desired_running = false; stop_bot(&mut bot).await?; exit = true; Ok("Botとコアを停止しました。メモリ内の状態は失われます。".into()) }
                 _ => Err("不明なコマンドです".into()),
             }
@@ -283,18 +296,35 @@ fn launch_core(path: &Path) -> Result<(), ErrorBox> {
     command.spawn()?;
     Ok(())
 }
+
+fn cli_name() -> String {
+    env::args_os()
+        .next()
+        .and_then(|value| PathBuf::from(value).file_stem().map(|v| v.to_owned()))
+        .and_then(|value| value.to_str().map(|v| v.to_owned()))
+        .unwrap_or_else(|| "manage".to_owned())
+}
+
+fn print_target(target: Option<&str>) {
+    if let Some(name) = target {
+        println!("対象Bot: {name}（現在は単一Bot管理のため同一インスタンスに適用します）");
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), ErrorBox> {
     let args: Vec<_> = env::args_os().skip(1).collect();
     let command = args.first().and_then(|s| s.to_str()).unwrap_or("help");
+    let target = args.get(1).and_then(|s| s.to_str());
     if command == "__core" {
         return core(args.get(1).ok_or("missing executable")?.into()).await;
     }
-    if args.len() > 1 {
+    if args.len() > 2 {
         return Err("引数が多すぎます".into());
     }
     match command {
         "start" => {
+            print_target(target);
             if request("status").await.is_ok() {
                 println!("{}", request("start").await?);
                 return Ok(());
@@ -316,16 +346,20 @@ async fn main() -> Result<(), ErrorBox> {
             }
             Err("コアの起動を確認できません。src/core-runtime/core.log を確認してください".into())
         }
-        "status" | "stop" | "restart" | "update" | "shutdown" => match request(command).await {
-            Ok(message) => {
-                println!("{message}");
-                Ok(())
+        "status" | "stop" | "restart" | "update" | "rollback" | "doctor" | "shutdown" => {
+            print_target(target);
+            match request(command).await {
+                Ok(message) => {
+                    println!("{message}");
+                    Ok(())
+                }
+                Err(error) => {
+                    Err(format!("コアに接続できないか、コマンドが失敗しました: {error}").into())
+                }
             }
-            Err(error) => {
-                Err(format!("コアに接続できないか、コマンドが失敗しました: {error}").into())
-            }
-        },
+        }
         "logs" => {
+            print_target(target);
             print!(
                 "{}",
                 tokio::fs::read_to_string(runtime_dir().join("core.log")).await?
@@ -333,8 +367,9 @@ async fn main() -> Result<(), ErrorBox> {
             Ok(())
         }
         _ => {
+            let name = cli_name();
             println!(
-                "使い方: cargo run --bin manage -- <start|status|stop|restart|update|logs|shutdown>"
+                "使い方: {name} <start|status|stop|restart|update|rollback|doctor|logs|shutdown> [bot_name_or_id]"
             );
             Ok(())
         }

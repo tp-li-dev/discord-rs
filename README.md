@@ -7,28 +7,30 @@
 ```powershell
 cd "D:\data-backup\code\コード保存\discord-rs\src"
 $env:DISCORD_TOKEN = 'Botのトークン'
-cargo run --bin manage -- start
+cargo run --bin botctl -- start
 ```
 
 コマンド実行後は端末に戻り、コアとBotは裏で動き続けます。以後は別の端末からでも同じフォルダで次を実行できます。
 
 ```powershell
-cargo run --bin manage -- status
-cargo run --bin manage -- update
-cargo run --bin manage -- logs
-cargo run --bin manage -- stop
-cargo run --bin manage -- start
-cargo run --bin manage -- restart
-cargo run --bin manage -- shutdown
+cargo run --bin botctl -- status
+cargo run --bin botctl -- doctor
+cargo run --bin botctl -- update
+cargo run --bin botctl -- logs
+cargo run --bin botctl -- stop
+cargo run --bin botctl -- start
+cargo run --bin botctl -- restart
+cargo run --bin botctl -- rollback
+cargo run --bin botctl -- shutdown
 ```
 
-`stop` はBotだけを止め、コアは維持します。`shutdown` は両方を終了します。`stop`・`restart`・`shutdown` は親を停止するため、メモリ内のジョブや状態は消えます。`restart` は現在の親バイナリを再起動し、コードの再ビルドはしません。`status` はプロセスの生存確認と直近の異常終了を表示しますが、Discordへの接続成功を保証しません。ログは `src/core-runtime/core.log` に記録されます。Botが異常終了した場合、コアは最大3回自動再起動を試し、60秒の安定稼働後に回数をリセットします。
+`stop` はBotだけを止め、コアは維持します。`shutdown` は両方を終了します。`stop`・`restart`・`shutdown` は親を停止するため、メモリ内のジョブや状態は消えます。`restart` は現在の親バイナリを再起動し、コードの再ビルドはしません。`status` はプロセスの生存確認と直近の異常終了を表示しますが、Discordへの接続成功を保証しません。`doctor` は `status` に加えてランタイムディレクトリ、Worker指定ファイル、コアポートを表示します。`rollback` は現時点では未実装です。ログは `src/core-runtime/core.log` に記録されます。Botが異常終了した場合、コアは最大3回自動再起動を試し、60秒の安定稼働後に回数をリセットします。
 
 現在のコアは管理要求を直列で処理するため、`update` のビルド中は `status` などの他の管理要求とBotの異常終了監視が待機します。Botの通常処理自体は別プロセスで続きます。
 
 ## 更新
 
-Botを起動したまま、例えば `src/cogs/general.rs` の `!ping` の応答を変更し、`cargo run --bin manage -- update` を実行します。Workerの更新コマンドを直接使う場合は次を実行します。
+Botを起動したまま、例えば `src/cogs/general.rs` の `!ping` の応答を変更し、`cargo run --bin botctl -- update` を実行します。Workerの更新コマンドを直接使う場合は次を実行します。
 
 ```powershell
 cd "D:\data-backup\code\コード保存\discord-rs\src"
