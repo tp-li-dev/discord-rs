@@ -1,4 +1,4 @@
-﻿use bot_framework::{component, modal, BotResult, interactions::InteractionContext};
+﻿use bot_framework::{component, modal};
 #[component(namespace = "app", name = "x")]
 async fn missing(_: InteractionContext<'_>) -> BotResult<()> { Ok(()) }
 #[modal(namespace = "app", name = "x", version = 0)]
