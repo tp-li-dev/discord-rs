@@ -27,3 +27,7 @@ rmp-serde = "1"
 [[bench]]
 name = "ipc_codec"
 harness = false
+
+[[bench]]
+name = "ipc_roundtrip"
+harness = false
