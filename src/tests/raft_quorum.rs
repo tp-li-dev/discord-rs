@@ -20,7 +20,9 @@ use std::{
 };
 use tokio::time::{Instant, sleep};
 
-const WAIT: Duration = Duration::from_secs(15);
+// Shared Windows runners can pause durable I/O and Raft tasks for seconds.
+// These are upper bounds for condition waits, not fixed stabilization sleeps.
+const WAIT: Duration = Duration::from_secs(60);
 const TTL: Duration = Duration::from_secs(10);
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
 
@@ -62,14 +64,17 @@ fn options() -> NodeOptions {
     NodeOptions {
         allow_test_mode: true,
         enable_production: false,
-        write_timeout: Duration::from_secs(2),
+        write_timeout: Duration::from_secs(10),
         max_lease_ttl: Duration::from_secs(30),
         raft_config: Config {
             cluster_name: "raftq-durable-test".into(),
-            heartbeat_interval: 50,
-            election_timeout_min: 300,
-            election_timeout_max: 600,
+            heartbeat_interval: 100,
+            election_timeout_min: 1_000,
+            election_timeout_max: 2_000,
+            // The default is 200ms, including the follower's durable install.
+            install_snapshot_timeout: 10_000,
             snapshot_policy: SnapshotPolicy::Never,
+            // A manual snapshot may purge its entire prefix, even when small.
             max_in_snapshot_log_to_keep: 0,
             purge_batch_size: 1,
             replication_lag_threshold: 8,
@@ -582,10 +587,13 @@ async fn snapshot_catchup_and_restart_preserve_epoch_after_log_purge() {
     let leader = cluster.leader(&[1, 2, 3]).await;
     let lagging = members().into_iter().find(|id| *id != leader).unwrap();
     let majority: Vec<_> = members().into_iter().filter(|id| *id != lagging).collect();
-    cluster.nodes[&lagging].raft.runtime_config().elect(false);
-    for id in &majority {
-        cluster.transport.block(*id, lagging);
-    }
+    // Stop and await the follower before writing the missing prefix. Blocking
+    // a link alone does not revoke RPC handles already obtained by a sender.
+    // No delayed AppendEntries may supply these entries after they are purged.
+    let stopped = cluster.nodes[&lagging].clone();
+    cluster.stop(lagging).await;
+    let lagging_last = stopped.raft.metrics().borrow().last_log_index;
+    drop(stopped);
     let k = key(80, 0);
     for epoch in 0..8 {
         assert_eq!(
@@ -637,10 +645,39 @@ async fn snapshot_catchup_and_restart_preserve_epoch_after_log_purge() {
         .purged(Some(last), "snapshot-covered log purged")
         .await
         .unwrap();
-    cluster.transport.heal();
-    cluster.converged(&[1, 2, 3], &committed).await;
     assert!(
-        cluster.transport.snapshot_count() > 0,
+        lagging_last < Some(last.index),
+        "the stopped follower must be behind the purged prefix"
+    );
+    let snapshots_before = cluster.transport.snapshot_count();
+    cluster.start(lagging, StorageMode::Open).await;
+    cluster.nodes[&lagging].raft.runtime_config().elect(false);
+    cluster.nodes[&lagging]
+        .raft
+        .wait(Some(WAIT))
+        .snapshot(
+            last,
+            "lagging follower installed the purged prefix snapshot",
+        )
+        .await
+        .unwrap();
+    cluster.converged(&[1, 2, 3], &committed).await;
+    // install_full_snapshot makes durable state visible before its RPC reply
+    // returns and MemoryTransport increments the success counter. Convergence
+    // alone is therefore not a barrier for observing a completed snapshot RPC.
+    let deadline = Instant::now() + WAIT;
+    while cluster.transport.snapshot_count() == snapshots_before {
+        assert!(
+            Instant::now() < deadline,
+            "catchup must use a real OpenRaft snapshot RPC: before={snapshots_before}, \
+             leader={:?}, lagging={:?}",
+            cluster.nodes[&leader].raft.metrics().borrow().clone(),
+            cluster.nodes[&lagging].raft.metrics().borrow().clone(),
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        cluster.transport.snapshot_count() > snapshots_before,
         "catchup must use a real OpenRaft snapshot RPC"
     );
     cluster.stop_all().await;
