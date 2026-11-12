@@ -79,6 +79,47 @@ pub struct Hello {
     pub optional_capabilities: Vec<String>,
 }
 
+/// Deterministic, symmetric negotiation; this does not authenticate either peer.
+impl Hello {
+    pub fn negotiate(&self, peer: &Self) -> Result<(u16, Vec<String>), &'static str> {
+        if self.identity != peer.identity {
+            return Err("handshake identity mismatch");
+        }
+        let min = self.protocol_min.max(peer.protocol_min);
+        let max = self.protocol_max.min(peer.protocol_max);
+        if self.protocol_min > self.protocol_max
+            || peer.protocol_min > peer.protocol_max
+            || min > max
+        {
+            return Err("incompatible protocol range");
+        }
+        let supports = |hello: &Self, cap: &String| {
+            hello.required_capabilities.contains(cap) || hello.optional_capabilities.contains(cap)
+        };
+        if self
+            .required_capabilities
+            .iter()
+            .any(|cap| !supports(peer, cap))
+            || peer
+                .required_capabilities
+                .iter()
+                .any(|cap| !supports(self, cap))
+        {
+            return Err("unsupported required capability");
+        }
+        let mut capabilities: Vec<String> = self
+            .required_capabilities
+            .iter()
+            .chain(&self.optional_capabilities)
+            .filter(|cap| supports(peer, cap))
+            .cloned()
+            .collect();
+        capabilities.sort();
+        capabilities.dedup();
+        Ok((max, capabilities))
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Envelope {
     pub protocol_version: u16,
