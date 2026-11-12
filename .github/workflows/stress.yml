@@ -1,0 +1,153 @@
+name: Manual stress tests
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Ref to test (empty uses github.ref)'
+        required: false
+        type: string
+      repeat:
+        description: 'Iterations per OS (1-20)'
+        required: true
+        default: '5'
+        type: string
+      suite:
+        description: Test suite
+        required: true
+        default: all
+        type: choice
+        options: [update_load, raft, recovery, acl, all]
+permissions:
+  contents: read
+concurrency:
+  group: stress-${{ inputs.ref || github.ref }}-${{ inputs.suite }}
+  cancel-in-progress: false
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      iterations: ${{ steps.matrix.outputs.iterations }}
+      repeat: ${{ steps.matrix.outputs.repeat }}
+    steps:
+      - id: matrix
+        env:
+          REPEAT: ${{ inputs.repeat }}
+        run: |
+          python - <<'PY'
+          import json, os, re, sys
+          value = os.environ['REPEAT']
+          if not re.fullmatch(r'[0-9]+', value) or not 1 <= int(value) <= 20:
+              sys.exit('repeat must be an integer between 1 and 20')
+          count = int(value)
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              output.write(f'iterations={json.dumps(list(range(1, count + 1)))}\nrepeat={count}\n')
+          PY
+  stress:
+    needs: prepare
+    name: Stress (${{ matrix.os }}, iteration ${{ matrix.iteration }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        iteration: ${{ fromJSON(needs.prepare.outputs.iterations) }}
+    defaults:
+      run:
+        working-directory: src
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: dtolnay/rust-toolchain@1.90.0
+      - uses: Swatinem/rust-cache@v2.8.1
+        with:
+          workspaces: src -> target
+      - name: Run selected suites
+        shell: bash
+        env:
+          SUITE: ${{ inputs.suite }}
+        run: |
+          set -o pipefail
+          status=0
+          run_suite() {
+            local name="$1"
+            shift
+            if [[ "$SUITE" == all || "$SUITE" == "$name" ]]; then
+              echo "=== $name ===" | tee -a stress-output.log
+              "$@" 2>&1 | tee -a stress-output.log || status=1
+            fi
+          }
+          run_suite update_load cargo test -p src --test update_load -- --include-ignored --nocapture
+          run_suite raft cargo test -p src --test raft_quorum --test raft_cluster_runtime --test raft_lease_policy
+          run_suite recovery cargo test -p src --test botd_child_recovery --test child_recovery_processes --test daemon_recovery_wiring
+          run_suite acl cargo test -p src --test fs_perms --test fs_perms_path_api
+          exit "$status"
+      - name: Upload failure log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-log-${{ matrix.os }}-${{ matrix.iteration }}
+          path: src/stress-output.log
+          if-no-files-found: ignore
+      - name: Record iteration result
+        if: always()
+        shell: bash
+        working-directory: .
+        env:
+          RESULT: ${{ job.status }}
+          OS_NAME: ${{ matrix.os }}
+          ITERATION: ${{ matrix.iteration }}
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          path = Path(os.environ['RUNNER_TEMP']) / 'stress-result.json'
+          path.write_text(json.dumps({'os': os.environ['OS_NAME'], 'iteration': int(os.environ['ITERATION']), 'result': os.environ['RESULT']}), encoding='utf-8')
+          PY
+      - name: Upload iteration result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-result-${{ matrix.os }}-${{ matrix.iteration }}
+          path: ${{ runner.temp }}/stress-result.json
+          if-no-files-found: error
+  summary:
+    if: always()
+    needs: [prepare, stress]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download iteration results
+        if: needs.prepare.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: stress-result-*
+          path: results
+      - name: Summarize results
+        if: always()
+        env:
+          PREPARE_RESULT: ${{ needs.prepare.result }}
+          STRESS_RESULT: ${{ needs.stress.result }}
+          REPEAT: ${{ needs.prepare.outputs.repeat }}
+          SUITE: ${{ inputs.suite }}
+          TEST_REF: ${{ inputs.ref || github.ref }}
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          prepare, stress = os.environ['PREPARE_RESULT'], os.environ['STRESS_RESULT']
+          expected = int(os.environ['REPEAT'] or 0) * 2
+          results = [json.loads(p.read_text(encoding='utf-8')) for p in Path('results').glob('*/stress-result.json')]
+          passed = sum(r['result'] == 'success' for r in results)
+          failed = sum(r['result'] == 'failure' for r in results)
+          other = len(results) - passed - failed
+          missing = max(0, expected - len(results))
+          lines = ['## Stress test summary', f"- Ref: `{os.environ['TEST_REF']}`", f"- Suite: `{os.environ['SUITE']}`", f'- Expected: {expected}; passed: {passed}; failed: {failed}; other: {other}; missing: {missing}', f'- Prepare: {prepare}; matrix: {stress}', '', '| OS | Iteration | Result |', '| --- | ---: | --- |']
+          lines.extend(f"| {r['os']} | {r['iteration']} | {r['result']} |" for r in sorted(results, key=lambda r: (r['os'], r['iteration'])))
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
+              summary.write('\n'.join(lines) + '\n')
+          print('\n'.join(lines))
+          if prepare != 'success' or stress != 'success' or passed != expected or expected == 0:
+              raise SystemExit(1)
+          PY
