@@ -7,11 +7,28 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
-    name: ${{ matrix.os }}
+  fmt:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: src
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.90.0
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+  clippy:
+    name: Clippy (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -21,19 +38,96 @@ jobs:
         working-directory: src
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.90.0
         with:
-          components: rustfmt, clippy
-      - name: Check formatting
-        run: cargo fmt --all --check
+          components: clippy
+      - uses: Swatinem/rust-cache@v2.8.1
+        with:
+          workspaces: src -> target
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Build examples
-        run: cargo build --workspace --examples
-      # Prebuild dependencies outside the integration test's 240 second timeout.
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    defaults:
+      run:
+        working-directory: src
+    steps:
+      - uses: actions/checkout@v4
+      # trybuild compares rustc diagnostics with checked-in snapshots.
+      - uses: dtolnay/rust-toolchain@1.90.0
+      - uses: Swatinem/rust-cache@v2.8.1
+        with:
+          workspaces: src -> target
+      # Some integration tests launch Cargo offline, including on a cold runner.
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
       - name: Prepare reload build
-        run: cargo build --release --bin src --target-dir target/reload-build
-      # The reload integration test builds a release binary and launches real
-      # local worker processes. It does not require a Discord token.
+        run: cargo build --locked --release --bin src --target-dir target/reload-build
       - name: Test
-        run: cargo test --workspace
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked --workspace --no-fail-fast 2>&1 | tee test-output.log
+      - name: Upload test log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-log-${{ matrix.os }}
+          path: src/test-output.log
+          if-no-files-found: ignore
+
+  examples-doctor:
+    name: Examples and doctor
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: src
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.90.0
+      - uses: Swatinem/rust-cache@v2.8.1
+        with:
+          workspaces: src -> target
+      - name: Build examples
+        run: cargo build --locked --workspace --examples
+      - name: Check sample configuration
+        run: cargo run --locked --bin doctor -- examples/placement.toml --resolved-shards bot-two=1
+
+  stable:
+    name: Stable compatibility (allowed to fail)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    continue-on-error: true
+    defaults:
+      run:
+        working-directory: src
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.8.1
+        with:
+          workspaces: src -> target
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+      - name: Prepare reload build
+        run: cargo build --locked --release --bin src --target-dir target/reload-build
+      - name: Test
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked --workspace --no-fail-fast 2>&1 | tee test-output.log
+      - name: Upload test log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-log-stable-ubuntu
+          path: src/test-output.log
+          if-no-files-found: ignore
