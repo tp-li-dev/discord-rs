@@ -2,18 +2,14 @@
 //!
 //! `MemoryTransport` is a fault-injection transport, never an authenticated
 //! network. `AuthenticatedRpcAdapter` and `RpcEndpoint` define the bounded RPC
-//! layer that an mTLS byte channel must connect. They do not open sockets.
+//! layer connected by `tls_transport::raft_rpc::TlsRpcChannel` over real TCP.
 //!
-//! The existing `tls_transport::TlsTransport` exposes only the closed
-//! `cluster::ControlMessage` protocol. It cannot currently carry opaque Raft
-//! frames. Integration needs a separately versioned opaque-payload API (or a
-//! dedicated ALPN) that retains its certificate/node checks, membership allow
-//! list, frame bounds, connection bounds and I/O deadlines. Do not tunnel Raft
-//! through `TestOnly` messages or interpret a TLS queue-admission ACK as a Raft
-//! response. No concrete TLS channel is supplied here; real mTLS/hosts, certificate
-//! rotation, snapshot chunking and protocol upgrades remain unverified.
+//! `TlsTransport::bind_raft_rpc` opens a separate, versioned RPC listener sharing
+//! the transport's live credentials and certificate policy. RPC returns the
+//! actual OpenRaft result; the legacy control protocol's queue ACK is unrelated.
+//! Cross-host safety, snapshot chunking and protocol upgrades remain unverified.
 
-use super::{OwnershipData, Raft, TypeConfig};
+use super::{Command, Outcome, OwnershipData, Raft, TypeConfig};
 use openraft::error::{Fatal, RPCError, RaftError, ReplicationClosed, StreamingError, Unreachable};
 use openraft::network::{Backoff, RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
@@ -71,6 +67,23 @@ pub enum RpcRequest {
     Append(AppendEntriesRequest<TypeConfig>),
     Vote(VoteRequest<u64>),
     Snapshot(SnapshotRequest),
+    /// An authenticated cluster member may submit only its own commands.
+    /// The receiving node never forwards this request again.
+    Forward {
+        source: u64,
+        command: Command,
+    },
+}
+
+/// Only `NotLeader` permits following a new leader hint: OpenRaft rejected the
+/// submission or already discarded its conflicting, uncommitted log entry.
+/// Other failures can leave a committed write, so callers must not retry them
+/// automatically or start a new lease deadline.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ForwardResponse {
+    Applied(Outcome),
+    NotLeader { leader: Option<u64> },
+    OutcomeUnknown,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -78,6 +91,7 @@ pub enum RpcResponse {
     Append(AppendEntriesResponse<u64>),
     Vote(VoteResponse<u64>),
     Snapshot(SnapshotResponse<u64>),
+    Forward(ForwardResponse),
 }
 
 impl RpcRequest {
@@ -86,6 +100,10 @@ impl RpcRequest {
             Self::Append(r) => r.vote.leader_id.voted_for(),
             Self::Vote(r) => r.vote.leader_id.voted_for(),
             Self::Snapshot(r) => r.vote.leader_id.voted_for(),
+            Self::Forward { source, command } => {
+                let (owner, session) = command.identity();
+                (*source == owner && owner != 0 && session != [0; 16]).then_some(*source)
+            }
         }
     }
 
@@ -94,6 +112,7 @@ impl RpcRequest {
             Self::Append(_) => 0,
             Self::Vote(_) => 1,
             Self::Snapshot(_) => 2,
+            Self::Forward { .. } => 3,
         }
     }
 }
@@ -103,6 +122,7 @@ impl RpcResponse {
             Self::Append(_) => 0,
             Self::Vote(_) => 1,
             Self::Snapshot(_) => 2,
+            Self::Forward(_) => 3,
         }
     }
 }
@@ -247,6 +267,18 @@ async fn dispatch(raft: &Raft, request: RpcRequest) -> Result<RpcResponse, Trans
             .await
             .map(RpcResponse::Snapshot)
             .map_err(|_| TransportError::RemoteFailure),
+        RpcRequest::Forward { command, .. } => {
+            let response = match raft.client_write(command).await {
+                Ok(response) => ForwardResponse::Applied(response.data),
+                Err(error) => match error.forward_to_leader() {
+                    Some(hint) => ForwardResponse::NotLeader {
+                        leader: hint.leader_id,
+                    },
+                    None => ForwardResponse::OutcomeUnknown,
+                },
+            };
+            Ok(RpcResponse::Forward(response))
+        }
     }
 }
 
@@ -399,8 +431,8 @@ pub struct AuthenticatedFrame {
 /// profile, reject untrusted peers, enforce bounded reads *before allocating the
 /// received frame*, and return a complete RPC response rather than a queue ACK.
 /// A successful TLS session is not application authorization; scope and sender
-/// checks are also performed below. No existing `TlsTransport` implementation is
-/// supplied because its public API cannot carry opaque Raft frames.
+/// checks are also performed below. `tls_transport::raft_rpc::TlsRpcChannel`
+/// supplies this contract using the existing TLS certificate policy.
 pub trait AuthenticatedChannel: Send + Sync + 'static {
     fn local_node(&self) -> u64;
 
@@ -567,12 +599,19 @@ impl RaftRpcTransport for AuthenticatedRpcAdapter {
             if result.kind() != kind {
                 return Err(TransportError::InvalidFrame);
             }
+            if let RpcResponse::Forward(ForwardResponse::NotLeader {
+                leader: Some(leader),
+            }) = &result
+                && !self.scope.members.contains(leader)
+            {
+                return Err(TransportError::ScopeMismatch);
+            }
             Ok(result)
         })
     }
 }
 
-/// Server-side RPC dispatcher behind the future mTLS opaque-frame API.
+/// Server-side RPC dispatcher behind the mTLS opaque-frame API.
 /// Authenticate and bound reads in the channel before calling `handle`.
 pub struct RpcEndpoint {
     node: u64,
@@ -583,6 +622,10 @@ pub struct RpcEndpoint {
 }
 
 impl RpcEndpoint {
+    pub(crate) fn local_node(&self) -> u64 {
+        self.node
+    }
+
     pub fn new(
         node: u64,
         scope: RpcScope,
@@ -847,17 +890,18 @@ mod tests {
                     return std::future::pending().await;
                 }
                 let request: WireRequest = decode(&request, MAX_FRAME)?;
+                let response = if matches!(request.request, RpcRequest::Forward { .. }) {
+                    RpcResponse::Forward(ForwardResponse::NotLeader { leader: Some(3) })
+                } else {
+                    RpcResponse::Vote(VoteResponse::new(Vote::new(5, 1), None, true))
+                };
                 let mut reply = WireResponse {
                     version: request.version,
                     scope: request.scope,
                     from: target,
                     to: request.from,
                     nonce: request.nonce,
-                    result: Ok(RpcResponse::Vote(VoteResponse::new(
-                        Vote::new(5, 1),
-                        None,
-                        true,
-                    ))),
+                    result: Ok(response),
                 };
                 let mut peer = target;
                 match self.fault {
@@ -874,6 +918,11 @@ mod tests {
                             peer,
                             payload: vec![b' '; max_response_len + 1],
                         });
+                    }
+                    11 => {
+                        reply.result = Ok(RpcResponse::Forward(ForwardResponse::NotLeader {
+                            leader: Some(9),
+                        }));
                     }
                     _ => {}
                 }
@@ -966,6 +1015,109 @@ mod tests {
             );
         }
         assert_eq!(channel.calls.load(Ordering::SeqCst), 0);
+    }
+
+    fn forward(owner: u64, session: [u8; 16]) -> RpcRequest {
+        RpcRequest::Forward {
+            source: 1,
+            command: Command::Acquire {
+                key: super::super::ShardKey {
+                    bot_id: 42,
+                    shard_id: 7,
+                },
+                expected_epoch: 9,
+                owner,
+                session,
+            },
+        }
+    }
+
+    #[test]
+    fn forwarding_binds_owner_session_sender_scope_and_destination() {
+        let mut request = wire();
+        request.request = forward(1, [1; 16]);
+        let bytes = encode(&request, MAX_FRAME).unwrap();
+        let decoded: WireRequest = decode(&bytes, MAX_FRAME).unwrap();
+        assert_eq!(validate_request(&decoded, 1, 2, &scope()), Ok(()));
+        let RpcRequest::Forward { source, command } = decoded.request else {
+            panic!("wrong forwarding variant")
+        };
+        assert_eq!(source, 1);
+        assert_eq!(command.identity(), (1, [1; 16]));
+        for (peer, node) in [(3, 2), (1, 3), (1, 1), (9, 2)] {
+            assert_eq!(
+                validate_request(&request, peer, node, &scope()),
+                Err(TransportError::IdentityMismatch)
+            );
+        }
+        for (owner, session) in [(3, [1; 16]), (0, [1; 16]), (1, [0; 16])] {
+            request.request = forward(owner, session);
+            assert_eq!(
+                validate_request(&request, 1, 2, &scope()),
+                Err(TransportError::IdentityMismatch)
+            );
+        }
+        request.request = forward(1, [1; 16]);
+        request.scope.cluster_id = [8; 16];
+        assert_eq!(
+            validate_request(&request, 1, 2, &scope()),
+            Err(TransportError::ScopeMismatch)
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarding_spoof_is_rejected_before_channel_and_hints_are_scoped() {
+        let channel = ChannelFixture::new(true, 0);
+        let adapter =
+            AuthenticatedRpcAdapter::new(channel.clone(), scope(), RpcLimits::default()).unwrap();
+        for request in [forward(3, [1; 16]), forward(1, [0; 16])] {
+            assert_eq!(
+                adapter.request(1, 2, request).await.err(),
+                Some(TransportError::IdentityMismatch)
+            );
+        }
+        assert_eq!(channel.calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            adapter.request(1, 2, forward(1, [1; 16])).await,
+            Ok(RpcResponse::Forward(ForwardResponse::NotLeader {
+                leader: Some(3)
+            }))
+        ));
+        for (fault, expected) in [
+            (1, TransportError::IdentityMismatch),
+            (4, TransportError::IdentityMismatch),
+            (5, TransportError::ScopeMismatch),
+            (8, TransportError::InvalidFrame),
+            (11, TransportError::ScopeMismatch),
+        ] {
+            let adapter = AuthenticatedRpcAdapter::new(
+                ChannelFixture::new(true, fault),
+                scope(),
+                RpcLimits::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                adapter.request(1, 2, forward(1, [1; 16])).await.err(),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn forwarding_results_preserve_commit_rejection_and_unknown_distinction() {
+        for response in [
+            ForwardResponse::Applied(Outcome::Stale { current_epoch: 10 }),
+            ForwardResponse::Applied(Outcome::Held),
+            ForwardResponse::NotLeader { leader: Some(3) },
+            ForwardResponse::NotLeader { leader: None },
+            ForwardResponse::OutcomeUnknown,
+        ] {
+            let bytes = encode(&RpcResponse::Forward(response.clone()), MAX_FRAME).unwrap();
+            let RpcResponse::Forward(decoded) = decode(&bytes, MAX_FRAME).unwrap() else {
+                panic!("wrong forwarding response variant")
+            };
+            assert_eq!(decoded, response);
+        }
     }
 
     #[tokio::test]
