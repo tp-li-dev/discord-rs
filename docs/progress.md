@@ -133,3 +133,13 @@ Worker の双方向受信に 1 MiB、管理要求に 4095 byte（改行込み）
 - `tls_transport.rs`：Tokio TCP + rustls の mTLS Transport（証明書によるノード ID 照合、平文・未許可ノード・偽 CA・巨大フレーム・slowloris の拒否、loopback 既定、秘密鍵保護）。実 TCP 上で heartbeat 途絶による failover 判定を再現。証明書失効・ローテーション、本体配線、本番 quorum/lease 統合は未実装。
 - framework コンポーネント経路：Button/Select/Modal を `custom_id` で名前空間付きハンドラーへルーティングする属性マクロ（重複検出）、2つの独立 Registry が同一ストアで処理する模擬 T16、`wait_for` の drain 時キャンセル型と永続 Subscription 型の区別。実 StateStore アダプタ・実 Worker 接続・Subscription 配送は未実装。
 - 統合後 workspace test は 605 件成功。ただし統合直後の初回実行で hot_swap_scenarios の T04 が1度失敗し、再実行（単体3回・全体1回）では成功。再ビルド直後の負荷に依存するフレークの可能性があり、安定性要再確認。
+
+## 2026-11-12：並列開発 第9弾（最終段）
+- 試験安定化：T04 のフレーク原因は、fixture が rlib を更新日時で個別選択し、異なる feature 構成の Tokio を混在させること（`there is no reactor running`）と特定。Cargo の依存解決/JSON 成果物取得へ移行し、条件待ち・ポート競合排除などを実施。空の target で `cargo test --workspace` を10回連続成功（CPU 負荷6プロセス併走9回を含む）。当初の一過性失敗との原因同一性は元ログ未入手のため未確定。
+- 複数 botd 分散 E2E：mTLS で接続した3 botd が、試験用過半数 ACK・lease watchdog・failover/failback で T10〜T14（閾値短縮）を実 Gateway プロセス（模擬 Discord）上で検証し、二重 Active 違反なし。本番利用不可（明示フラグと模擬 Discord を必須とする guard）。実 openraft・永続化・実ホスト間・OS suspend は未検証。
+- ベンチ追加（Windows 開発機の参考値）：failover 検知（loopback mTLS、50回）Suspected p50/p95 1,504.6/1,513.3 ms、FailoverPending 3,008.7/3,014.7 ms、正常時の誤判定 0/100 観測。event_seq・TaskManager・metrics・StateStore も計測。3秒は検知目標で Discord 再接続を含まない。
+- docs：`docs/conformance.md`（§16.2 と T01〜T20 の適合状況表）、README と各ガイド、known-limitations を最新化。
+- main 統合後の workspace test は 647 件成功、失敗 0、無視 1（手動ベンチ）を2回連続確認。fmt・clippy（警告禁止）成功。いずれも Windows / Rust 1.99.0。
+
+## 残課題（次段階）
+Linux と GitHub Actions での実行確認、実 Discord での接続・登録・Interaction 応答・Identify 検証、実 openraft 組込みと永続ストレージ、Daemon↔Gateway/Core の実本番配線（Worker を Core 代替から Shard 単位 Core へ）、StateStore と framework コンポーネント経路の Worker 接続、update/rollback、証明書失効・ローテーション、Windows ACL、性能の Linux 再測定。
