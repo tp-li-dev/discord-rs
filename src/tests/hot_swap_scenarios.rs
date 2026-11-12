@@ -76,7 +76,7 @@ fn application_worker_binary() -> &'static Path {
         // built libraries. Link only the actual rlibs used by executable tests.
         for name in ["src", "bot_framework", "tokio"] {
             let prefix = format!("lib{name}-");
-            let libraries: Vec<_> = std::fs::read_dir(dependencies)
+            let library = std::fs::read_dir(dependencies)
                 .unwrap()
                 .map(|entry| entry.unwrap().path())
                 .filter(|path| {
@@ -84,14 +84,14 @@ fn application_worker_binary() -> &'static Path {
                         .and_then(|file| file.to_str())
                         .is_some_and(|file| file.starts_with(&prefix) && file.ends_with(".rlib"))
                 })
-                .collect();
-            assert_eq!(
-                libraries.len(),
-                1,
-                "need one compiled {name} rlib for fixture linking"
-            );
+                .max_by_key(|path| {
+                    path.metadata()
+                        .and_then(|metadata| metadata.modified())
+                        .expect("read fixture library modification time")
+                })
+                .unwrap_or_else(|| panic!("need a compiled {name} rlib for fixture linking"));
             let mut external = std::ffi::OsString::from(format!("{name}="));
-            external.push(&libraries[0]);
+            external.push(&library);
             command.arg("--extern").arg(external);
         }
         let result = command
