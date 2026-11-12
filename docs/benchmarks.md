@@ -140,3 +140,31 @@ Linux でも `src/` から同じ Cargo コマンドを使える。環境変数�
 スループットの分母となる実経過時間は並列度1で477,883,900 ns、4で280,131,400 ns、16で172,329,600 ns。合計30,000件の計測すべてで期待した `Pong! 🦀` と空の counts/jobs 状態に完全一致した。並列度4/16の往復p99.9はこの試行で1 msを超えた。N=10,000のp99.9は上位約10標本の影響が大きく、複数試行による再現性や信頼区間は検証していない。
 
 **Windows 開発機の参考値。1ms 未満目標との比較は Linux で要再測定。** Linux の片道p99目標、実 Gateway/Core・Manager 経路、実 Discord、障害・更新中の性能を達成したという保証は追加しない。
+
+### 2026-11-12: プリミティブと failover 検知の追加測定
+
+Windows 開発機（Windows NT 10.0.26200、AMD64 Family 25 Model 97、論理 CPU 12、Rust 1.99.0）。`src/` で `cargo bench --offline --bench primitives` と `cargo bench --offline --bench failover_detect` を実行。これは **Windows 開発機の参考値で Linux 本番の根拠ではない**。3秒は検知目標であり Discord 再接続を含まない。
+
+プリミティブは current-thread Tokio、warmup 1,000 回、各 10,000 標本、失敗 0 件。各標本を `Instant` で計測し nearest-rank を使用、計測オーバーヘッドを差し引いていない。
+
+| 処理 | p50 ns | p95 ns | p99 ns | 最大 ns |
+|---|---:|---:|---:|---:|
+| event_seq enqueue/replay/accept/ack、64 bytes | 100 | 100 | 200 | 500 |
+| Counter inc | 0 | 100 | 100 | 3,600 |
+| Histogram observe | 0 | 100 | 100 | 2,600 |
+| MemoryStateStore put、64 bytes | 500 | 600 | 3,400 | 34,600 |
+| MemoryStateStore get、64 bytes | 300 | 400 | 400 | 11,200 |
+| TaskManager 登録・開始から完了確認 | 2,600 | 2,900 | 3,200 | 106,500 |
+
+`event_seq` の直列サイクル数を各標本の計測時間の合計で割った値は 11,114,816 cycles/s。通信・IPC 往復のスループットではない。task の忘却は計測区間外。状態ストアは単一キー上書きで揮発性メモリのみ。0 ns は時計の分解能によるものでゼロコストを意味しない。各結果は単一実行であり、実負荷や競合下の性能、再現性を保証しない。
+
+failover は loopback mTLS 2 ノード、current-thread Tokio、既定 heartbeat 500 ms / suspect 1.5 s / fail 3 s。各試行で 2 回送受信し、最後の受信を状態機械へ入力した直後から停止、5 ms 間隔の sleep と Tick で検知を観測した。50 回の逐次試行、成功 50、失敗 0。nearest-rank の p50/p95 と最大値を示す。測定はポーリング遅延を含む。
+
+| 状態 | p50 ms | p95 ms | 最大 ms |
+|---|---:|---:|---:|
+| Suspected | 1,504.630 | 1,513.338 | 1,514.375 |
+| FailoverPending | 3,008.664 | 3,014.664 | 3,015.272 |
+
+正常 heartbeat 到着時に直前の Tick で判定した誤判定は 100 観測中 0 件。正常時の連続監視や長時間・負荷・遅延注入は行っておらず、実運用の誤判定率ではない。試験用の承認・起動完了イベントを与え TemporaryActive とした後、cooldown 経過後の heartbeat で FailbackWaiting に入り、1,518.890 ms 後に heartbeat 欠落を Tick で検出して TemporaryActive に戻った。古い FailbackComplete は無視された（1 試行）。30 秒の安定期間を通した正常フェイルバックは測定していない。
+
+TLS は heartbeat 配送に使用し、状態機械への入力はベンチが手動で接続している。実 daemon、複数ホスト、quorum/lease 承認、実プロセス起動、Discord 再接続や復旧完了は測定していない。初期の証明書 fixture による起動失敗 2 回を修正後に上記を取得した。
