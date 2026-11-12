@@ -190,6 +190,7 @@ pub enum Error {
     TimeOverflow,
     ClockRegressed,
     IdExhausted,
+    TaskFailed,
 }
 
 impl std::fmt::Display for Error {
@@ -710,6 +711,210 @@ impl<C: Clock> TaskManager<C> {
             }
             self.wait_progress(None).await;
         }
+    }
+}
+
+/// The result receiver and tracked identifiers for a Worker request tree.
+/// Dropping this value does not detach or cancel either managed task.
+pub struct WorkerRequest<T> {
+    root: TaskId,
+    child: TaskId,
+    output: tokio::sync::oneshot::Receiver<T>,
+    _lifetime: Arc<()>,
+}
+
+impl<T> WorkerRequest<T> {
+    pub fn root_id(&self) -> TaskId {
+        self.root
+    }
+
+    pub fn child_id(&self) -> TaskId {
+        self.child
+    }
+}
+
+/// Generation adapter for the Worker's serial command execution slot. Every
+/// admitted request has a RequestScoped root and a managed handler child. The
+/// adapter retains their joins if its caller cancels a wait; begin_drain closes
+/// root admission before wait_drained waits for every retained descendant.
+///
+/// This is task settlement only. The Worker must separately flush IPC, save
+/// state and settle Gateway/REST outcomes before retiring its generation.
+pub struct WorkerTasks {
+    manager: TaskManager,
+    bot_id: BotId,
+    shard_id: u32,
+    next_request: u128,
+    requests: BTreeMap<TaskId, (TaskId, std::sync::Weak<()>)>,
+}
+
+impl WorkerTasks {
+    const CAPACITY: usize = 128;
+
+    pub fn new(bot_id: BotId, shard_id: u32) -> Result<Self, Error> {
+        Ok(Self {
+            manager: TaskManager::new(MonotonicClock::default(), bot_id, shard_id, Self::CAPACITY)?,
+            bot_id,
+            shard_id,
+            next_request: 1,
+            requests: BTreeMap::new(),
+        })
+    }
+
+    fn reap_abandoned(&mut self) -> Result<(), Error> {
+        self.manager.poll()?;
+        let abandoned: Vec<_> = self
+            .requests
+            .iter()
+            .filter_map(|(root, (child, lifetime))| {
+                (lifetime.upgrade().is_none() && self.manager.tree_finished(*root))
+                    .then_some((*root, *child))
+            })
+            .collect();
+        for (root, child) in abandoned {
+            self.manager.forget(child)?;
+            self.manager.forget(root)?;
+            self.requests.remove(&root);
+        }
+        Ok(())
+    }
+
+    /// Register the request and handler atomically with respect to this adapter's
+    /// admission gate. Actual future execution starts only after registration.
+    pub fn start_request<F, T>(&mut self, future: F) -> Result<WorkerRequest<T>, Error>
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.reap_abandoned()?;
+        if self.manager.is_draining() {
+            return Err(Error::Draining);
+        }
+        // Reserve two records before spawning the root, avoiding a capacity
+        // failure that would otherwise leave it waiting for an absent child.
+        if self.manager.entries.len() > Self::CAPACITY - 2 {
+            return Err(Error::Capacity);
+        }
+        let request = self.next_request;
+        self.next_request = request.checked_add(1).ok_or(Error::IdExhausted)?;
+        let owner = TaskOwner {
+            bot_id: self.bot_id,
+            shard_id: self.shard_id,
+            cog: None,
+            request_id: Some(RequestId(request.to_be_bytes())),
+            parent: None,
+        };
+        let spec = TaskSpec {
+            owner,
+            kind: TaskKind::RequestScoped,
+            timeout: None,
+        };
+        let (settled, settlement) = tokio::sync::oneshot::channel();
+        let root = self.manager.spawn(spec.clone(), move |_| async move {
+            settlement.await.map_err(|_| TaskFailure::Application)?;
+            Ok(TaskCompletion::Completed)
+        })?;
+        let mut child_spec = spec;
+        child_spec.owner.parent = Some(root);
+        let (output, received) = tokio::sync::oneshot::channel();
+        let child = match self.manager.spawn(child_spec, move |_| async move {
+            let result = future.await;
+            // The completion signal is sent even when the caller no longer
+            // wants the value. A dropped receiver never strands the root.
+            let _ = output.send(result);
+            let _ = settled.send(());
+            Ok(TaskCompletion::Completed)
+        }) {
+            Ok(child) => child,
+            Err(error) => {
+                self.manager.request_cancel(root)?;
+                return Err(error);
+            }
+        };
+        let lifetime = Arc::new(());
+        self.requests
+            .insert(root, (child, Arc::downgrade(&lifetime)));
+        Ok(WorkerRequest {
+            root,
+            child,
+            output: received,
+            _lifetime: lifetime,
+        })
+    }
+
+    pub async fn finish_request<T>(&mut self, request: WorkerRequest<T>) -> Result<T, Error> {
+        if !self
+            .requests
+            .get(&request.root)
+            .is_some_and(|(child, lifetime)| {
+                *child == request.child && lifetime.ptr_eq(&Arc::downgrade(&request._lifetime))
+            })
+        {
+            return Err(Error::WrongOwner);
+        }
+        self.manager.wait(request.root).await?;
+        let child = self.manager.forget(request.child)?;
+        let root = self.manager.forget(request.root)?;
+        self.requests.remove(&request.root);
+        if child.result != Some(Ok(TaskCompletion::Completed))
+            || root.result != Some(Ok(TaskCompletion::Completed))
+        {
+            return Err(Error::TaskFailed);
+        }
+        request.output.await.map_err(|_| Error::TaskFailed)
+    }
+
+    pub async fn request<F, T>(&mut self, future: F) -> Result<T, Error>
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let request = self.start_request(future)?;
+        self.finish_request(request).await
+    }
+
+    pub fn begin_drain(&mut self) {
+        self.manager.begin_core_drain();
+    }
+
+    pub fn is_draining(&self) -> bool {
+        self.manager.is_draining()
+    }
+
+    pub async fn wait_drained(&mut self) -> Result<(), Error> {
+        if !self.manager.is_draining() {
+            return Err(Error::InvalidState);
+        }
+        self.manager.wait_all().await
+    }
+
+    /// Reopen only after all retained joins have actually completed. In-flight
+    /// request handles must be finished before this resets the task registry.
+    /// Logical request identifiers continue monotonically across aborted drains.
+    pub fn resume(&mut self) -> Result<(), Error> {
+        self.reap_abandoned()?;
+        if !self.manager.is_draining()
+            || !self.manager.core_tasks_finished()
+            || self.manager.metrics().pending_joins != 0
+            || !self.requests.is_empty()
+        {
+            return Err(Error::InvalidState);
+        }
+        self.manager = TaskManager::new(
+            MonotonicClock::default(),
+            self.bot_id,
+            self.shard_id,
+            Self::CAPACITY,
+        )?;
+        Ok(())
+    }
+
+    pub fn snapshots(&self) -> Vec<TaskSnapshot> {
+        self.manager.snapshots()
+    }
+
+    pub fn metrics(&self) -> Metrics {
+        self.manager.metrics()
     }
 }
 

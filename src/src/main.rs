@@ -1,5 +1,5 @@
-use src::{AppError, worker};
-use std::{env, future::IntoFuture, sync::Arc};
+use src::{AppError, redact::Secret, worker};
+use std::{env, ffi::OsStr, future::IntoFuture, process::ExitCode, sync::Arc};
 use tokio::sync::Semaphore;
 use twilight_gateway::{
     ConfigBuilder, Event, EventTypeFlags, Intents, Shard, ShardId, StreamExt as _,
@@ -79,12 +79,36 @@ where
     registry.register(std::num::NonZeroU64::MIN, &limits)
 }
 
+// External error text may contain short unlabelled credentials that heuristic
+// redaction cannot recognize. Never format that text at this output boundary.
+fn failure_message<T>(context: &'static str, error: T) -> String {
+    format!("{context}: {}", Secret::new(error))
+}
+
+fn token_from_env(value: Result<String, env::VarError>) -> Result<Secret<String>, AppError> {
+    match value {
+        Ok(value) => Ok(Secret::new(value)),
+        Err(env::VarError::NotPresent) => Err("DISCORD_TOKEN is not configured".into()),
+        Err(env::VarError::NotUnicode(_)) => Err("DISCORD_TOKEN is not Unicode".into()),
+    }
+}
+
 #[tokio::main]
-async fn main() -> Result<(), AppError> {
-    if env::args().nth(1).as_deref() == Some("--worker") {
+async fn main() -> ExitCode {
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{}", failure_message("実行に失敗しました", error));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<(), AppError> {
+    if env::args_os().nth(1).as_deref() == Some(OsStr::new("--worker")) {
         return worker::run().await;
     }
-    let bootstrap = if env::args().nth(1).as_deref() == Some("--local-control") {
+    let bootstrap = if env::args_os().nth(1).as_deref() == Some(OsStr::new("--local-control")) {
         Some(
             src::local_control::read_bootstrap()
                 .await
@@ -96,17 +120,20 @@ async fn main() -> Result<(), AppError> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let deployment = worker::DeploymentIdentity::from_env()?;
     let shard_id = configured_shard(&deployment);
-    let token = env::var("DISCORD_TOKEN")?;
-    let http = Arc::new(Client::new(token.clone()));
+    let token = token_from_env(env::var("DISCORD_TOKEN"))?;
+    let http = Arc::new(Client::new(token.expose_secret().clone()));
     let queue = single_shard_queue(deployment.shard.total(), async {
         let response = http.gateway().authed().await.map_err(|_| ())?;
         let metadata = response.model().await.map_err(|_| ())?;
         Ok((metadata.shards, metadata.session_start_limit))
     })
     .await?;
-    let config = ConfigBuilder::new(token, Intents::GUILD_MESSAGES | Intents::MESSAGE_CONTENT)
-        .queue(queue)
-        .build();
+    let config = ConfigBuilder::new(
+        token.into_inner(),
+        Intents::GUILD_MESSAGES | Intents::MESSAGE_CONTENT,
+    )
+    .queue(queue)
+    .build();
     let mut shard = Shard::with_config(shard_id, config);
     let manager =
         worker::Manager::start_pool_with_identity(env::current_exe()?, 2, deployment).await?;
@@ -123,7 +150,7 @@ async fn main() -> Result<(), AppError> {
     while let Some(result) = shard.next_event(EventTypeFlags::all()).await {
         match result {
             Ok(Event::Ready(ready)) => {
-                println!("ログイン成功: {}", ready.user.name);
+                println!("ログイン成功: {}", ready.user.id);
                 let Ok(permit) = capacity.clone().try_acquire_owned() else {
                     eprintln!("Ready イベントを処理できません: 混雑中");
                     continue;
@@ -133,7 +160,10 @@ async fn main() -> Result<(), AppError> {
                 tokio::spawn(async move {
                     let _permit = permit;
                     if let Err(error) = manager.dispatch_ready(bot_name).await {
-                        eprintln!("Ready イベントを処理できません: {error}");
+                        eprintln!(
+                            "{}",
+                            failure_message("Ready イベントを処理できません", error)
+                        );
                     }
                 });
             }
@@ -164,7 +194,7 @@ async fn main() -> Result<(), AppError> {
                         match manager.begin_response(message.channel_id.get()).await {
                             Ok(guard) => guard,
                             Err(error) => {
-                                eprintln!("応答追跡を開始できません: {error}");
+                                eprintln!("{}", failure_message("応答追跡を開始できません", error));
                                 return;
                             }
                         };
@@ -189,7 +219,7 @@ async fn main() -> Result<(), AppError> {
                         Ok(None) => response_guard.confirm(),
                         Err(error) => {
                             response_guard.confirm();
-                            eprintln!("Worker error: {error}");
+                            eprintln!("{}", failure_message("Worker error", error));
                         }
                     }
                 });
@@ -219,7 +249,7 @@ async fn main() -> Result<(), AppError> {
                     let response_guard = match manager.begin_response(key).await {
                         Ok(guard) => guard,
                         Err(error) => {
-                            eprintln!("応答追跡を開始できません: {error}");
+                            eprintln!("{}", failure_message("応答追跡を開始できません", error));
                             return;
                         }
                     };
@@ -227,7 +257,7 @@ async fn main() -> Result<(), AppError> {
                     let identity = (
                         interaction.application_id,
                         interaction.id,
-                        interaction.token,
+                        Arc::new(Secret::new(interaction.token)),
                     );
                     let ack_http = http.clone();
                     let update_http = http.clone();
@@ -242,7 +272,7 @@ async fn main() -> Result<(), AppError> {
                             };
                             ack_http
                                 .interaction(application_id)
-                                .create_response(interaction_id, &token, &response)
+                                .create_response(interaction_id, token.expose_secret(), &response)
                                 .await
                                 .is_ok()
                         },
@@ -256,7 +286,7 @@ async fn main() -> Result<(), AppError> {
                         move |(application_id, _, token), message| async move {
                             update_http
                                 .interaction(application_id)
-                                .update_response(&token)
+                                .update_response(token.expose_secret())
                                 .content(Some(&message))
                                 .await
                                 .is_ok()
@@ -270,7 +300,7 @@ async fn main() -> Result<(), AppError> {
                     }
                 });
             }
-            Err(error) => eprintln!("Gateway error: {error}"),
+            Err(error) => eprintln!("{}", failure_message("Gateway error", error)),
             _ => {}
         }
     }
@@ -280,6 +310,79 @@ async fn main() -> Result<(), AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failure_output_never_formats_external_error_text() {
+        struct UntrustedError;
+        impl std::fmt::Display for UntrustedError {
+            fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                panic!("the log boundary must not inspect external Display")
+            }
+        }
+        impl std::fmt::Debug for UntrustedError {
+            fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                panic!("the log boundary must not inspect external Debug")
+            }
+        }
+        for context in [
+            "実行に失敗しました",
+            "Ready イベントを処理できません",
+            "応答追跡を開始できません",
+            "Worker error",
+            "Gateway error",
+        ] {
+            assert_eq!(
+                failure_message(context, UntrustedError),
+                format!("{context}: [REDACTED]")
+            );
+            assert!(
+                !failure_message(context, "short-private-value").contains("short-private-value")
+            );
+        }
+    }
+
+    #[test]
+    fn token_environment_errors_are_fixed_and_valid_values_remain_usable() {
+        let token = token_from_env(Ok("short-private-value".into())).unwrap();
+        assert_eq!(token.expose_secret(), "short-private-value");
+        assert_eq!(format!("{token:?}"), "[REDACTED]");
+        assert_eq!(
+            token_from_env(Err(env::VarError::NotPresent))
+                .unwrap_err()
+                .to_string(),
+            "DISCORD_TOKEN is not configured"
+        );
+        let error = token_from_env(Err(env::VarError::NotUnicode("short-private-value".into())))
+            .unwrap_err();
+        assert_eq!(error.to_string(), "DISCORD_TOKEN is not Unicode");
+        assert!(!format!("{error:?}").contains("short-private-value"));
+    }
+
+    #[tokio::test]
+    async fn protected_interaction_identity_reaches_ack_and_update_unchanged() {
+        let token = Arc::new(Secret::new("short-private-value".to_owned()));
+        let expected = token.clone();
+        let result = src::interaction_flow::run(
+            (1, 2, token),
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+            |(application, interaction, token)| async move {
+                assert_eq!((application, interaction), (1, 2));
+                assert_eq!(token.expose_secret(), "short-private-value");
+                true
+            },
+            || async { "reply".into() },
+            move |(application, interaction, token), message| async move {
+                assert_eq!((application, interaction), (1, 2));
+                assert!(Arc::ptr_eq(&token, &expected));
+                assert_eq!(message, "reply");
+                true
+            },
+        )
+        .await;
+        assert_eq!(result, src::interaction_flow::Outcome::Completed);
+    }
+
     #[tokio::test]
     async fn response_timeout_is_not_confirmed() {
         assert!(

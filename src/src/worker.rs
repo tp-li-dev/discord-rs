@@ -1,5 +1,6 @@
 use crate::{
     AppError,
+    redact::{Secret, redact},
     response_drain::{ResponseDrain, ResponseOperation},
 };
 use serde::{Deserialize, Serialize};
@@ -19,9 +20,11 @@ use tokio::{
 const PROTOCOL: u32 = 5;
 const CAPABILITIES: &[&str] = &["snapshot-v3"];
 const EVENT_SEQ_CAPABILITY: &str = "event-seq-v1";
+const EVENT_REPLAY_CAPABILITY: &str = "event-replay-v1";
 const HELLO_CAPABILITY: &str = "hello-v1";
 const OPTIONAL_CAPABILITIES: &[&str] = &[
     EVENT_SEQ_CAPABILITY,
+    EVENT_REPLAY_CAPABILITY,
     "hello-v1",
     "command-dispatch-v1",
     "ready-event-v1",
@@ -162,6 +165,9 @@ enum Request {
         local_sequence: u64,
         bot_name: String,
     },
+    RestoreEventStream {
+        next_sequence: Option<u64>,
+    },
     ReadyEvent {
         bot_name: String,
     },
@@ -175,6 +181,7 @@ enum Request {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Response {
+    EventStreamRestored,
     EventAccepted {
         local_sequence: u64,
     },
@@ -292,7 +299,7 @@ struct Process {
 impl Process {
     async fn start(path: &Path, deployment: &DeploymentIdentity) -> Result<Self, AppError> {
         let identity = deployment.next_identity()?;
-        let hello = local_hello(identity.clone());
+        let mut hello = local_hello(identity.clone());
         let mut child = Command::new(path)
             .arg("--worker")
             .env(IDENTITY_ENV, serde_json::to_string(&identity)?)
@@ -301,7 +308,8 @@ impl Process {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .kill_on_drop(true)
-            .spawn()?;
+            .spawn()
+            .map_err(|_| "worker spawn failed")?;
         let input = child.stdin.take().ok_or("missing worker stdin")?;
         let output = BufReader::new(child.stdout.take().ok_or("missing worker stdout")?);
         let mut process = Self {
@@ -327,6 +335,17 @@ impl Process {
                 pid,
             } => {
                 validate_hello(protocol_min, protocol_max, &required_capabilities)?;
+                // Old v5 peers may echo optional Hello fields without handling
+                // new wire requests. Offer replay only after explicit Ready
+                // advertisement, then still require bilateral Hello agreement.
+                if !supported_capabilities
+                    .iter()
+                    .any(|cap| cap == EVENT_REPLAY_CAPABILITY)
+                {
+                    hello
+                        .optional_capabilities
+                        .retain(|cap| cap != EVENT_REPLAY_CAPABILITY);
+                }
                 if supported_capabilities
                     .iter()
                     .any(|cap| cap == HELLO_CAPABILITY)
@@ -391,6 +410,9 @@ impl Process {
             Request::SequencedReady { local_sequence, .. } => Some(*local_sequence),
             _ => None,
         };
+        // Poison before the first await. If the caller cancels an in-flight
+        // exchange, leftover frames must never be read as a later response.
+        self.broken = true;
         let result = timeout(DEADLINE, async {
             let mut data = serde_json::to_vec(request)?;
             data.push(b'\n');
@@ -401,7 +423,9 @@ impl Process {
             self.input.flush().await?;
             let frame = read_frame(&mut self.output).await?.ok_or("worker exited")?;
             if let Some(expected) = expected_ack {
-                match serde_json::from_slice::<Response>(&frame)? {
+                match serde_json::from_slice::<Response>(&frame)
+                    .map_err(|_| "invalid worker response")?
+                {
                     Response::EventAccepted { local_sequence } if local_sequence == expected => {
                         self.events
                             .ack(crate::event_seq::EventAccepted(
@@ -417,24 +441,75 @@ impl Process {
                 let frame = read_frame(&mut self.output)
                     .await?
                     .ok_or("worker exited after ACK")?;
-                return Ok(serde_json::from_slice(&frame)?);
+                return Ok(serde_json::from_slice(&frame).map_err(|_| "invalid worker response")?);
             }
-            Ok(serde_json::from_slice(&frame)?)
+            Ok(serde_json::from_slice(&frame).map_err(|_| "invalid worker response")?)
         })
         .await
         .map_err(|_| -> AppError { "worker timed out".into() })
         .and_then(|result| result);
-        if result.is_err() {
-            self.broken = true;
-            if self.events.retained_len() != 0 {
-                eprintln!(
-                    "worker event ACK missing: unacked={:?}, retained_bytes={}; replacement replay unavailable",
-                    self.events.unacked_ranges(),
-                    self.events.retained_bytes()
-                );
-            }
+        if result.is_ok() {
+            self.broken = false;
+        }
+        if result.is_err() && self.events.retained_len() != 0 {
+            eprintln!(
+                "worker event ACK missing: unacked={:?}, retained_bytes={}",
+                self.events.unacked_ranges(),
+                self.events.retained_bytes()
+            );
         }
         result
+    }
+
+    fn supports(&self, capability: &str) -> bool {
+        self.supported_capabilities
+            .iter()
+            .any(|cap| cap == capability)
+    }
+
+    /// Candidate-only transaction: keep the previous buffer until installation.
+    /// Both process locks/routing must be held by the caller throughout handoff.
+    async fn inherit_events(&mut self, previous: &Self) -> Result<(), AppError> {
+        let compatible = self.supports(EVENT_SEQ_CAPABILITY)
+            && previous.supports(EVENT_SEQ_CAPABILITY)
+            && self.supports(EVENT_REPLAY_CAPABILITY)
+            && previous.supports(EVENT_REPLAY_CAPABILITY);
+        if !compatible {
+            if previous.events.retained_len() != 0 {
+                return Err("unacknowledged events require negotiated replay support".into());
+            }
+            return Ok(());
+        }
+        match self
+            .request(&Request::RestoreEventStream {
+                next_sequence: previous.events.receiver_checkpoint(),
+            })
+            .await?
+        {
+            Response::EventStreamRestored => {}
+            _ => return Err("worker event stream restore rejected".into()),
+        }
+        self.events = previous.events.clone();
+        // Clone at most the configured bounded buffer, without borrowing across
+        // request() which consumes ACKs. Replay never assigns a new sequence.
+        let pending: Vec<_> = self.events.replay().cloned().collect();
+        for event in pending {
+            let Request::ReadyEvent { bot_name } = serde_json::from_slice(&event.payload)? else {
+                return Err("invalid retained worker event".into());
+            };
+            match self
+                .request(&Request::SequencedReady {
+                    local_sequence: event.local_sequence,
+                    bot_name,
+                })
+                .await?
+            {
+                Response::Result { state, .. } => self.checkpoint = Some(state),
+                Response::Rejected { .. } => return Err("replayed worker event rejected".into()),
+                _ => return Err("unexpected replay response".into()),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -480,7 +555,7 @@ impl Manager {
             lines.push(format!(
                 "{}: {} / PID: {}",
                 index + 1,
-                process.build,
+                redact(&process.build),
                 process.pid
             ));
         }
@@ -545,12 +620,20 @@ impl Manager {
             let mut process = Process::start(&path, &self.deployment).await?;
             // Exclusive lock drains accepted requests and queues new ones during migration.
             let mut active = worker.write().await;
-            let snapshot = active
-                .process
-                .lock()
-                .await
-                .request(&Request::Snapshot)
-                .await?;
+            let mut previous = active.process.lock().await;
+            let snapshot = if previous.broken {
+                // Same recovery boundary as automatic restart: only confirmed
+                // snapshots survive. Unconfirmed application effects are unknown.
+                Response::Snapshot {
+                    version: STATE_VERSION,
+                    state: previous
+                        .checkpoint
+                        .clone()
+                        .unwrap_or(serde_json::to_value(crate::cogs::State::default())?),
+                }
+            } else {
+                previous.request(&Request::Snapshot).await?
+            };
             let (version, state) = match snapshot {
                 Response::Snapshot { version, state } => (version, state),
                 _ => return Err("旧Workerから状態を取得できません".into()),
@@ -564,20 +647,23 @@ impl Manager {
             {
                 Response::Restored => {}
                 Response::Rejected { reason } => {
-                    return Err(format!("状態の引き継ぎを拒否しました: {reason}").into());
+                    return Err(
+                        format!("状態の引き継ぎを拒否しました: {}", Secret::new(reason)).into(),
+                    );
                 }
                 _ => return Err("新Workerが状態の引き継ぎを確認できません".into()),
             }
             process.checkpoint = Some(state);
+            process.inherit_events(&previous).await?;
+            drop(previous);
             *active = Active {
                 path: path.clone(),
                 process: Arc::new(Mutex::new(process)),
             };
             println!(
-                "Worker {}/{} を切り替えました: {}",
+                "Worker {}/{} を切り替えました",
                 index + 1,
-                self.workers.len(),
-                path.display()
+                self.workers.len()
             );
         }
         Ok(())
@@ -689,7 +775,11 @@ impl Manager {
                 loop {
                     interval.tick().await;
                     if let Err(error) = manager.execute(index, Request::Tick).await {
-                        eprintln!("Worker {} の仕事を進められません: {error}", index + 1);
+                        eprintln!(
+                            "Worker {} の仕事を進められません: {}",
+                            index + 1,
+                            Secret::new(error)
+                        );
                     }
                 }
             });
@@ -728,24 +818,25 @@ impl Manager {
         if let Ok(Response::Result { state, .. }) = &result {
             guard.checkpoint = Some(state.clone());
         }
-        let checkpoint = guard.checkpoint.clone();
         drop(guard);
         drop(active);
         let result = match result {
-            Ok(Response::Rejected { reason }) => return Err(reason.into()),
+            Ok(Response::Rejected { reason }) => {
+                return Err(format!("worker rejected request: {}", Secret::new(reason)).into());
+            }
             Ok(Response::Result { content, .. }) => Ok(content),
             Ok(_) => Err("unexpected worker response".into()),
             Err(error) => Err(error),
         };
         if result.is_err() {
             let _guard = self.update.lock().await;
-            let active = worker.read().await;
+            let mut active = worker.write().await;
             if Arc::ptr_eq(&active.process, &process) {
                 let path = active.path.clone();
-                drop(active);
+                let previous = active.process.lock().await;
                 match Process::start(&path, &self.deployment).await {
                     Ok(mut new_process) => {
-                        if let Some(state) = checkpoint {
+                        if let Some(state) = previous.checkpoint.clone() {
                             match new_process
                                 .request(&Request::Restore {
                                     version: STATE_VERSION,
@@ -760,13 +851,18 @@ impl Manager {
                                 }
                             }
                         }
-                        *worker.write().await = Active {
+                        if let Err(error) = new_process.inherit_events(&previous).await {
+                            eprintln!("Workerのイベントを復旧できません: {}", Secret::new(error));
+                            return result;
+                        }
+                        drop(previous);
+                        *active = Active {
                             path,
                             process: Arc::new(Mutex::new(new_process)),
                         };
                         eprintln!("Workerを再起動しました");
                     }
-                    Err(error) => eprintln!("Workerの再起動に失敗しました: {error}"),
+                    Err(error) => eprintln!("Workerの再起動に失敗しました: {}", Secret::new(error)),
                 }
             }
         }
@@ -790,24 +886,31 @@ impl Manager {
                             )
                             .await
                             {
-                                eprintln!("Workerの状態を記録できません: {error}");
+                                eprintln!("Workerの状態を記録できません: {}", Secret::new(error));
                             }
                             let _ = tokio::fs::remove_file(error_file(&file)).await;
                         }
                         Err(error) => {
-                            eprintln!("Workerの更新に失敗しました: {error}");
-                            let detail = serde_json::json!({"path": path.to_string_lossy(), "error": error.to_string()});
+                            let safe_error =
+                                redact(&format!("worker update failed: {}", Secret::new(error)));
+                            eprintln!("Workerの更新に失敗しました: {safe_error}");
+                            // path is an exact-match control field used by reload,
+                            // never a diagnostic; preserve its wire compatibility.
+                            let detail = serde_json::json!({"path": path.to_string_lossy(), "error": safe_error});
                             if let Err(write_error) =
                                 tokio::fs::write(error_file(&file), detail.to_string()).await
                             {
-                                eprintln!("更新エラーを記録できません: {write_error}");
+                                eprintln!(
+                                    "更新エラーを記録できません: {}",
+                                    Secret::new(write_error)
+                                );
                             }
                         }
                     }
                 }
                 Ok(_) => eprintln!("Worker指定ファイルが空です"),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => eprintln!("Worker指定ファイルを読めません: {error}"),
+                Err(error) => eprintln!("Worker指定ファイルを読めません: {}", Secret::new(error)),
             }
         }
     }
@@ -817,13 +920,21 @@ pub async fn run() -> Result<(), AppError> {
     let mut input = BufReader::new(tokio::io::stdin());
     let mut output = tokio::io::stdout();
     let mut state = crate::cogs::State::default();
-    let runtime = crate::cogs::FrameworkRuntime::default();
+    let runtime = Arc::new(crate::cogs::FrameworkRuntime::default());
     bot_framework::commands()?;
     let identity = std::env::var(IDENTITY_ENV)
         .ok()
         .map(|value| serde_json::from_str::<crate::protocol::Identity>(&value))
         .transpose()?;
+    let mut tasks = crate::supervisor::WorkerTasks::new(
+        identity
+            .as_ref()
+            .map_or(crate::protocol::BotId(0), |id| id.bot_id),
+        identity.as_ref().map_or(0, |id| id.shard.id()),
+    )?;
     let mut sequenced_events = false;
+    let mut replay_events = false;
+    let mut event_stream_initialized = false;
     let mut receiver = crate::event_seq::Receiver::new(0);
     while let Some(frame) = read_frame(&mut input).await? {
         let request = match serde_json::from_slice(&frame)? {
@@ -838,6 +949,7 @@ pub async fn run() -> Result<(), AppError> {
                 receiver
                     .accept(local_sequence, true)
                     .map_err(|_| "worker event gap or duplicate")?;
+                event_stream_initialized = true;
                 let mut ack = serde_json::to_vec(&Response::EventAccepted { local_sequence })?;
                 ack.push(b'\n');
                 output.write_all(&ack).await?;
@@ -848,6 +960,17 @@ pub async fn run() -> Result<(), AppError> {
         };
         let response = match request {
             Request::SequencedReady { .. } => unreachable!(),
+            Request::RestoreEventStream { next_sequence } => {
+                if replay_events && sequenced_events && !event_stream_initialized {
+                    receiver = crate::event_seq::Receiver::from_checkpoint(next_sequence);
+                    event_stream_initialized = true;
+                    Response::EventStreamRestored
+                } else {
+                    Response::Rejected {
+                        reason: "worker event stream restore not permitted".into(),
+                    }
+                }
+            }
             Request::Hello { hello: peer } => match identity.clone() {
                 Some(identity) => {
                     let hello = local_hello(identity);
@@ -855,6 +978,9 @@ pub async fn run() -> Result<(), AppError> {
                         Ok((_, capabilities)) => {
                             sequenced_events =
                                 capabilities.iter().any(|cap| cap == EVENT_SEQ_CAPABILITY);
+                            replay_events = capabilities
+                                .iter()
+                                .any(|cap| cap == EVENT_REPLAY_CAPABILITY);
                             Response::Hello { hello }
                         }
                         Err(reason) => Response::Rejected {
@@ -873,6 +999,7 @@ pub async fn run() -> Result<(), AppError> {
                 required_capabilities: CAPABILITIES.iter().map(|s| (*s).to_owned()).collect(),
                 supported_capabilities: vec![
                     EVENT_SEQ_CAPABILITY.into(),
+                    EVENT_REPLAY_CAPABILITY.into(),
                     HELLO_CAPABILITY.into(),
                     "command-dispatch-v1".into(),
                     "ready-event-v1".into(),
@@ -881,41 +1008,42 @@ pub async fn run() -> Result<(), AppError> {
                 build: crate::cogs::build_id().to_owned(),
                 pid: std::process::id(),
             },
-            Request::Dispatch { key, content } => {
+            command @ (Request::Dispatch { .. }
+            | Request::Command { .. }
+            | Request::SlashCommand { .. }
+            | Request::ReadyEvent { .. }
+            | Request::Tick) => {
                 let previous = state.clone();
-                let result = crate::cogs::dispatch(key, &content, &mut state, &runtime).await;
-                command_result(&mut state, previous, result)?
-            }
-            Request::Command { name } => {
-                let previous = state.clone();
-                let result = crate::cogs::dispatch_command(&name, &runtime).await;
-                command_result(&mut state, previous, result)?
-            }
-            Request::SlashCommand { name, args } => {
-                let previous = state.clone();
-                let result = crate::cogs::dispatch_slash(&name, args, &runtime).await;
-                command_result(&mut state, previous, result)?
-            }
-            Request::ReadyEvent { bot_name } => {
-                match crate::cogs::dispatch_ready(&runtime, bot_name).await {
-                    Ok(()) => {
-                        let previous = state.clone();
-                        checked_result(&mut state, previous, None)?
+                let owned = std::mem::take(&mut state);
+                match tasks
+                    .request(handle_command(command, owned, runtime.clone()))
+                    .await
+                {
+                    Ok((current, response)) => {
+                        state = current;
+                        response?
                     }
-                    Err(_) => Response::Rejected {
-                        reason: "ready handler failed".into(),
-                    },
+                    Err(_) => {
+                        state = previous;
+                        Response::Rejected {
+                            reason: "managed command failed".into(),
+                        }
+                    }
                 }
             }
-            Request::Tick => {
-                let previous = state.clone();
-                crate::cogs::tick(&mut state);
-                checked_result(&mut state, previous, None)?
+            Request::Snapshot => {
+                // Manager already holds the exclusive routing lock. Close root
+                // admission first, join descendants, then capture state. Reopen
+                // locally so a cancelled/failed candidate leaves v1 usable.
+                tasks.begin_drain();
+                tasks.wait_drained().await?;
+                let snapshot = serde_json::to_value(&state);
+                tasks.resume()?;
+                Response::Snapshot {
+                    version: STATE_VERSION,
+                    state: snapshot?,
+                }
             }
-            Request::Snapshot => Response::Snapshot {
-                version: STATE_VERSION,
-                state: serde_json::to_value(&state)?,
-            },
             Request::Restore {
                 version,
                 state: incoming,
@@ -934,8 +1062,8 @@ pub async fn run() -> Result<(), AppError> {
                                 _ => Response::Restored,
                             }
                         }
-                        Err(error) => Response::Rejected {
-                            reason: error.to_string(),
+                        Err(_) => Response::Rejected {
+                            reason: "invalid worker state".into(),
                         },
                     }
                 }
@@ -946,7 +1074,37 @@ pub async fn run() -> Result<(), AppError> {
         output.write_all(&data).await?;
         output.flush().await?;
     }
+    tasks.begin_drain();
+    tasks.wait_drained().await?;
+    output.flush().await?;
     Ok(())
+}
+
+async fn handle_command(
+    request: Request,
+    mut state: crate::cogs::State,
+    runtime: Arc<crate::cogs::FrameworkRuntime>,
+) -> (crate::cogs::State, Result<Response, AppError>) {
+    let previous = state.clone();
+    let result = match request {
+        Request::Dispatch { key, content } => {
+            crate::cogs::dispatch(key, &content, &mut state, &runtime).await
+        }
+        Request::Command { name } => crate::cogs::dispatch_command(&name, &runtime).await,
+        Request::SlashCommand { name, args } => {
+            crate::cogs::dispatch_slash(&name, args, &runtime).await
+        }
+        Request::ReadyEvent { bot_name } => crate::cogs::dispatch_ready(&runtime, bot_name)
+            .await
+            .map(|()| None),
+        Request::Tick => {
+            crate::cogs::tick(&mut state);
+            Ok(None)
+        }
+        _ => unreachable!("only application requests are managed here"),
+    };
+    let response = command_result(&mut state, previous, result);
+    (state, response)
 }
 
 #[cfg(test)]
