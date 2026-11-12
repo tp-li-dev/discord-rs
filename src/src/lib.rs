@@ -1,5 +1,6 @@
 mod cogs;
 pub mod drain;
+pub mod failover;
 pub mod gateway_metadata;
 pub mod identify;
 pub mod interaction_flow;
