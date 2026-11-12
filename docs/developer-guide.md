@@ -99,6 +99,21 @@ StateMapは具体型ごとに `Send + Sync + 'static` の値を保持し、`Cont
 
 実Workerでは `FrameworkRuntime::default` が `FrameworkCounter` を注入します。`!state_counter` はWorkerごとの一時状態で、Worker更新・再起動でリセットされます。`!count` と計算ジョブは別の明示的snapshotで、親メモリから引き継ぎます。StateMapやCogの状態が自動的に保存・移行されることはありません。
 
+## コンポーネント・状態・タスク基盤
+
+`framework/src/interactions.rs` のRegistryと `#[component]` / `#[modal]` はButton・Select・Modalの名前空間付きルートに対応し、`wait_for` とSubscriptionの型もあります。通信非依存のAPIで、Discordや実Workerへの配送は未接続です。ルートやcustom IDだけでユーザー認可・再送防止はできません。
+
+`src/state_store.rs` はTTL・容量制限・CAS・schema検査を伴う非同期StateStoreとメモリ実装を提供します。メモリ状態はプロセス停止で失われ、外部DB・永続Subscriptionへの接続はありません。`src/supervisor.rs` のTaskManager / Supervisorは追跡・取消・drain・再起動方針の基盤で、Workerの要求タスクに一部接続されています。任意のCog・外部副作用を含む全資源のdrainを保証しません。
+
+`src/tls_transport.rs` は相互TLS transport、`src/cluster.rs` は決定的なネットワーク模擬を提供します。実daemonの分散合意・leaseに接続された本番クラスタではありません。
+
+Discord不要のサンプルは `src/` から次で実行できます。
+
+```sh
+cargo run --offline -p bot-framework --example ping_bot
+cargo run --offline -p bot-framework --example hybrid_bot
+```
+
 ## 確認するテスト
 
 すべて `src/` で実行します。
@@ -111,6 +126,6 @@ cargo test --offline --workspace
 
 frameworkの `hybrid` / `typed_macro` / `cog_extensions` / `state` / `events` とcompile-failがAPI・診断の根拠です。実Worker試験はDiscord HTTPの成功、Interaction期限、OS障害・分断時の安全性を証明しません。
 
-## この文書更新時の検証
+## 過去の検証記録
 
 2026-11-12、Windows / Rust 1.99.0で `cargo test --offline --workspace`、`cargo fmt --all --check`、`cargo clippy --offline --workspace --all-targets -- -D warnings` が成功しました。掲載した3つのRustブロックを一時ディレクトリへ抽出し、既存workspaceのビルド成果物に対してrustcでコンパイルしました。Cog・Ready・状態共有サンプルは1テスト成功、フリー関数のコマンド・イベント例もコンパイル成功です。リポジトリのコードは変更していません。実Discord・Linux・複数ホストの再検証は行っていません。

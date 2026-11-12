@@ -137,6 +137,10 @@ Windows / Rust 1.99.0 でロール×全9操作、未認証遠隔要求、確認�
 
 `metrics-json` と `metrics-prometheus` は管理プロセス内のメトリクススナップショットを返す。現在の registry は Gateway / Worker の観測に接続されていないため、表示値を実環境の状態や健全性の証明に使えない。Windows ACL、Linux 実機、実 Discord や遠隔管理を通じた動作は未検証。
 
+## botd / botctl のローカル管理境界
+
+`botd` は loopback のみで受け付け、匿名 stdin で渡された非ゼロの32バイト共有資格情報を要求と定数時間比較してから操作を管理キューに渡す。`botctl` は bootstrap 情報を読みこの資格情報を送信する。これは `manage` の viewer / admin と別の経路で、`botd` 側に RBAC / `AuditedExecutor` の接続はなく、共有資格情報を持つ利用者ごとの役割分離・永続監査を提供しない。資格情報や bootstrap ファイルを閲覧可能な主体から保護する必要がある。`--force` の確認は権限認証の代替ではない。遠隔管理や mTLS とこのローカル listener は接続されていない。`src/src/bin/botd.rs` の `authenticated_status_returns_snapshot_without_secret`、`status_is_dispatched_only_after_authentication` と `src/tests/botctl_daemon.rs` がローカル経路の一部を検証する。Windows ACL、複数ホストでの利用は未検証。
+
 ## Daemon 間 mTLS TCP Transport（2026-11-12）
 
 `src/src/tls_transport.rs` の `TlsTransport` が既存 `cluster::Transport` を実装する。Tokio TCP と rustls / tokio-rustls を使い、TLS 1.3・相互証明書認証・ALPN `botd-cluster/1` を必須にする。追加依存はない。`main.rs` / `worker.rs` / `daemon.rs`、本番の合意・lease・RBAC・監査ハンドラーには接続していない。Transport の認証試験は §4.3 / §13.1 / T20 の一部であり、遠隔 CLI 操作と永続監査を含む T20 全体の完了ではない。

@@ -44,6 +44,12 @@ Hello 本体の実例:
 
 アプリ処理失敗も rejected を返す。SlashValue は framework の serde 型に従う。snapshot の状態形式は現在 version=3。request_id、timestamp、drain/switch 制御メッセージ、MessagePack 分割転送はこの Worker wire にはない。プロセスの起動世代とアプリ状態 version は別の概念。
 
+## 外部応答結果の帰属と環境
+
+`api-result-v1` は Ready の明示広告と Hello の双方での交渉を要する。`response_dispatch` は `operation_id` と dispatch / command / slash_command を送り、応答内容のある結果に対して Worker が未決操作を登録する。Gateway は外部応答後、同じ世代へ `api_result` を送り、Worker は operation_id、outcome、identity、pid を含む `api_result_accepted` を返す。親は期待値を照合する。未決枠は最大1024。これは Discord 側の副作用の exactly-once や結果不明の解消を保証しない。`src/src/worker.rs`、`src/tests/worker_response_generation.rs` と模擬 Discord を使う `src/tests/e2e_shard_worker.rs` を参照。実 Discord は未検証。
+
+Ready の `credential_free` は Worker 自身による環境変数名の検査結果であり、秘密の不在を証明する認証ではない。isolated 起動では環境を消去し identity を渡す（Windows の `SystemRoot` を除く）。通常の Worker 起動でも `DISCORD_TOKEN` を除外するが、全起動方式で別名の秘密を除外する保証はない。Gateway は Worker の親であり、Worker 更新は Gateway 自体の更新ではない。Gateway の終了は Worker にも影響するため、Gateway 再起動を跨ぐ接続維持は主張しない。
+
 ## TaskManager と世代ごとの drain
 
 Worker の dispatch / command / slash_command / Ready / tick は `WorkerTasks` adapter から `TaskManager` に登録する。1要求の親とハンドラーを実行する子は両方 `RequestScoped` で、Bot / Shard / ローカル単調 request_id / parent TaskId を持つ。本文や token は所有者メタデータへ入れない。子が完了・失敗するまで親を保持し、両 join の回収後に結果を IPC へ返す。終了記録は回収し、登録数は128（親子で64要求）に制限する。実 Worker の要求処理は引き続き直列。
