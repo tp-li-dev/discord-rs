@@ -4,7 +4,7 @@
 //! Only a trusted authentication adapter may construct an authenticated principal;
 //! never deserialize that decision or the role from an untrusted command body.
 //! Keep the log directory private and stable. Run blocking I/O away from Gateway
-//! heartbeat/event tasks. Existing CLI/daemon handlers are not wired to this module.
+//! heartbeat/event tasks. The local manage server uses this executor.
 //!
 //! ```no_run
 //! use src::rbac_audit::{AuditConfig, AuditedExecutor, Confirmation, Principal, Request};
@@ -437,6 +437,63 @@ impl AuditedExecutor {
                 // separate logging boundary and must redact their own output.
                 let _ = self.record(request, id, Outcome::Panicked, "operation_panicked");
                 std::panic::resume_unwind(payload)
+            }
+        }
+    }
+
+    /// Async counterpart for management operations. A durable started record is
+    /// written before polling the future; cancellation leaves an unmatched start.
+    pub async fn execute_async<T, F>(
+        &mut self,
+        request: &Request,
+        operation: F,
+    ) -> Result<T, ExecuteError>
+    where
+        F: std::future::Future<Output = Result<T, String>>,
+    {
+        if self.poisoned {
+            return Err(ExecuteError::Audit(AuditError::Poisoned));
+        }
+        let input_bytes = request
+            .principal
+            .subject
+            .as_ref()
+            .map_or(0, String::len)
+            .saturating_add(request.principal.role.as_ref().map_or(0, String::len))
+            .saturating_add(request.operation.len())
+            .saturating_add(request.bot_id.as_ref().map_or(0, String::len));
+        if input_bytes > self.config.max_record_bytes {
+            return Err(ExecuteError::Audit(AuditError::RecordTooLarge));
+        }
+        let id = self.next_id;
+        self.next_id = id
+            .checked_add(1)
+            .ok_or(ExecuteError::Audit(AuditError::CapacityExhausted))?;
+        if let Err(denial) = authorize(request) {
+            self.record(request, id, Outcome::Denied, denial.reason())
+                .map_err(ExecuteError::Audit)?;
+            return Err(ExecuteError::Denied(denial));
+        }
+        let started = self
+            .encode_record(request, id, Outcome::Started, "authorized")
+            .map_err(ExecuteError::Audit)?;
+        self.ensure_capacity(&[started.len(), self.config.max_record_bytes])
+            .map_err(ExecuteError::Audit)?;
+        if let Err(error) = self.append(&started) {
+            self.poisoned = true;
+            return Err(ExecuteError::Audit(error));
+        }
+        let result = operation.await;
+        match result {
+            Ok(value) => {
+                self.record(request, id, Outcome::Succeeded, "completed")
+                    .map_err(ExecuteError::AuditAfterExecution)?;
+                Ok(value)
+            }
+            Err(_) => {
+                self.record(request, id, Outcome::Failed, "operation_failed")
+                    .map_err(ExecuteError::AuditAfterExecution)?;
+                Err(ExecuteError::OperationFailed)
             }
         }
     }

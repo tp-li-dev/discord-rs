@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
 use src::local_control::GatewayControl;
+use src::metrics::MetricsRegistry;
+use src::rbac_audit::{
+    AuditConfig, AuditedExecutor, Confirmation, Principal, Request as AuditRequest,
+};
 use src::redact::{Secret, redact};
 use std::{
     env,
@@ -60,6 +64,7 @@ struct Endpoint {
     secret: Secret<String>,
 }
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Request {
     #[serde(with = "secret_wire")]
     secret: Secret<String>,
@@ -91,10 +96,10 @@ fn token() -> Result<String, ErrorBox> {
     getrandom::fill(&mut random)?;
     Ok(random.iter().map(|b| format!("{b:02x}")).collect())
 }
-async fn write_endpoint(endpoint: &Endpoint) -> Result<(), ErrorBox> {
+async fn write_endpoint(endpoint: &Endpoint, name: &str) -> Result<(), ErrorBox> {
     let dir = runtime_dir();
     tokio::fs::create_dir_all(&dir).await?;
-    let temp = dir.join(format!("core-{}.tmp", std::process::id()));
+    let temp = dir.join(format!("{name}-{}.tmp", std::process::id()));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -106,7 +111,7 @@ async fn write_endpoint(endpoint: &Endpoint) -> Result<(), ErrorBox> {
     use std::io::Write;
     file.write_all(&serde_json::to_vec(endpoint)?)?;
     file.sync_all()?;
-    std::fs::rename(temp, dir.join("core.json"))?;
+    std::fs::rename(temp, dir.join(name))?;
     Ok(())
 }
 async fn request(command: &str) -> Result<String, ErrorBox> {
@@ -215,6 +220,15 @@ async fn core(binary: PathBuf) -> Result<(), ErrorBox> {
         port: listener.local_addr()?.port(),
         secret: Secret::new(secret.expose_secret().clone()),
     };
+    let viewer_secret = Arc::new(Secret::new(token()?));
+    let viewer_endpoint = Endpoint {
+        port: endpoint.port,
+        secret: Secret::new(viewer_secret.expose_secret().clone()),
+    };
+    tokio::fs::create_dir_all(runtime_dir()).await?;
+    let mut audit =
+        AuditedExecutor::open(runtime_dir().join("audit.jsonl"), AuditConfig::default())?;
+    let metrics = MetricsRegistry::default();
     let mut bot = Some(spawn_bot(&binary).await?);
     let mut desired_running = true;
     let mut failures = 0u8;
@@ -222,26 +236,36 @@ async fn core(binary: PathBuf) -> Result<(), ErrorBox> {
     let mut started = tokio::time::Instant::now();
     let mut supervision = tokio::time::interval(Duration::from_secs(2));
     let readers = Arc::new(Semaphore::new(32));
-    let (requests_tx, mut requests_rx) = mpsc::channel::<(Request, BufReader<TcpStream>)>(32);
-    write_endpoint(&endpoint).await?;
+    let (requests_tx, mut requests_rx) =
+        mpsc::channel::<(Option<Request>, Option<&'static str>, BufReader<TcpStream>)>(32);
+    write_endpoint(&endpoint, "core.json").await?;
+    write_endpoint(&viewer_endpoint, "viewer.json").await?;
     println!("コアを起動しました。BotのDiscord接続状態はログで確認してください。");
     loop {
-        let (input, mut reader) = tokio::select! {
+        let (input, role, mut reader) = tokio::select! {
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
                 let Ok(permit) = readers.clone().try_acquire_owned() else { continue };
                 let sender = requests_tx.clone();
                 let expected_secret = secret.clone();
+                let expected_viewer = viewer_secret.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
                     let mut reader = BufReader::new(stream);
                     let Ok(Ok(Some(line))) = tokio::time::timeout(
                         Duration::from_secs(3), read_frame(&mut reader, MAX_REQUEST_BYTES)
-                    ).await else { return };
-                    let Ok(input) = serde_json::from_slice::<Request>(&line) else { return };
-                    if bool::from(input.secret.expose_secret().as_bytes().ct_eq(expected_secret.expose_secret().as_bytes())) {
-                        let _ = sender.try_send((input, reader));
-                    }
+                    ).await else {
+                        let _ = sender.try_send((None, None, reader));
+                        return;
+                    };
+                    let input = serde_json::from_slice::<Request>(&line).ok();
+                    let role = input.as_ref().and_then(|input| {
+                        let candidate = input.secret.expose_secret().as_bytes();
+                        if bool::from(candidate.ct_eq(expected_secret.expose_secret().as_bytes())) { Some("admin") }
+                        else if bool::from(candidate.ct_eq(expected_viewer.expose_secret().as_bytes())) { Some("viewer") }
+                        else { None }
+                    });
+                    let _ = sender.try_send((input, role, reader));
                 });
                 continue;
             },
@@ -263,6 +287,31 @@ async fn core(binary: PathBuf) -> Result<(), ErrorBox> {
                 continue;
             }
         };
+        let command = input.as_ref().map(|v| v.command.as_str()).unwrap_or("");
+        let operation = match command {
+            "status" | "metrics-json" | "metrics-prometheus" => "status",
+            "logs" => "logs",
+            "list-unknown" => "inspect",
+            "start" | "restart" | "update" => "update",
+            "stop" => "stop",
+            "shutdown" => "shutdown",
+            _ => "unknown",
+        };
+        let audit_request = AuditRequest {
+            principal: role.map_or_else(Principal::unauthenticated, |r| {
+                Principal::authenticated("local-capability", r)
+            }),
+            operation: operation.into(),
+            bot_id: Some("local-bot".into()),
+            shard_id: None,
+            remote: false,
+            confirmation: Confirmation::None,
+        };
+        if role.is_none() {
+            let _ = audit.execute(&audit_request, || Ok(()));
+            continue;
+        }
+        let input = input.expect("authenticated request");
         if let Some(process) = bot.as_mut()
             && let Some(status) = process.try_wait()?
         {
@@ -271,7 +320,9 @@ async fn core(binary: PathBuf) -> Result<(), ErrorBox> {
             bot = None;
         }
         let mut exit = false;
-        let action: Result<String, ErrorBox> = async {
+        let mut operation_error = None;
+        let action = audit.execute_async(&audit_request, async {
+            let result: Result<String, ErrorBox> = async {
             match input.command.as_str() {
                 "list-unknown" => {
                     let bot = bot.as_mut().ok_or("Gateway unavailable")?;
@@ -279,6 +330,9 @@ async fn core(binary: PathBuf) -> Result<(), ErrorBox> {
                     let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
                     Ok(format!("snapshot_unix_seconds={timestamp}; volatile=true; state=Unknown\n{}", serde_json::to_string(&reply)?))
                 }
+                "logs" => Ok(redact(&tokio::fs::read_to_string(runtime_dir().join("core.log")).await?)),
+                "metrics-json" => Ok(serde_json::to_string(&metrics.snapshots())?),
+                "metrics-prometheus" => Ok(metrics.render_prometheus()),
                 "status" => Ok(format!("{}\n直近のエラー: {}\n自動再起動: {}/3\nログ: {}", match &bot {
                     Some(process) => format!("コア: 稼働中 (PID: {})\nBotプロセス: 稼働中 (PID: {})\nDiscord接続: Botのログで確認してください", std::process::id(), process.id().unwrap_or_default()),
                     None => format!("コア: 稼働中 (PID: {})\nBotプロセス: 停止中", std::process::id()),
@@ -309,14 +363,19 @@ async fn core(binary: PathBuf) -> Result<(), ErrorBox> {
                 "shutdown" => { desired_running = false; stop_bot(&mut bot).await?; exit = true; Ok("Botとコアを停止しました。メモリ内の状態は失われます。".into()) }
                 _ => Err("不明なコマンドです".into()),
             }
-        }.await;
+            }.await;
+            result.map_err(|error| { operation_error = Some(redact(&error.to_string())); "operation_failed".to_owned() })
+        }).await;
         let reply = match action {
             Ok(message) => Reply {
                 ok: true,
                 message: redact(&message),
             },
             Err(error) => {
-                let message = redact(&format!("{} 失敗: {error}", input.command));
+                let message = redact(&format!(
+                    "management failed: {}",
+                    operation_error.unwrap_or_else(|| error.to_string())
+                ));
                 eprintln!("{message}");
                 last_failure = Some(message.clone());
                 Reply { ok: false, message }
@@ -324,6 +383,9 @@ async fn core(binary: PathBuf) -> Result<(), ErrorBox> {
         };
         let mut data = serde_json::to_vec(&reply)?;
         data.push(b'\n');
+        if data.len() > 64 * 1024 {
+            data = b"{\"ok\":false,\"message\":\"response exceeds limit\"}\n".to_vec();
+        }
         let _ =
             tokio::time::timeout(Duration::from_secs(3), reader.get_mut().write_all(&data)).await;
         if exit {
@@ -331,6 +393,7 @@ async fn core(binary: PathBuf) -> Result<(), ErrorBox> {
         }
     }
     let _ = tokio::fs::remove_file(runtime_dir().join("core.json")).await;
+    let _ = tokio::fs::remove_file(runtime_dir().join("viewer.json")).await;
     Ok(())
 }
 fn launch_core(path: &Path) -> Result<(), ErrorBox> {
@@ -403,27 +466,19 @@ async fn run() -> Result<(), ErrorBox> {
             }
             Err("コアの起動を確認できません。src/core-runtime/core.log を確認してください".into())
         }
-        "list-unknown" | "status" | "stop" | "restart" | "update" | "shutdown" => {
-            match request(command).await {
-                Ok(message) => {
-                    println!("{message}");
-                    Ok(())
-                }
-                Err(error) => {
-                    Err(format!("コアに接続できないか、コマンドが失敗しました: {error}").into())
-                }
+        "list-unknown" | "status" | "metrics-json" | "metrics-prometheus" | "logs" | "stop"
+        | "restart" | "update" | "shutdown" => match request(command).await {
+            Ok(message) => {
+                println!("{message}");
+                Ok(())
             }
-        }
-        "logs" => {
-            print!(
-                "{}",
-                redact(&tokio::fs::read_to_string(runtime_dir().join("core.log")).await?)
-            );
-            Ok(())
-        }
+            Err(error) => {
+                Err(format!("コアに接続できないか、コマンドが失敗しました: {error}").into())
+            }
+        },
         _ => {
             println!(
-                "使い方: cargo run --bin manage -- <start|list-unknown|status|stop|restart|update|logs|shutdown>"
+                "使い方: cargo run --bin manage -- <start|list-unknown|status|metrics-json|metrics-prometheus|stop|restart|update|logs|shutdown>"
             );
             Ok(())
         }

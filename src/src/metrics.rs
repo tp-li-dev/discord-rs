@@ -8,7 +8,8 @@
 //! saturate rather than wrap. No reset/removal API is provided: cardinality caps
 //! apply to the registry's entire lifetime, including generation churn.
 //!
-//! This module is not wired to Gateway/Core, botctl, or an HTTP listener. Callers
+//! This module is not wired to Gateway/Core, botctl, or an HTTP listener. The local
+//! manage server exposes its own registry, initially empty. Callers
 //! must supply measurements and expose output through authenticated management.
 //! Only public identifiers belong in labels. Credential checks reject known
 //! shapes, not arbitrary unknown secrets; never pass tokens to this API.
