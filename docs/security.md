@@ -1,6 +1,6 @@
 # 秘密情報とログの安全性
 
-2026-11-12 調査・一部適用。基準は architecture.md §4.3 / §13.1。管理・登録・更新・診断 CLI と配置型の出力にマスクを接続した。全ログ経路への適用は未完了。progress.md は PM が統合するため変更していない。
+2026-11-12 調査・一部適用。基準は architecture.md §4.3 / §13.1。管理・登録・更新・診断 CLI、配置型に加え、worker.rs / main.rs の後述する出力境界に保護を接続した。全ログ経路への適用は未完了。progress.md は PM が統合するため変更していない。
 
 ## 追加 API と適用範囲
 
@@ -44,21 +44,29 @@
 - `placement.rs`: 設定・配置・起動 intent の自由文字列を Debug 時に `Secret` で丸ごと隠す。短い無ラベル文字列も対象。PlacementError の Display / Debug は `redact` を通す。Serialize の wire 内容や実配置の値は変更しない。
 - `local_control.rs` の認証・JSON 失敗、`gateway_metadata.rs` の HTTP 失敗、`identify.rs` は既に固定エラーで本文を出していない。`interaction_flow.rs`、`response_drain.rs`、`drain.rs`、`switch.rs` は秘密を含むログ経路がなく、Debug は分類・数値・状態のみ。これらは変更していない。
 
-### 未対応：PM 向け worker.rs / main.rs の具体的修正候補
+### worker.rs / main.rs の候補への対応
 
-行番号は今回の調査時点。これらのファイルは別作業の担当範囲として編集していない。
+行番号は適用前の調査時点。以下の候補は今回対応した。短い無ラベルの秘密を含み得る外部エラーは、文字列検出に頼らず `Secret` で本文全体を隠す。
 
-| 箇所 | 修正案 |
+| 調査時の箇所 | 実装した対策 |
 |---|---|
-| `main.rs:126` | Ready の `user.name` を直接表示せず、安全な数値 ID または固定文へ置換。必要な本文には `Redacted` を適用。 |
-| `main.rs:136,192,273` | Ready / Worker / Gateway の外部エラー本文を固定分類へ置換するか、整形後の文字列に `redact` を適用する。 |
-| `main.rs:167,222` | 応答追跡エラーの型・伝播元を確認し、秘密を含みうる本文は固定分類へ置換。 |
-| `main.rs:83,99` の最上位 `Result` と token 読込 | `?` の自動 Debug 出力を避ける main/run 境界を設け、マスク済み Display のみ出力。既知 token は `Secret` に保持し、非 Unicode 値を含む VarError は固定分類にする。 |
-| `worker.rs:494,662` | 子から受け取った Rejected reason をエラーへ直接取り込まず、固定分類またはマスク済み文字列へ変換。 |
-| `worker.rs:503–507` | 更新先 path の直接表示を避け、世代 ID 等を表示。任意の短い秘密がパスに含まれる場合は `redact` の検出に依存せず全体を隠す。 |
-| `worker.rs:619,696,720,725,730,737` | 外部エラーと write_error のログ境界へ `redact`、可能なら固定分類を適用。 |
-| `worker.rs:725–730` | 更新エラーの状態ファイル書込前にも保護を適用し、永続保存・他プロセスへの返却で生のエラーが残らないようにする。 |
-| `worker.rs:837` | `error.to_string()` を Rejected reason に入れる前に分類・マスクし、IPC 受信側だけの保護に依存しない。 |
+| `main.rs:126` | Ready の直接ログは数値 user.id のみ。イベントの bot_name 自体は機能データとして維持する。 |
+| `main.rs:136,192,273` | Ready / Worker / Gateway のエラーは固定コンテキストと `Secret`。外部エラーの Display / Debug を呼ばない。 |
+| `main.rs:167,222` | 応答追跡エラーにも同じ出力境界を適用。Interaction outcome は閉じた列挙型の分類のみ。 |
+| `main.rs:83,99` | main/run と ExitCode を分離し自動 Debug 出力を排除。Bot token は `Secret<String>`、Interaction token は `Arc<Secret<String>>` に保持し HTTP 呼出時だけ明示参照する。欠落・非 Unicode 環境変数は固定分類。非 Unicode 引数も args_os で扱う。 |
+| `worker.rs:494,662` | 子の Rejected reason は `Secret` で全体を隠してから Manager のエラーへ変換。復元拒否も同様。 |
+| `worker.rs:503–507` | 更新成功ログから更新先パス全体を除き、Worker 番号と pool サイズのみ表示。spawn 失敗も固定分類。 |
+| `worker.rs:619,696,720,725,730,737` | job・再起動・復旧・ファイル操作失敗の外部本文を `Secret` で隠す。表示用 build は `redact` を通す。 |
+| `worker.rs:725–730` | 更新失敗の診断は `Secret` と `redact` を通し、同じ安全な文字列をログと状態ファイルの error フィールドへ保存する。 |
+| `worker.rs:837` | 不正な状態の Rejected reason は固定の `invalid worker state`。親の不正 Response デコードエラーも固定分類で、serde の未信頼入力本文を伝播しない。 |
+
+更新状態ファイルの成功パスと失敗 JSON の `path` は、reload が要求と応答を完全一致で照合するための制御データであり、引き続き正確なパスを保持する。診断ログには出力しない。パスを含む wire データ全体のマスクや状態ファイルのアクセス権変更は行っていない。この照合フィールドへ秘密を埋め込まない運用とファイル権限制限が必要であり、任意のファイル名の秘密まで保存されないという保証ではない。
+
+担当外の `cogs/mod.rs` / framework の任意 logger は未変更で、Ready の bot_name を表示し得る。アプリの panic hook、子プロセス自身の stderr、Twilight 等の独自ログもこの境界では保護しない。TaskManager がパニックを固定分類へ変換しても、標準 panic hook の出力保護を意味しない。
+
+`src/tests/main_security.rs` は実バイナリの欠落・非 Unicode token、不正 Worker JSON（短い無ラベル秘密を含む）、正常 health wire を確認する。main の単体試験は、外部 Display / Debug を実行しないこと、token 読込分類、Interaction identity の HTTP 相当クロージャへの引渡しを確認する。`src/tests/worker_replay.rs` は未信頼のコマンド・restore 拒否理由の保護と、実 watch が書く失敗状態の診断文字列の保護、旧 Worker 継続を確認する。すべて架空値を使用する。実 Discord・実 HTTP の例外ログと Linux は未検証。
+
+今回の統合後、Windows / Rust 1.99.0 で `cargo test --offline --workspace` は293件（新規24件、doc-testを含む）成功。`cargo clippy --offline --workspace --all-targets -- -D warnings`、`cargo fmt --all --check`、`git diff --check` も成功した。release ビルドを伴う既存 reload / 管理 / 更新試験を含む。子 cargo も `CARGO_NET_OFFLINE=true` で実行した。これらは任意 logger・panic hook・外部ライブラリ出力の秘密保護を保証する結果ではない。
 
 ### 今回の回帰試験
 

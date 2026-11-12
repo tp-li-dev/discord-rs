@@ -53,6 +53,7 @@ pub struct Event {
     pub payload: Vec<u8>,
 }
 
+#[derive(Clone)]
 struct Slot {
     event: Event,
     accepted: bool,
@@ -67,6 +68,7 @@ pub enum Error {
 /// ACKed holes keep their slots until the prefix is ACKed, bounding ACK metadata
 /// as well as payload memory. Interaction capacity is reserved, not reordered:
 /// events always remain in IPC sequence order; this is not a deadline scheduler.
+#[derive(Clone)]
 pub struct Sender {
     slots: VecDeque<Slot>,
     capacity: usize,
@@ -197,6 +199,16 @@ impl Sender {
     pub fn accepted_prefix(&self) -> Option<u64> {
         self.retired
     }
+
+    /// Admission cursor consistent with the contiguous ACK prefix. Transfer it
+    /// together with this sender while routing is locked, before replaying.
+    /// None means the u64 sequence space was exhausted, not a fresh stream.
+    pub fn receiver_checkpoint(&self) -> Option<u64> {
+        match self.retired {
+            Some(last) => last.checked_add(1),
+            None => Some(self.first),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -218,6 +230,10 @@ impl Receiver {
     /// `first` is the explicitly agreed IPC checkpoint, not a Discord sequence.
     pub fn new(first: u64) -> Self {
         Self { next: Some(first) }
+    }
+
+    pub fn from_checkpoint(next: Option<u64>) -> Self {
+        Self { next }
     }
 
     pub fn accept(
