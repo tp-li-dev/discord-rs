@@ -1,14 +1,15 @@
 //! Transport-independent interaction routing and an optional state adapter API.
-//! Discord/Worker transports are not connected.
+//! The Worker host supplies authenticated transport and generation drain signals.
 //!
 //! The host must authenticate IDs, isolate bot/shard and interaction kind, check
 //! expiry and bind the stored envelope to the decoded route before returning it.
 //! A route or state key is not user authorization or protection against replay.
 use crate::{BotResult, CommandFuture};
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{fmt, future::Future, pin::Pin, sync::Mutex};
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum InteractionKind {
     Component,
     Modal,
@@ -78,6 +79,8 @@ pub enum InteractionError {
     CapacityExceeded,
     /// A write may have committed. Reconcile with storage before retrying.
     UnknownOutcome,
+    /// This generation has stopped admission or its drain signal was closed.
+    Draining,
 }
 impl InteractionError {
     /// Safe, fixed text suitable for an adapter's interaction error response.
@@ -98,6 +101,7 @@ impl InteractionError {
             }
             Self::CapacityExceeded => "Interaction state exceeds the storage limit.",
             Self::UnknownOutcome => "The interaction state write outcome is unknown.",
+            Self::Draining => "This interaction generation is draining.",
         }
     }
 }
@@ -185,6 +189,7 @@ pub struct InteractionContext<'a> {
     kind: InteractionKind,
     custom_id: &'a str,
     route: &'a Route,
+    drain: Option<tokio::sync::watch::Receiver<bool>>,
 }
 impl InteractionContext<'_> {
     /// Decode the snapshot validated when dispatch began. Use `load_state` for a
@@ -265,6 +270,16 @@ impl InteractionContext<'_> {
     pub fn values(&self) -> &[String] {
         self.values
     }
+    /// Wait only within the current host generation. Drain cancels this local
+    /// future, leaving saved state/subscriptions intact. The handler may finish
+    /// its cleanup and reply after cancellation; it is not forcibly aborted.
+    /// Legacy `Registry::dispatch` has no host signal and fails closed here.
+    pub async fn wait_for<F: Future>(&self, future: F) -> Result<F::Output, WaitCancelled> {
+        let Some(drain) = &self.drain else {
+            return Err(WaitCancelled::SignalClosed);
+        };
+        wait_for(future, drain.clone()).await
+    }
     pub async fn reply(&self, message: impl Into<String>) -> BotResult<()> {
         self.replies
             .lock()
@@ -311,7 +326,53 @@ impl Registry {
         values: &[String],
         replies: &Mutex<Vec<String>>,
     ) -> Result<(), InteractionError> {
+        self.dispatch_inner(store, kind, custom_id, values, replies, None)
+            .await
+    }
+
+    /// Dispatch admitted host work with a generation-scoped drain signal.
+    /// The host must stop admission before setting true and never reset it.
+    /// This cancels only explicit `ctx.wait_for` calls, not the entire handler
+    /// or a state write whose outcome may already have become uncertain.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn dispatch_with_drain(
+        &self,
+        store: &dyn InteractionStateStore,
+        kind: InteractionKind,
+        custom_id: &str,
+        values: &[String],
+        replies: &Mutex<Vec<String>>,
+        drain: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(), InteractionError> {
+        self.dispatch_inner(store, kind, custom_id, values, replies, Some(drain))
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_inner(
+        &self,
+        store: &dyn InteractionStateStore,
+        kind: InteractionKind,
+        custom_id: &str,
+        values: &[String],
+        replies: &Mutex<Vec<String>>,
+        drain: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> Result<(), InteractionError> {
+        let accepting = || {
+            if drain
+                .as_ref()
+                .is_some_and(|signal| *signal.borrow() || signal.has_changed().is_err())
+            {
+                Err(InteractionError::Draining)
+            } else {
+                Ok(())
+            }
+        };
+        accepting()?;
         let state = store.restore(kind, custom_id).await?;
+        // A restore can await remote I/O. Recheck before starting application
+        // code so a drain that began during the read cannot admit a handler.
+        accepting()?;
         let route = &state.route;
         let handler = self.handlers.iter().find(|h| {
             h.kind == kind
@@ -338,6 +399,7 @@ impl Registry {
             kind,
             custom_id,
             route,
+            drain,
         })
         .await
         .map_err(|error| {

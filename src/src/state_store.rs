@@ -1,4 +1,4 @@
-//! Optional, asynchronous application state. No database or file I/O runs here.
+//! Optional, asynchronous application state. Blocking file I/O is offloaded.
 //!
 //! The memory backend is volatile: cloning a handle shares state within one
 //! process, not across process/host failure. External backends must implement
@@ -142,7 +142,7 @@ impl StateId {
         Self(bytes)
     }
     /// Uses OS entropy. Prepare IDs outside the Gateway heartbeat/dispatch path;
-    /// get/put/delete themselves never call the RNG or perform storage I/O.
+    /// State operations do not call the RNG; backend I/O follows its contract.
     pub fn random() -> Result<Self, StateError> {
         let mut bytes = [0; 16];
         getrandom::fill(&mut bytes).map_err(|_| StateError::RandomUnavailable)?;
@@ -487,6 +487,395 @@ impl StateStore for MemoryStateStore {
                 Ok(false)
             }
         })
+    }
+}
+
+/// Bounded, append-only local-file backend for development and single-host use.
+/// Each operation reloads under an OS file lock, so separately opened handles in
+/// overlapping Worker generations share atomic CAS and monotonically increasing
+/// revisions. Blocking work runs in `spawn_blocking`, never on a Tokio executor.
+///
+/// Success acknowledges `sync_all` of a complete checksummed snapshot. A torn
+/// final frame is ignored and truncated before the next write; a complete but
+/// invalid frame fails closed. Cancellation may leave a complete committed write
+/// (the blocking task continues); callers must reconcile rather than blindly retry.
+/// No automatic retries, compaction, encryption, distributed fencing or delivery
+/// are supplied. Journal exhaustion fails before writing and preserves live data.
+///
+/// Keep the file in an application-owned directory on a local filesystem, and do
+/// not replace/remove it while any handle is live. Unix creation uses mode 0600;
+/// Windows inherits directory ACLs, which this backend does not verify. Filesystem
+/// lock enforcement, machine/power failure, directory-entry durability, network
+/// filesystems and storage corruption recovery are outside the verified model.
+/// Persisted write timestamps reject clock regression across restarts; read-only
+/// timestamps are tracked per handle. Cross-host clocks need an external backend.
+#[derive(Clone)]
+pub struct FileStateStore {
+    file: Arc<std::sync::Mutex<std::fs::File>>,
+    limits: StoreLimits,
+    max_journal_bytes: u64,
+    clock: Arc<dyn StateClock>,
+    last_now: Arc<std::sync::Mutex<Option<Timestamp>>>,
+}
+
+impl fmt::Debug for FileStateStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("FileStateStore([REDACTED])")
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileSnapshot {
+    format: u16,
+    revision: u64,
+    last_now: Option<Timestamp>,
+    records: Vec<(StateKey, StateRecord)>,
+}
+
+impl FileStateStore {
+    pub async fn open(
+        path: impl AsRef<std::path::Path>,
+        limits: StoreLimits,
+        max_journal_bytes: u64,
+        clock: Arc<dyn StateClock>,
+    ) -> Result<Self, StateError> {
+        let path = path.as_ref().to_owned();
+        let file = tokio::task::spawn_blocking(move || {
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true).write(true).create(true).truncate(false);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let file = options
+                .open(path)
+                .map_err(|_| StateError::BackendUnavailable)?;
+            if !file
+                .metadata()
+                .map_err(|_| StateError::BackendUnavailable)?
+                .is_file()
+            {
+                return Err(StateError::BackendUnavailable);
+            }
+            Ok(file)
+        })
+        .await
+        .map_err(|_| StateError::BackendUnavailable)??;
+        let store = Self {
+            file: Arc::new(std::sync::Mutex::new(file)),
+            limits,
+            max_journal_bytes,
+            clock,
+            last_now: Arc::new(std::sync::Mutex::new(None)),
+        };
+        store.operation(|_| Ok(((), false))).await?;
+        Ok(store)
+    }
+
+    async fn operation<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(&mut MemoryInner) -> Result<(T, bool), StateError> + Send + 'static,
+    ) -> Result<T, StateError> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let file = store
+                .file
+                .lock()
+                .map_err(|_| StateError::BackendUnavailable)?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                match file.try_lock() {
+                    Ok(()) => break,
+                    Err(std::fs::TryLockError::WouldBlock)
+                        if std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => return Err(StateError::BackendUnavailable),
+                }
+            }
+            struct Unlock<'a>(&'a std::fs::File);
+            impl Drop for Unlock<'_> {
+                fn drop(&mut self) {
+                    let _ = self.0.unlock();
+                }
+            }
+            let _unlock = Unlock(&file);
+            let (mut inner, committed_len) = store.read_journal(&file)?;
+            let now = inner.observe(store.clock.as_ref())?;
+            let mut last_now = store
+                .last_now
+                .lock()
+                .map_err(|_| StateError::BackendUnavailable)?;
+            if last_now.is_some_and(|previous| now < previous) {
+                return Err(StateError::ClockRegressed);
+            }
+            *last_now = Some(now);
+            inner.purge(now);
+            let (result, changed) = operation(&mut inner)?;
+            if changed {
+                store.append_snapshot(&file, &inner, committed_len)?;
+            }
+            Ok(result)
+        })
+        .await
+        // A panic/cancelled JoinHandle can occur after the disk write started.
+        .map_err(|_| StateError::UnknownOutcome)?
+    }
+
+    fn checksum(bytes: &[u8]) -> Vec<u8> {
+        // An unkeyed corruption checksum, not authentication of filesystem data.
+        let provider = rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256
+            .tls13()
+            .expect("TLS 1.3 suite")
+            .hkdf_provider;
+        provider
+            .hmac_sign(&OkmBlock::new(b"file-state-snapshot-v1"), bytes)
+            .as_ref()
+            .to_vec()
+    }
+
+    fn read_journal(&self, file: &std::fs::File) -> Result<(MemoryInner, u64), StateError> {
+        use std::io::{Read, Seek, SeekFrom};
+        let len = file
+            .metadata()
+            .map_err(|_| StateError::BackendUnavailable)?
+            .len();
+        if len > self.max_journal_bytes {
+            return Err(StateError::CapacityExceeded);
+        }
+        let mut reader = file;
+        reader
+            .seek(SeekFrom::Start(0))
+            .map_err(|_| StateError::BackendUnavailable)?;
+        let mut bytes = Vec::new();
+        reader
+            .take(self.max_journal_bytes.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|_| StateError::BackendUnavailable)?;
+        if bytes.len() as u64 > self.max_journal_bytes {
+            return Err(StateError::CapacityExceeded);
+        }
+        let mut inner = MemoryInner::default();
+        let mut offset = 0;
+        while bytes.len() - offset >= 16 {
+            let length = u64::from_be_bytes(bytes[offset..offset + 8].try_into().expect("header"));
+            let complement =
+                u64::from_be_bytes(bytes[offset + 8..offset + 16].try_into().expect("header"));
+            if length != !complement {
+                return Err(StateError::InvalidState);
+            }
+            let length = usize::try_from(length).map_err(|_| StateError::InvalidState)?;
+            let end = offset
+                .checked_add(16)
+                .and_then(|n| n.checked_add(length))
+                .and_then(|n| n.checked_add(33))
+                .ok_or(StateError::InvalidState)?;
+            if end as u64 > self.max_journal_bytes {
+                return Err(StateError::InvalidState);
+            }
+            if end > bytes.len() {
+                break;
+            }
+            let data = &bytes[offset + 16..offset + 16 + length];
+            if bytes[end - 1] != b'\n' || Self::checksum(data) != bytes[end - 33..end - 1] {
+                return Err(StateError::InvalidState);
+            }
+            let snapshot: FileSnapshot =
+                serde_json::from_slice(data).map_err(|_| StateError::InvalidState)?;
+            if snapshot.format != 1
+                || snapshot.revision <= inner.revision
+                || snapshot.last_now < inner.last_now
+            {
+                return Err(StateError::InvalidState);
+            }
+            let mut next = MemoryInner {
+                revision: snapshot.revision,
+                last_now: snapshot.last_now,
+                ..MemoryInner::default()
+            };
+            for (key, record) in snapshot.records {
+                if record.revision == 0
+                    || record.revision > snapshot.revision
+                    || record.value.data.len() > self.limits.max_value_bytes
+                {
+                    return Err(StateError::InvalidState);
+                }
+                next.bytes = next
+                    .bytes
+                    .checked_add(
+                        key.charged_bytes(record.value.data.len())
+                            .ok_or(StateError::CapacityExceeded)?,
+                    )
+                    .ok_or(StateError::CapacityExceeded)?;
+                if next.records.insert(key, record).is_some() {
+                    return Err(StateError::InvalidState);
+                }
+            }
+            if next.records.len() > self.limits.max_entries || next.bytes > self.limits.max_bytes {
+                return Err(StateError::CapacityExceeded);
+            }
+            inner = next;
+            offset = end;
+        }
+        Ok((inner, offset as u64))
+    }
+
+    fn append_snapshot(
+        &self,
+        file: &std::fs::File,
+        inner: &MemoryInner,
+        committed_len: u64,
+    ) -> Result<(), StateError> {
+        use std::io::{Seek, SeekFrom, Write};
+        let snapshot = FileSnapshot {
+            format: 1,
+            revision: inner.revision,
+            last_now: inner.last_now,
+            records: inner
+                .records
+                .iter()
+                .map(|(key, record)| (key.clone(), record.clone()))
+                .collect(),
+        };
+        let data = serde_json::to_vec(&snapshot).map_err(|_| StateError::Encoding)?;
+        let frame_len = (data.len() as u64)
+            .checked_add(49)
+            .ok_or(StateError::CapacityExceeded)?;
+        if committed_len
+            .checked_add(frame_len)
+            .is_none_or(|len| len > self.max_journal_bytes)
+        {
+            return Err(StateError::CapacityExceeded);
+        }
+        let mut writer = file;
+        // Remove only a torn tail while holding the OS lock; earlier snapshots survive.
+        file.set_len(committed_len)
+            .map_err(|_| StateError::UnknownOutcome)?;
+        writer
+            .seek(SeekFrom::Start(committed_len))
+            .map_err(|_| StateError::UnknownOutcome)?;
+        writer
+            .write_all(&(data.len() as u64).to_be_bytes())
+            .map_err(|_| StateError::UnknownOutcome)?;
+        writer
+            .write_all(&(!(data.len() as u64)).to_be_bytes())
+            .map_err(|_| StateError::UnknownOutcome)?;
+        writer
+            .write_all(&data)
+            .map_err(|_| StateError::UnknownOutcome)?;
+        writer
+            .write_all(&Self::checksum(&data))
+            .map_err(|_| StateError::UnknownOutcome)?;
+        writer
+            .write_all(b"\n")
+            .map_err(|_| StateError::UnknownOutcome)?;
+        file.sync_all().map_err(|_| StateError::UnknownOutcome)
+    }
+}
+
+impl StateStore for FileStateStore {
+    fn get<'a>(
+        &'a self,
+        key: &'a StateKey,
+        reader: SchemaVersion,
+    ) -> StoreFuture<'a, Option<StateRecord>> {
+        let key = key.clone();
+        Box::pin(self.operation(move |inner| {
+            let record = inner.records.get(&key);
+            if record.is_some_and(|record| !reader.can_read(record.value.schema)) {
+                return Err(StateError::IncompatibleSchema);
+            }
+            Ok((record.cloned(), false))
+        }))
+    }
+    fn put(
+        &self,
+        key: StateKey,
+        value: StateValue,
+        condition: PutCondition,
+    ) -> StoreFuture<'_, u64> {
+        let limits = self.limits;
+        Box::pin(self.operation(move |inner| {
+            if value.data.len() > limits.max_value_bytes {
+                return Err(StateError::ValueTooLarge);
+            }
+            if value
+                .expires_at
+                .is_some_and(|expiry| inner.last_now.is_some_and(|now| now >= expiry))
+            {
+                return Err(StateError::InvalidExpiry);
+            }
+            let old = inner.records.get(&key);
+            match condition {
+                PutCondition::IfAbsent if old.is_some() => return Err(StateError::Conflict),
+                PutCondition::IfRevision(revision)
+                    if old.map(|record| record.revision) != Some(revision) =>
+                {
+                    return Err(StateError::Conflict);
+                }
+                _ => {}
+            }
+            let old_size = old.map_or(0, |record| {
+                key.charged_bytes(record.value.data.len())
+                    .expect("validated size")
+            });
+            let bytes = (inner.bytes - old_size)
+                .checked_add(
+                    key.charged_bytes(value.data.len())
+                        .ok_or(StateError::CapacityExceeded)?,
+                )
+                .ok_or(StateError::CapacityExceeded)?;
+            if bytes > limits.max_bytes
+                || (old.is_none() && inner.records.len() >= limits.max_entries)
+            {
+                return Err(StateError::CapacityExceeded);
+            }
+            inner.revision = inner
+                .revision
+                .checked_add(1)
+                .ok_or(StateError::RevisionExhausted)?;
+            inner.records.insert(
+                key,
+                StateRecord {
+                    value,
+                    revision: inner.revision,
+                },
+            );
+            inner.bytes = bytes;
+            Ok((inner.revision, true))
+        }))
+    }
+    fn delete<'a>(
+        &'a self,
+        key: &'a StateKey,
+        expected_revision: Option<u64>,
+    ) -> StoreFuture<'a, bool> {
+        let key = key.clone();
+        Box::pin(self.operation(move |inner| {
+            if expected_revision.is_some_and(|revision| {
+                inner.records.get(&key).map(|record| record.revision) != Some(revision)
+            }) {
+                return Err(StateError::Conflict);
+            }
+            if let Some(record) = inner.records.remove(&key) {
+                inner.bytes -= key
+                    .charged_bytes(record.value.data.len())
+                    .expect("validated size");
+                inner.revision = inner
+                    .revision
+                    .checked_add(1)
+                    .ok_or(StateError::RevisionExhausted)?;
+                Ok((true, true))
+            } else {
+                Ok((false, false))
+            }
+        }))
+    }
+    fn durability(&self) -> Durability {
+        Durability::Durable
     }
 }
 
@@ -850,9 +1239,10 @@ impl InteractionStore {
 ///
 /// Retain the backend and independent signing key across Core generations. This
 /// adapter does not improve backend durability: MemoryStateStore remains volatile.
-/// Worker transport, user authorization, admission/fencing, reply tracking and
-/// Subscription delivery are separate host responsibilities and are not connected
-/// here. It never needs a Bot token or treats a signed ID as user authorization.
+/// The Worker host connects transport, admission, drain and reply tracking;
+/// those responsibilities are not implemented by this adapter. User authorization,
+/// ownership fencing and Subscription delivery remain host responsibilities.
+/// It never needs a Bot token or treats a signed ID as user authorization.
 pub struct FrameworkStateStore {
     namespace: PublicLabel,
     components: InteractionStore,
