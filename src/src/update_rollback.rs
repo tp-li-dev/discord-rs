@@ -1,4 +1,4 @@
-//! Offline, shard-by-shard update/rollback planning. No candidate is executed.
+//! Shard-by-shard update/rollback planning and authenticated daemon requests.
 //!
 //! CLI: `botctl update BOT --plan manifest.json [--component core|gateway|all]`.
 //! `rollback` uses the same format with the previous software's artifacts, but
@@ -14,21 +14,24 @@
 //! supplied age plus time spent planning is only an offline estimate, not proof
 //! of freshness, a reservation, ownership, quorum, a lease, or readiness.
 //!
-//! # Future daemon control contract (not connected)
-//! [`UpdateControlRequest`] is a proposed extension of daemon `CommandRequest`.
+//! # Daemon control contract
+//! [`UpdateControlRequest`] extends daemon `CommandRequest` on the client side.
 //! Carry it in the existing anonymous-bootstrap authenticated loopback envelope
 //! (`secret` supplied by the transport, never stored in the plan), newline JSON,
 //! 4096-byte request / 64-KiB response limits and existing operation-ID polling.
 //! Count the authentication envelope in the request limit: a large manifest may
 //! not fit. Reject it before any mutation; generate a smaller, explicitly reviewed
 //! plan rather than silently truncating shards or fragmenting an operation.
-//! The current daemon rejects this extension; botctl never sends it. `--yes`
-//! returns unsupported without connecting or reading a bootstrap. Specifying
-//! `--bootstrap-stdin` is required for that invocation but is not authentication:
-//! until a daemon handler exists, authentication cannot be verified and every
-//! execution attempt is refused.
+//! With `--yes --bootstrap-stdin`, botctl sends it once and polls the operation
+//! endpoint. The server binds the capability to a trusted launch-time principal,
+//! role and optional Shard scope, then uses the audited update executor. Normal
+//! runtime and Core/all execution remain unsupported and fail closed. Explicit
+//! test Gateway-switch mode supports Gateway updates using mock Discord only.
+//! Artifact paths sent by botctl are absolute paths on the same local host.
+//! Successful operations add `final_generations` entries of the form
+//! `{shard_id, core: generation, gateway: generation}` (selected components only).
 //!
-//! A future handler must authenticate and authorize update privileges, validate
+//! A production executor must authenticate and authorize update privileges, validate
 //! `yes` and operation id, resolve the canonical Bot, compare every current
 //! generation and shard count, rehash the pinned artifact immediately before
 //! launching it, and refresh/reserve Identify budget through the Bot-wide shared
@@ -142,8 +145,8 @@ pub struct Manifest {
     pub identify: Option<IdentifyObservation>,
 }
 
-/// Proposed authenticated envelope payload, deliberately without credentials.
-/// Do not send to the current daemon, which does not support these commands.
+/// Authenticated envelope payload, deliberately without credentials or roles.
+/// The daemon must resolve/authorize the canonical Bot and revalidate live state.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateControlRequest {
@@ -156,6 +159,13 @@ pub struct UpdateControlRequest {
 }
 
 impl UpdateControlRequest {
+    pub fn command_name(&self) -> &'static str {
+        match self.command {
+            Action::Update => "update",
+            Action::Rollback => "rollback",
+        }
+    }
+
     /// Structural checks only, never authentication or authorization.
     pub fn validate(&self) -> Result<(), &'static str> {
         if !self.yes {

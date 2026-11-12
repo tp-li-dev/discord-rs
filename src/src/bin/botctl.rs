@@ -3,7 +3,8 @@
 //! environment variables or a persistent endpoint file.
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use src::update_rollback::{self, Action, Component};
+use src::local_control::DaemonControlEnvelope;
+use src::update_rollback::{self, Action, Component, UpdateControlRequest};
 use src::{botref, placement::Config};
 use std::{collections::HashMap, ffi::OsString, path::PathBuf, time::Duration};
 use tokio::{
@@ -159,13 +160,21 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
     if yes && !force && !update {
         return Err("--yes requires --force stop");
     }
-    if operation_id.is_some() && !matches!(command, "start" | "stop" | "restart" | "operation") {
-        return Err("--operation-id is only supported for start, stop and restart");
+    if operation_id.is_some()
+        && !matches!(
+            command,
+            "start" | "stop" | "restart" | "operation" | "update" | "rollback"
+        )
+    {
+        return Err("--operation-id requires a mutation or operation query");
     }
     if !update && (plan.is_some() || component.is_some() || dry_run || rolling) {
         return Err("update planning options require update or rollback");
     }
     if update {
+        if operation_id.is_some() && !yes {
+            return Err("--operation-id requires --yes for update/rollback");
+        }
         if plan.is_none() {
             return Err(
                 "未実装: daemon-derived update/rollback plans are unavailable; --plan is required",
@@ -288,12 +297,8 @@ fn contains_control_secret(value: &Value, secret: &[u8; 32]) -> bool {
     walk(value, &secret_value, &encoded, &hex)
 }
 
-async fn exchange(bootstrap: &Bootstrap, request: &Request<'_>) -> Result<Value, &'static str> {
-    let mut frame = serde_json::to_vec(request).map_err(|_| "cannot encode control request")?;
-    frame.push(b'\n');
-    if frame.len() > REQUEST_LIMIT {
-        return Err("control request exceeds limit");
-    }
+async fn exchange(bootstrap: &Bootstrap, request: &impl Serialize) -> Result<Value, &'static str> {
+    let frame = encode_request(request)?;
     // No hostname, endpoint file or arbitrary remote address is accepted.
     let mut stream = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, bootstrap.port))
         .await
@@ -313,6 +318,15 @@ async fn exchange(bootstrap: &Bootstrap, request: &Request<'_>) -> Result<Value,
         return Err("daemon response contains control credentials");
     }
     Ok(value)
+}
+
+fn encode_request(request: &impl Serialize) -> Result<Vec<u8>, &'static str> {
+    let mut frame = serde_json::to_vec(request).map_err(|_| "cannot encode control request")?;
+    frame.push(b'\n');
+    if frame.len() > REQUEST_LIMIT {
+        return Err("control request exceeds limit");
+    }
+    Ok(frame)
 }
 
 fn failure(error: impl AsRef<str>, operation_id: Option<&str>, operation: Option<&Value>) -> Value {
@@ -367,7 +381,7 @@ fn operation_state<'a>(value: &'a Value, id: &str, command: &str) -> Result<&'a 
         || !operation["failed_shards"].is_array()
         || !matches!(
             operation["command"].as_str(),
-            Some("start" | "stop" | "restart")
+            Some("start" | "stop" | "restart" | "update" | "rollback")
         )
     {
         return Err("daemon operation has no valid result metadata");
@@ -385,15 +399,103 @@ fn operation_state<'a>(value: &'a Value, id: &str, command: &str) -> Result<&'a 
     }
 }
 
-async fn run(mut options: Options) -> Value {
+fn validate_update_result(
+    value: &Value,
+    expected: Option<&UpdateControlRequest>,
+) -> Result<(), &'static str> {
+    let operation = &value["operation"];
+    if !matches!(operation["command"].as_str(), Some("update" | "rollback")) {
+        return Ok(());
+    }
+    if expected.is_some_and(|expected| operation["bot_id"].as_str() != Some(expected.bot.as_str()))
+    {
+        return Err("daemon update Bot does not match request");
+    }
+    if operation["state"] != "succeeded" {
+        return Ok(());
+    }
+    let generations = operation["final_generations"]
+        .as_array()
+        .filter(|items| !items.is_empty())
+        .ok_or("daemon update has no final generations")?;
+    let mut seen = std::collections::HashSet::new();
+    for entry in generations {
+        let shard = entry["shard_id"]
+            .as_u64()
+            .filter(|id| *id <= u32::MAX as u64)
+            .ok_or("invalid final generation Shard")? as u32;
+        if !seen.insert(shard)
+            || !(entry["core"].as_u64().is_some_and(|g| g > 0)
+                || entry["gateway"].as_u64().is_some_and(|g| g > 0))
+        {
+            return Err("invalid or duplicate final generations");
+        }
+        if let Some(expected) = expected {
+            let target = expected
+                .manifest
+                .shards
+                .iter()
+                .find(|s| s.shard_id == shard)
+                .ok_or("unexpected final generation Shard")?;
+            for (part, selected, generation) in [
+                (
+                    "core",
+                    expected.component != Component::Gateway,
+                    target.core,
+                ),
+                (
+                    "gateway",
+                    expected.component != Component::Core,
+                    target.gateway,
+                ),
+            ] {
+                if selected && entry[part].as_u64() != generation.map(|g| g.candidate) {
+                    return Err("daemon final generation does not match candidate");
+                }
+            }
+        }
+    }
+    if expected.is_some_and(|expected| generations.len() != expected.manifest.shards.len()) {
+        return Err("daemon final generations omit requested Shards");
+    }
+    let shards = operation["shards"]
+        .as_array()
+        .expect("validated operation metadata");
+    let reported: std::collections::HashSet<_> = shards
+        .iter()
+        .filter(|s| s["key"]["bot_id"] == operation["bot_id"])
+        .filter_map(|s| s["key"]["shard_id"].as_u64())
+        .collect();
+    if shards.len() != seen.len()
+        || reported.len() != seen.len()
+        || !seen.iter().all(|s| reported.contains(&u64::from(*s)))
+    {
+        return Err("daemon affected Shards do not match request");
+    }
+    Ok(())
+}
+
+async fn run(options: Options) -> Value {
     if options.command == "config" {
         return config_validate(options.file.as_ref().expect("validated config path"))
             .unwrap_or_else(|error| json!({"ok": false, "offline": true, "error": error}));
     }
     if matches!(options.command, "update" | "rollback") {
-        return run_update(&options).await;
+        return run_update(options).await;
     }
-    let mutation = matches!(options.command, "start" | "stop" | "restart");
+    let deadline = Instant::now() + options.timeout;
+    run_live(options, None, deadline).await
+}
+
+async fn run_live(
+    mut options: Options,
+    update: Option<UpdateControlRequest>,
+    deadline: Instant,
+) -> Value {
+    let mutation = matches!(
+        options.command,
+        "start" | "stop" | "restart" | "update" | "rollback"
+    );
     if mutation && options.operation_id.is_none() {
         options.operation_id = match new_operation_id() {
             Ok(id) => Some(id),
@@ -401,12 +503,56 @@ async fn run(mut options: Options) -> Value {
         };
     }
     let id = options.operation_id.as_deref();
-    let deadline = Instant::now() + options.timeout;
     let bootstrap = match timeout_at(deadline, read_bootstrap()).await {
         Ok(Ok(bootstrap)) => bootstrap,
         Ok(Err(error)) => return failure(error, id, None),
         Err(_) => return failure("control bootstrap timed out; no request sent", id, None),
     };
+    if let Some(update) = &update {
+        // Check the entire authenticated payload before even a read-only query.
+        if let Err(error) = encode_request(&DaemonControlEnvelope {
+            secret: bootstrap.secret,
+            request: update,
+        }) {
+            return failure(error, id, None);
+        }
+        let inspect = Request {
+            secret: &bootstrap.secret,
+            command: "inspect",
+            bot: options.bot.as_deref(),
+            operation_id: None,
+            force: false,
+            yes: false,
+        };
+        let response = match timeout_at(deadline, exchange(&bootstrap, &inspect)).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => return failure(error, id, None),
+            Err(_) => {
+                return failure(
+                    "update target inspection timed out; no mutation sent",
+                    id,
+                    None,
+                );
+            }
+        };
+        if response["ok"] != true {
+            return failure(
+                "daemon rejected update target inspection; no mutation sent",
+                id,
+                None,
+            );
+        }
+        if response["bot"]["bot_id"].as_str() != Some(update.bot.as_str())
+            || response["bot"]["total_shards"].as_u64()
+                != Some(u64::from(update.manifest.total_shards))
+        {
+            return failure(
+                "daemon update target does not match manifest; no mutation sent",
+                id,
+                None,
+            );
+        }
+    }
     let mut request = Request {
         secret: &bootstrap.secret,
         command: options.command,
@@ -416,8 +562,24 @@ async fn run(mut options: Options) -> Value {
         yes: options.yes,
     };
     let mut last = None;
+    let mut send_update = update.is_some();
     loop {
-        let mut response = match timeout_at(deadline, exchange(&bootstrap, &request)).await {
+        let exchange_result = timeout_at(deadline, async {
+            if send_update {
+                exchange(
+                    &bootstrap,
+                    &DaemonControlEnvelope {
+                        secret: bootstrap.secret,
+                        request: update.as_ref().expect("update payload"),
+                    },
+                )
+                .await
+            } else {
+                exchange(&bootstrap, &request).await
+            }
+        })
+        .await;
+        let mut response = match exchange_result {
             Ok(Ok(response)) => response,
             Ok(Err(error)) => return failure(error, id, last.as_ref()),
             Err(_) => {
@@ -439,7 +601,13 @@ async fn run(mut options: Options) -> Value {
         if mutation || options.command == "operation" {
             let id = id.expect("validated or generated operation ID");
             response["operation_id"] = json!(id);
-            match operation_state(&response, id, options.command) {
+            let state = operation_state(&response, id, options.command);
+            if state.is_ok()
+                && let Err(error) = validate_update_result(&response, update.as_ref())
+            {
+                return failure(error, Some(id), last.as_ref());
+            }
+            match state {
                 Ok("succeeded") if response["ok"] == true => return response,
                 Ok("failed" | "succeeded") => {
                     response["ok"] = json!(false);
@@ -475,6 +643,7 @@ async fn run(mut options: Options) -> Value {
             request.bot = None;
             request.force = false;
             request.yes = false;
+            send_update = false;
         } else {
             let valid = match options.command {
                 "ps" => response["bots"].is_array(),
@@ -492,7 +661,7 @@ async fn run(mut options: Options) -> Value {
     }
 }
 
-async fn run_update(options: &Options) -> Value {
+async fn run_update(mut options: Options) -> Value {
     let started = Instant::now();
     let deadline = started + options.timeout;
     let path = options
@@ -511,13 +680,35 @@ async fn run_update(options: &Options) -> Value {
     // Cancellation may finish read-only validation in the background; it can never
     // start a candidate or send a daemon mutation.
     let validation = tokio::task::spawn_blocking(move || {
-        let manifest = update_rollback::load_manifest(&path)?;
+        let mut manifest = update_rollback::load_manifest(&path)?;
         update_rollback::build_plan(&manifest, &selector, action, component, started.elapsed())?;
         update_rollback::verify_artifacts(
             &manifest,
             component,
             path.parent().unwrap_or(std::path::Path::new(".")),
         )?;
+        // The daemon is on this host but may have a different working directory.
+        // It must still rehash the selected artifacts immediately before launch.
+        for (selected, artifact) in [
+            (
+                component != Component::Gateway,
+                &mut manifest.artifacts.core,
+            ),
+            (
+                component != Component::Core,
+                &mut manifest.artifacts.gateway,
+            ),
+        ] {
+            if selected {
+                let artifact = artifact.as_mut().ok_or("missing selected artifact")?;
+                artifact.path = std::fs::canonicalize(
+                    path.parent()
+                        .unwrap_or(std::path::Path::new("."))
+                        .join(&artifact.path),
+                )
+                .map_err(|_| "cannot resolve artifact path")?;
+            }
+        }
         let plan = update_rollback::build_plan(
             &manifest,
             &selector,
@@ -525,10 +716,10 @@ async fn run_update(options: &Options) -> Value {
             component,
             started.elapsed(),
         )?;
-        Ok::<_, &'static str>(plan)
+        Ok::<_, &'static str>((plan, manifest))
     });
-    let plan = match timeout_at(deadline, validation).await {
-        Ok(Ok(Ok(plan))) => plan,
+    let (plan, manifest) = match timeout_at(deadline, validation).await {
+        Ok(Ok(Ok(result))) => result,
         Ok(Ok(Err(error))) => {
             return json!({"ok":false,"offline":true,"applied":false,"error":error});
         }
@@ -549,15 +740,28 @@ async fn run_update(options: &Options) -> Value {
     if !options.yes {
         return value;
     }
-    value["ok"] = json!(false);
-    // The assigned scope ends at the proposed control request types. Do not add
-    // even an inspect connection here. A bootstrap flag or locally supplied
-    // capability does not establish daemon authentication/authorization.
-    value["authenticated"] = json!(false);
-    value["error"] = json!(
-        "未実装: daemon update/rollback authentication and execution are not connected; no request sent"
-    );
-    value
+    let id = match options
+        .operation_id
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(new_operation_id)
+    {
+        Ok(id) => id,
+        Err(error) => return failure(error, None, None),
+    };
+    let update = UpdateControlRequest {
+        command: action,
+        bot: manifest.bot_id.clone(),
+        operation_id: id.clone(),
+        yes: true,
+        component,
+        manifest,
+    };
+    if let Err(error) = update.validate() {
+        return failure(error, Some(&id), None);
+    }
+    options.operation_id = Some(id);
+    run_live(options, Some(update), deadline).await
 }
 
 #[tokio::main(flavor = "current_thread")]

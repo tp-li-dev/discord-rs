@@ -35,6 +35,9 @@ use tokio::{
     process::{Child, Command},
 };
 
+/// Authenticated update admission and off-loop audit/artifact work.
+pub mod update_control;
+
 /// Process harness for the explicitly enabled loopback quorum experiment.
 /// It never reads Bot credentials and is not a production lease watchdog.
 pub mod test_cluster_processes {
@@ -851,6 +854,64 @@ pub mod control {
     }
 
     impl ControlPlane {
+        pub fn operation_exists(&self, id: &str) -> bool {
+            self.operations.contains_key(id)
+        }
+
+        pub fn bot_busy(&self, bot: &str) -> bool {
+            self.operations
+                .values()
+                .any(|op| op.bot_id == bot && op.finished.is_none())
+        }
+
+        pub fn request_as(
+            &mut self,
+            request: &CommandRequest,
+            access: &super::update_control::ControlAccess,
+        ) -> Value {
+            let target = if request.command == "operation" {
+                request
+                    .operation_id
+                    .as_ref()
+                    .and_then(|id| self.operations.get(id))
+                    .map(|op| op.bot_id.clone())
+            } else {
+                request
+                    .bot
+                    .as_deref()
+                    .and_then(|selector| botref::resolve(&self.config.bots, selector).ok())
+                    .map(|bot| bot.bot_id.clone())
+            };
+            let read = matches!(
+                request.command.as_str(),
+                "ps" | "status" | "inspect" | "shards" | "operation"
+            );
+            let keys: Vec<_> = if request.command == "shards" {
+                self.config
+                    .bots
+                    .iter()
+                    .filter(|b| target.as_ref().is_none_or(|bot| bot == &b.bot_id))
+                    .flat_map(|bot| {
+                        bot.shard_placement.iter().map(|s| ShardKey {
+                            bot_id: bot.bot_id.clone(),
+                            shard_id: s.shard_id,
+                        })
+                    })
+                    .collect()
+            } else {
+                self.daemon
+                    .snapshots()
+                    .into_iter()
+                    .filter(|s| target.as_ref().is_none_or(|bot| bot == &s.key.bot_id))
+                    .map(|s| s.key)
+                    .collect()
+            };
+            if !access.allows_command(read, target.as_deref(), &keys) {
+                return Self::error("control permission or scope denied");
+            }
+            self.request(request)
+        }
+
         pub fn new(daemon: Daemon, config: Config, monitor_ok: bool) -> Self {
             Self {
                 daemon,
@@ -1579,6 +1640,54 @@ pub mod control {
                 assert_eq!(response["status"]["processes"].as_array().unwrap().len(), 1);
                 assert_eq!(response["status"]["processes"][0]["key"]["bot_id"], "id-1");
             }
+        }
+
+        #[test]
+        fn scoped_reads_and_lifecycle_do_not_expose_unpermitted_remote_placements() {
+            let mut plane = plane(2, 1);
+            let access = super::super::update_control::ControlAccess {
+                subject: "scoped-viewer".into(),
+                role: "viewer".into(),
+                scope: Some(vec![ShardKey {
+                    bot_id: "id-0".into(),
+                    shard_id: 0,
+                }]),
+            };
+            let mut read = CommandRequest {
+                command: "status".into(),
+                bot: Some("bot0".into()),
+                ..Default::default()
+            };
+            assert_eq!(
+                plane.request_as(&read, &access)["status"]["processes"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+            read.bot = Some("bot1".into());
+            assert_eq!(plane.request_as(&read, &access)["ok"], false);
+            assert_eq!(
+                plane.request_as(&request("stop", 0, 1), &access)["ok"],
+                false
+            );
+            plane.config.bots[0].shard_placement.push(
+                serde_json::from_value(json!({"shard_id":1,"primary":"other","failover":[]}))
+                    .unwrap(),
+            );
+            read.command = "shards".into();
+            read.bot = Some("bot0".into());
+            assert_eq!(plane.request_as(&read, &access)["ok"], false);
+            assert_eq!(
+                plane.request_as(
+                    &read,
+                    &super::super::update_control::ControlAccess::default()
+                )["shards"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                2
+            );
         }
     }
 }
@@ -2382,6 +2491,7 @@ impl<C: Clock> Daemon<C> {
 /// backend or permission to enable rolling on the production Gateway path.
 pub mod test_gateway_switch {
     use super::{control::CommandRequest, *};
+    use crate::update_rollback::{Artifact, Component as UpdateComponent, UpdateControlRequest};
     use crate::{
         gateway_switch::{
             Authority, Effect, Event, Failure, GatewaySwitch, IdentifyBlock, IdentifyDecision,
@@ -2408,6 +2518,18 @@ pub mod test_gateway_switch {
     const IO_TIMEOUT: Duration = Duration::from_secs(5);
     const LEASE: Duration = Duration::from_secs(120);
     type Result<T> = std::result::Result<T, &'static str>;
+
+    async fn checked_artifact(
+        check: JoinHandle<Result<PathBuf>>,
+        deadline: Duration,
+    ) -> Result<PathBuf> {
+        // Timeout may leave read-only hashing on the blocking worker. It cannot
+        // launch a child, and this actor resumes its lease/monitor loop promptly.
+        tokio::time::timeout(deadline, check)
+            .await
+            .map_err(|_| "artifact verification timed out; candidate not launched")?
+            .map_err(|_| "artifact verification task failed")?
+    }
 
     async fn read_json<T: DeserializeOwned>(
         reader: &mut (impl AsyncBufRead + Unpin),
@@ -2813,11 +2935,29 @@ pub mod test_gateway_switch {
         shards: BTreeMap<ShardKey, Value>,
         transitions: VecDeque<Value>,
         operations: BTreeMap<String, Value>,
+        updates: BTreeMap<String, UpdateBatch>,
+    }
+
+    struct UpdateBatch {
+        fingerprint: Vec<u8>,
+        command: &'static str,
+        bot_id: String,
+        targets: Vec<(ShardKey, String, u64)>,
+        started: std::time::Instant,
+        finished: Option<Value>,
+    }
+
+    #[derive(Clone)]
+    struct GatewayUpdate {
+        current: u64,
+        candidate: u64,
+        artifact: Artifact,
     }
 
     struct Job {
         id: String,
         command: String,
+        update: Option<GatewayUpdate>,
     }
     struct Actor {
         spec: ShardRuntimeSpec,
@@ -2867,7 +3007,8 @@ pub mod test_gateway_switch {
                 self.key.clone(),
                 json!({
                     "bot_id":self.key.bot_id,"shard_id":self.key.shard_id,"phase":phase,
-                    "active_generation":active,"processes":processes,"identify":self.deferral,
+                    "active_generation":active,"generation_high_water":self.generation,
+                    "processes":processes,"identify":self.deferral,
                 }),
             );
         }
@@ -2891,9 +3032,27 @@ pub mod test_gateway_switch {
         }
 
         fn finish_job(&mut self, error: Option<&'static str>) {
-            if let Some(job) = self.pending.take()
-                && let Some(operation) = self.shared.lock().unwrap().operations.get_mut(&job.id)
-            {
+            if let Some(job) = self.pending.take() {
+                let error = if let Some(update) = &job.update {
+                    if error.is_none()
+                        && self
+                            .machine
+                            .as_ref()
+                            .and_then(|m| m.active())
+                            .is_some_and(|active| active.generation.0 == update.candidate)
+                    {
+                        self.gateway_program = update.artifact.path.clone();
+                        None
+                    } else {
+                        error.or(Some("candidate did not become the final active generation"))
+                    }
+                } else {
+                    error
+                };
+                let mut shared = self.shared.lock().unwrap();
+                let Some(operation) = shared.operations.get_mut(&job.id) else {
+                    return;
+                };
                 operation["state"] = json!(if error.is_some() {
                     "failed"
                 } else {
@@ -2927,9 +3086,27 @@ pub mod test_gateway_switch {
         }
 
         async fn spawn(&mut self, generation: u64) -> Result<()> {
+            // Hash away from the actor/runtime worker immediately before launch.
+            // A failed or replaced artifact never reaches PauseOld/Activate.
+            let program =
+                if let Some(update) = self.pending.as_ref().and_then(|j| j.update.as_ref()) {
+                    if update.candidate != generation {
+                        return Err("candidate generation mismatch");
+                    }
+                    let artifact = update.artifact.clone();
+                    checked_artifact(
+                        tokio::task::spawn_blocking(move || {
+                            crate::update_rollback::verify_artifact(&artifact, Path::new("."))
+                        }),
+                        IO_TIMEOUT,
+                    )
+                    .await?
+                } else {
+                    self.gateway_program.clone()
+                };
             let gateway = Gateway::spawn(
                 &self.spec,
-                &self.gateway_program,
+                &program,
                 &self.core_program,
                 self.collector,
                 generation,
@@ -3145,6 +3322,29 @@ pub mod test_gateway_switch {
                 op["error"] = json!("Shard operation already running");
                 return Ok(());
             }
+            if let Some(update) = &job.update {
+                let current = self
+                    .machine
+                    .as_ref()
+                    .and_then(|m| m.active())
+                    .map(|a| a.generation.0);
+                if self.prepared
+                    || self.stopped
+                    || self.faulted
+                    || self
+                        .machine
+                        .as_ref()
+                        .is_none_or(|m| m.phase() != Phase::Stable)
+                    || current != Some(update.current)
+                    || self.generation.checked_add(1) != Some(update.candidate)
+                {
+                    let mut shared = self.shared.lock().unwrap();
+                    let op = shared.operations.get_mut(&job.id).expect("admitted job");
+                    op["state"] = json!("failed");
+                    op["error"] = json!("Shard changed after update admission");
+                    return Ok(());
+                }
+            }
             if job.command == "stop" {
                 self.finish_job(Some("operation cancelled by stop"));
             }
@@ -3315,6 +3515,7 @@ pub mod test_gateway_switch {
         shared: Arc<StdMutex<Shared>>,
         actors: BTreeMap<ShardKey, mpsc::Sender<Job>>,
         tasks: Vec<JoinHandle<()>>,
+        config: Config,
     }
 
     impl Drop for Runtime {
@@ -3366,6 +3567,7 @@ pub mod test_gateway_switch {
                 shared: shared.clone(),
                 actors: BTreeMap::new(),
                 tasks: Vec::new(),
+                config: config.clone(),
             };
             let started = std::time::Instant::now();
             for spec in specs {
@@ -3423,6 +3625,195 @@ pub mod test_gateway_switch {
             Ok(runtime)
         }
 
+        /// Resolve against trusted daemon configuration for botctl's preflight.
+        pub fn inspect_bot(&self, selector: &str) -> Value {
+            let Ok(bot) = crate::botref::resolve(&self.config.bots, selector) else {
+                return json!({"ok":false,"error":"unknown or ambiguous Bot"});
+            };
+            json!({"ok":true,"offline":false,"test_gateway_switch":true,"production_ready":false,
+                "bot":{"bot_id":bot.bot_id,"name":bot.name,"total_shards":bot.total_shards}})
+        }
+
+        fn batch_view(shared: &mut Shared, id: &str) -> Value {
+            let Some(batch) = shared.updates.get(id) else {
+                return json!({"ok":false,"error":"unknown update operation"});
+            };
+            if let Some(finished) = &batch.finished {
+                return finished.clone();
+            }
+            let mut shards = Vec::new();
+            let mut failed = Vec::new();
+            let mut generations = Vec::new();
+            let mut running = false;
+            for (key, child_id, expected) in &batch.targets {
+                let result = &shared.operations[child_id];
+                let observed = shared.shards.get(key);
+                let generation = observed.and_then(|s| s["active_generation"].as_u64());
+                let child_running = result["state"] == "running";
+                running |= child_running;
+                if result["state"] == "failed" || (!child_running && generation != Some(*expected))
+                {
+                    failed.push(key.clone());
+                }
+                shards.push(
+                    json!({"key":key,"state":result["state"],"error":result["error"],
+                    "gateway_generation":generation}),
+                );
+                if let Some(generation) = generation {
+                    generations.push(json!({"shard_id":key.shard_id,"gateway":generation}));
+                }
+            }
+            let state = if running {
+                "running"
+            } else if failed.is_empty() {
+                "succeeded"
+            } else {
+                "failed"
+            };
+            let value = json!({"ok":state != "failed","offline":false,"test_gateway_switch":true,
+                "production_ready":false,"operation":{"operation_id":id,"command":batch.command,
+                "bot_id":batch.bot_id,"state":state,"elapsed_ms":batch.started.elapsed().as_millis(),
+                "shards":shards,"failed_shards":failed,"final_generations":generations}});
+            if !running {
+                shared.updates.get_mut(id).expect("known batch").finished = Some(value.clone());
+            }
+            value
+        }
+
+        /// Inspect an admitted batch without replaying any mutation. Terminal
+        /// observations are frozen, including generations and partial failures.
+        pub fn update_status(&self, operation_id: &str) -> Value {
+            Self::batch_view(&mut self.shared.lock().unwrap(), operation_id)
+        }
+
+        pub fn legacy_operation_exists(&self, operation_id: &str) -> bool {
+            self.shared
+                .lock()
+                .unwrap()
+                .operations
+                .contains_key(operation_id)
+        }
+
+        /// Test-only Gateway execution adapter. Production/Core activation does
+        /// not have the required control contract and must never be synthesized
+        /// by restarting a Gateway. The caller owns authentication and auditing.
+        /// Artifact preflight belongs on the caller's blocking worker; each actor
+        /// independently rehashes again immediately before launching a candidate.
+        pub fn request_update(&self, request: &UpdateControlRequest) -> Value {
+            if let Err(error) = request.validate() {
+                return json!({"ok":false,"error":error});
+            }
+            if request.component != UpdateComponent::Gateway {
+                return json!({"ok":false,"error":"Core update execution is not connected"});
+            }
+            let Some(bot) = self.config.bots.iter().find(|b| b.bot_id == request.bot) else {
+                return json!({"ok":false,"error":"unknown canonical Bot"});
+            };
+            if bot.name != request.manifest.bot_name
+                || bot.total_shards
+                    != crate::placement::ShardCount::Fixed(request.manifest.total_shards)
+            {
+                return json!({"ok":false,"error":"manifest does not match daemon Bot configuration"});
+            }
+            let artifact = request
+                .manifest
+                .artifacts
+                .gateway
+                .as_ref()
+                .expect("validated artifact");
+            if !artifact.path.is_absolute() || !safe_path(&artifact.path) {
+                return json!({"ok":false,"error":"candidate requires an absolute executable path"});
+            }
+            let fingerprint = match serde_json::to_vec(request) {
+                Ok(value) => value,
+                Err(_) => return json!({"ok":false,"error":"invalid update payload"}),
+            };
+            let mut shared = self.shared.lock().unwrap();
+            if let Some(old) = shared.updates.get(&request.operation_id) {
+                if old.fingerprint != fingerprint {
+                    return json!({"ok":false,"error":"operation ID conflicts with an earlier request"});
+                }
+                return Self::batch_view(&mut shared, &request.operation_id);
+            }
+            if shared.operations.contains_key(&request.operation_id) {
+                return json!({"ok":false,"error":"operation ID conflicts with an earlier request"});
+            }
+            if shared.operations.len() + request.manifest.shards.len() > 256
+                || shared.updates.len() >= 256
+            {
+                return json!({"ok":false,"error":"operation history full"});
+            }
+            // Acquire every channel permit before inserting a job or changing a
+            // generation. A full/disconnected actor rejects the entire batch.
+            let mut permits = Vec::new();
+            for shard in &request.manifest.shards {
+                let key = ShardKey {
+                    bot_id: request.bot.clone(),
+                    shard_id: shard.shard_id,
+                };
+                let Some(sender) = self.actors.get(&key) else {
+                    return json!({"ok":false,"error":"requested Shard is not local"});
+                };
+                let Some(view) = shared.shards.get(&key) else {
+                    return json!({"ok":false,"error":"requested Shard has no verified runtime"});
+                };
+                let generations = shard.gateway.expect("validated Gateway generation");
+                let selector = format!("{}/{}", key.bot_id, key.shard_id);
+                if view["phase"] != "Stable"
+                    || view["active_generation"].as_u64() != Some(generations.current)
+                    || view["generation_high_water"]
+                        .as_u64()
+                        .and_then(|g| g.checked_add(1))
+                        != Some(generations.candidate)
+                    || shared
+                        .operations
+                        .values()
+                        .any(|op| op["state"] == "running" && op["bot"] == selector)
+                    || shared.updates.values().any(|batch| {
+                        batch.finished.is_none()
+                            && batch.targets.iter().any(|(target, _, _)| target == &key)
+                    })
+                {
+                    return json!({"ok":false,"error":"Shard is busy or current/candidate generation is stale"});
+                }
+                let Ok(permit) = sender.try_reserve() else {
+                    return json!({"ok":false,"error":"Shard control busy"});
+                };
+                permits.push((key, generations, permit));
+            }
+            let mut targets = Vec::new();
+            for (key, generations, permit) in permits {
+                let id = format!("{}-shard-{}", request.operation_id, key.shard_id);
+                shared.operations.insert(
+                    id.clone(),
+                    json!({"operation_id":id,"command":"gateway-update",
+                    "bot":format!("{}/{}",key.bot_id,key.shard_id),"state":"running","error":null}),
+                );
+                targets.push((key, id.clone(), generations.candidate));
+                permit.send(Job {
+                    id,
+                    command: "gateway-update".into(),
+                    update: Some(GatewayUpdate {
+                        current: generations.current,
+                        candidate: generations.candidate,
+                        artifact: artifact.clone(),
+                    }),
+                });
+            }
+            shared.updates.insert(
+                request.operation_id.clone(),
+                UpdateBatch {
+                    fingerprint,
+                    command: request.command_name(),
+                    bot_id: request.bot.clone(),
+                    targets,
+                    started: std::time::Instant::now(),
+                    finished: None,
+                },
+            );
+            Self::batch_view(&mut shared, &request.operation_id)
+        }
+
         pub fn request(&self, request: &CommandRequest) -> Value {
             let mut shared = self.shared.lock().unwrap();
             if matches!(
@@ -3467,6 +3858,14 @@ pub mod test_gateway_switch {
             let Some(id) = &request.operation_id else {
                 return json!({"ok":false,"error":"operation id required"});
             };
+            if shared.updates.contains_key(id)
+                || shared.updates.values().any(|batch| {
+                    batch.finished.is_none()
+                        && batch.targets.iter().any(|(target, _, _)| target == &key)
+                })
+            {
+                return json!({"ok":false,"error":"Shard update in progress or operation ID conflict"});
+            }
             if let Some(operation) = shared.operations.get(id) {
                 return if operation["command"] == request.command
                     && operation["bot"].as_str() == request.bot.as_deref()
@@ -3486,6 +3885,7 @@ pub mod test_gateway_switch {
                 .try_send(Job {
                     id: id.clone(),
                     command: request.command.clone(),
+                    update: None,
                 })
                 .is_err()
             {
@@ -3493,6 +3893,181 @@ pub mod test_gateway_switch {
                 return json!({"ok":false,"error":"Shard control busy"});
             }
             json!({"ok":true,"operation":operation})
+        }
+    }
+
+    #[cfg(test)]
+    mod update_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn artifact_check_deadline_returns_no_launchable_candidate() {
+            let check = tokio::spawn(std::future::pending::<Result<PathBuf>>());
+            assert_eq!(
+                checked_artifact(check, Duration::from_millis(1)).await,
+                Err("artifact verification timed out; candidate not launched")
+            );
+        }
+
+        fn fixture() -> (Runtime, Vec<mpsc::Receiver<Job>>, UpdateControlRequest) {
+            let config: Config = toml::from_str("[cluster]\nid='test'\nmode='standalone'\n[node]\nid='local'\n[[bots]]\nname='alpha'\nbot_id='101'\napplication_id='101'\ntoken_env='TOKEN_ALPHA'\ntotal_shards=2\n").unwrap();
+            let shared = Arc::new(StdMutex::new(Shared::default()));
+            let mut actors = BTreeMap::new();
+            let mut receivers = Vec::new();
+            for shard_id in 0..2 {
+                let key = ShardKey {
+                    bot_id: "101".into(),
+                    shard_id,
+                };
+                shared.lock().unwrap().shards.insert(
+                    key.clone(),
+                    json!({"phase":"Stable",
+                    "active_generation":1,"generation_high_water":1}),
+                );
+                let (sender, receiver) = mpsc::channel(1);
+                actors.insert(key, sender);
+                receivers.push(receiver);
+            }
+            let request = serde_json::from_value(json!({"command":"update","bot":"101",
+                "operation_id":"0123456789abcdef0123456789abcdef","yes":true,"component":"gateway",
+                "manifest":{"bot_id":"101","bot_name":"alpha","total_shards":2,
+                    "shards":[{"shard_id":0,"gateway":{"current":1,"candidate":2}},
+                              {"shard_id":1,"gateway":{"current":1,"candidate":2}}],
+                    "artifacts":{"gateway":{"path":std::env::current_exe().unwrap(),"sha256":"a".repeat(64)}},
+                    "identify":{"limits":{"max_concurrency":2,"remaining":2,"total":10,"reset_after":60000},"observed_age_ms":0}}})).unwrap();
+            (
+                Runtime {
+                    shared,
+                    actors,
+                    tasks: Vec::new(),
+                    config,
+                },
+                receivers,
+                request,
+            )
+        }
+
+        #[test]
+        fn batch_admission_is_atomic_and_checks_live_generations() {
+            let (runtime, mut receivers, mut request) = fixture();
+            request.manifest.shards[1].gateway.as_mut().unwrap().current = 3;
+            request.manifest.shards[1]
+                .gateway
+                .as_mut()
+                .unwrap()
+                .candidate = 4;
+            assert_eq!(runtime.request_update(&request)["ok"], false);
+            assert!(
+                receivers
+                    .iter_mut()
+                    .all(|r| matches!(r.try_recv(), Err(mpsc::error::TryRecvError::Empty)))
+            );
+            assert!(runtime.shared.lock().unwrap().operations.is_empty());
+            request.manifest.shards[1].gateway.as_mut().unwrap().current = 1;
+            request.manifest.shards[1]
+                .gateway
+                .as_mut()
+                .unwrap()
+                .candidate = 2;
+            let key = ShardKey {
+                bot_id: "101".into(),
+                shard_id: 1,
+            };
+            runtime.actors[&key]
+                .try_send(Job {
+                    id: "occupied".into(),
+                    command: "gateway-update".into(),
+                    update: None,
+                })
+                .unwrap_or_else(|_| panic!("empty queue"));
+            assert_eq!(runtime.request_update(&request)["ok"], false);
+            assert!(matches!(
+                receivers[0].try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+            assert!(runtime.shared.lock().unwrap().operations.is_empty());
+        }
+
+        #[test]
+        fn update_replay_is_idempotent_conflicts_fail_and_terminal_generations_freeze() {
+            let (runtime, mut receivers, mut request) = fixture();
+            assert_eq!(runtime.inspect_bot("alpha")["bot"]["bot_id"], "101");
+            let admitted = runtime.request_update(&request);
+            assert_eq!(admitted["operation"]["state"], "running");
+            let replay = runtime.request_update(&request);
+            assert_eq!(
+                replay["operation"]["operation_id"],
+                admitted["operation"]["operation_id"]
+            );
+            assert_eq!(replay["operation"]["state"], "running");
+            let jobs: Vec<_> = receivers
+                .iter_mut()
+                .map(|r| r.try_recv().unwrap())
+                .collect();
+            assert!(receivers.iter_mut().all(|r| r.try_recv().is_err()));
+            request.manifest.artifacts.gateway.as_mut().unwrap().sha256 = "b".repeat(64);
+            assert_eq!(runtime.request_update(&request)["ok"], false);
+            {
+                let mut shared = runtime.shared.lock().unwrap();
+                for job in jobs {
+                    assert_eq!(job.update.as_ref().unwrap().candidate, 2);
+                    shared.operations.get_mut(&job.id).unwrap()["state"] = json!("succeeded");
+                }
+                for shard in shared.shards.values_mut() {
+                    shard["active_generation"] = json!(2);
+                }
+            }
+            let terminal = runtime.update_status(&request.operation_id);
+            assert_eq!(terminal["operation"]["state"], "succeeded");
+            assert_eq!(
+                terminal["operation"]["final_generations"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                2
+            );
+            assert_eq!(terminal["operation"]["final_generations"][0]["gateway"], 2);
+            for shard in runtime.shared.lock().unwrap().shards.values_mut() {
+                shard["active_generation"] = json!(99);
+            }
+            assert_eq!(runtime.update_status(&request.operation_id), terminal);
+        }
+
+        #[test]
+        fn rollback_to_old_generation_is_failure_and_core_is_not_emulated_by_gateway_restart() {
+            let (runtime, mut receivers, mut request) = fixture();
+            request.component = UpdateComponent::Core;
+            request.manifest.artifacts.core = request.manifest.artifacts.gateway.clone();
+            for shard in &mut request.manifest.shards {
+                shard.core = shard.gateway;
+            }
+            assert_eq!(
+                runtime.request_update(&request)["error"],
+                "Core update execution is not connected"
+            );
+            request.component = UpdateComponent::Gateway;
+            assert_eq!(runtime.request_update(&request)["ok"], true);
+            for receiver in &mut receivers {
+                let job = receiver.try_recv().unwrap();
+                runtime
+                    .shared
+                    .lock()
+                    .unwrap()
+                    .operations
+                    .get_mut(&job.id)
+                    .unwrap()["state"] = json!("succeeded");
+            }
+            let failed = runtime.update_status(&request.operation_id);
+            assert_eq!(failed["ok"], false);
+            assert_eq!(failed["operation"]["state"], "failed");
+            assert_eq!(
+                failed["operation"]["failed_shards"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                2
+            );
+            assert_eq!(failed["operation"]["final_generations"][0]["gateway"], 1);
         }
     }
 }

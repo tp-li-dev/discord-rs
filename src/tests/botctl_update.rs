@@ -1,10 +1,10 @@
-//! CLI planning and fail-closed execution tests. No Gateway, daemon connection,
-//! Discord connection, or deployment is exercised here.
+//! CLI planning and authenticated loopback contract tests. The listener below
+//! is a mock daemon; no Gateway, Discord connection, or deployment is exercised.
 use serde_json::{Value, json};
 use std::{
     ffi::OsString,
-    io::{Read, Write},
-    net::{Ipv4Addr, TcpListener},
+    io::{BufRead, BufReader, Read, Write},
+    net::{Ipv4Addr, TcpListener, TcpStream},
     path::PathBuf,
     process::{Command, Output, Stdio},
     sync::{
@@ -317,12 +317,100 @@ fn malformed_plans_hash_mismatches_missing_artifacts_and_wrong_bots_are_rejected
 }
 
 #[test]
-fn apply_refuses_unconnected_authentication_and_execution_without_connecting() {
+fn apply_authenticates_inspection_and_sends_canonical_request_once() {
     let fixture = Fixture::new(&manifest());
     for command in ["update", "rollback"] {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let accept = || {
+                let deadline = Instant::now() + Duration::from_secs(15);
+                loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            stream.set_nonblocking(false).unwrap();
+                            stream
+                                .set_read_timeout(Some(Duration::from_secs(3)))
+                                .unwrap();
+                            return stream;
+                        }
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && Instant::now() < deadline =>
+                        {
+                            thread::sleep(Duration::from_millis(5))
+                        }
+                        Err(error) => panic!("mock daemon accept failed: {error}"),
+                    }
+                }
+            };
+            let read = |stream: &mut TcpStream| {
+                let mut frame = Vec::new();
+                BufReader::new(stream)
+                    .take(4097)
+                    .read_until(b'\n', &mut frame)
+                    .unwrap();
+                assert!(frame.len() <= 4096 && frame.last() == Some(&b'\n'));
+                serde_json::from_slice::<Value>(&frame).unwrap()
+            };
+            let mut stream = accept();
+            let inspection = read(&mut stream);
+            assert_eq!(inspection["command"], "inspect");
+            assert_eq!(inspection["bot"], "first");
+            assert_eq!(inspection["secret"], json!(TEST_CAPABILITY));
+            assert!(inspection.get("manifest").is_none());
+            writeln!(
+                stream,
+                "{}",
+                json!({"ok":true,"offline":false,
+                "bot":{"bot_id":"bot-one","total_shards":2}})
+            )
+            .unwrap();
+            drop(stream);
+            let mut stream = accept();
+            let request = read(&mut stream);
+            let envelope: src::local_control::DaemonControlEnvelope<
+                src::update_rollback::UpdateControlRequest,
+            > = serde_json::from_value(request.clone()).unwrap();
+            assert_eq!(envelope.secret, TEST_CAPABILITY);
+            envelope.request.validate().unwrap();
+            assert_eq!(envelope.request.command_name(), command);
+            assert_eq!(envelope.request.bot, "bot-one");
+            assert!(envelope.request.yes);
+            assert_eq!(
+                envelope.request.component,
+                src::update_rollback::Component::Core
+            );
+            assert!(request.get("role").is_none());
+            assert!(request.get("principal").is_none());
+            assert_eq!(envelope.request.manifest.shards.len(), 2);
+            assert!(
+                envelope
+                    .request
+                    .manifest
+                    .artifacts
+                    .core
+                    .unwrap()
+                    .path
+                    .is_absolute()
+            );
+            let id = envelope.request.operation_id;
+            writeln!(
+                stream,
+                "{}",
+                json!({"ok":false,"offline":false,
+                "error":"update admission denied"})
+            )
+            .unwrap();
+            drop(stream);
+            // A rejection must terminate the command, never replay the mutation.
+            thread::sleep(Duration::from_millis(200));
+            assert!(
+                matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock)
+            );
+            id
+        });
         let value = result(
             fixture.run(
                 &[command, "first", "--yes", "--bootstrap-stdin"],
@@ -330,23 +418,15 @@ fn apply_refuses_unconnected_authentication_and_execution_without_connecting() {
             ),
             false,
         );
-        assert_eq!(value["offline"], true);
-        assert_eq!(value["dry_run"], false);
-        assert_eq!(value["applied"], false);
-        assert_eq!(value["authenticated"], false);
-        assert_eq!(
-            value["error"],
-            "未実装: daemon update/rollback authentication and execution are not connected; no request sent"
-        );
-        match listener.accept() {
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-            _ => panic!("update/rollback must not connect to the daemon"),
-        }
+        assert_eq!(value["offline"], false);
+        assert_eq!(value["operation_id"], server.join().unwrap());
+        assert_eq!(value["error"], "update admission denied");
+        assert_ne!(value["applied"], true);
     }
 }
 
 #[test]
-fn apply_does_not_read_or_trust_malformed_bootstrap_and_never_connects() {
+fn apply_rejects_malformed_bootstrap_before_connecting() {
     let fixture = Fixture::new(&manifest());
     for command in ["update", "rollback"] {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -368,16 +448,22 @@ fn apply_does_not_read_or_trust_malformed_bootstrap_and_never_connects() {
                 fixture.run(&[command, "first", "--yes", "--bootstrap-stdin"], &input),
                 false,
             );
-            assert_eq!(value["offline"], true);
-            assert_eq!(value["applied"], false);
-            assert_eq!(value["authenticated"], false);
+            assert_eq!(value["offline"], false);
+            assert_ne!(value["applied"], true);
+            let id = value["operation_id"].as_str().unwrap();
+            assert_eq!(id.len(), 32);
+            assert!(id.bytes().all(|byte| byte.is_ascii_hexdigit()));
             assert_eq!(
                 value["error"],
-                "未実装: daemon update/rollback authentication and execution are not connected; no request sent"
+                if input.is_empty() {
+                    "invalid or oversized local control frame"
+                } else {
+                    "invalid anonymous control bootstrap"
+                }
             );
             match listener.accept() {
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                _ => panic!("unsupported execution must not connect, regardless of bootstrap"),
+                _ => panic!("malformed bootstrap must not allow a daemon connection"),
             }
         }
     }

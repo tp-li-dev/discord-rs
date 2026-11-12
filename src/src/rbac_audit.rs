@@ -287,6 +287,8 @@ enum Outcome {
 struct Record {
     timestamp_unix_ms: u64,
     request_id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    operation_id: Option<String>,
     subject: String,
     role: Option<String>,
     operation: String,
@@ -384,6 +386,78 @@ impl AuditedExecutor {
     where
         F: FnOnce() -> Result<T, String>,
     {
+        self.execute_checked(request, None, None, operation)
+    }
+
+    /// Adapter for the daemon update wire contract. Authentication and canonical
+    /// target/scope resolution belong to the server, never to wire role fields.
+    /// Run the actual operation to completion in the closure, not just admission.
+    /// This stricter confirmation policy leaves the legacy manage API unchanged.
+    pub fn execute_update<T, F>(
+        &mut self,
+        update: &crate::update_rollback::UpdateControlRequest,
+        principal: Principal,
+        remote: bool,
+        operation: F,
+    ) -> Result<T, ExecuteError>
+    where
+        F: FnOnce() -> Result<T, String>,
+    {
+        self.execute_update_scoped(update, principal, remote, true, operation)
+    }
+
+    /// Apply the server-resolved Bot/Shard scope before invoking an update.
+    /// `scope_allowed` must come from trusted server policy, never the wire body.
+    /// Scope denial is durably audited and cannot invoke the operation closure.
+    pub fn execute_update_scoped<T, F>(
+        &mut self,
+        update: &crate::update_rollback::UpdateControlRequest,
+        principal: Principal,
+        remote: bool,
+        scope_allowed: bool,
+        operation: F,
+    ) -> Result<T, ExecuteError>
+    where
+        F: FnOnce() -> Result<T, String>,
+    {
+        let request = Request {
+            principal,
+            operation: update.command_name().into(),
+            bot_id: Some(update.bot.clone()),
+            shard_id: None,
+            remote,
+            confirmation: Confirmation::NonInteractive {
+                explicit: true,
+                yes: update.yes,
+            },
+        };
+        let denial = if !update.yes {
+            Some(Denial::ConfirmationRequired)
+        } else if !scope_allowed || update.validate().is_err() {
+            Some(Denial::InvalidTarget)
+        } else {
+            None
+        };
+        // Never copy arbitrary invalid input into the audit correlation field.
+        let operation_id = (update.operation_id.len() == 32
+            && update
+                .operation_id
+                .bytes()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)))
+        .then_some(update.operation_id.as_str());
+        self.execute_checked(&request, denial, operation_id, operation)
+    }
+
+    fn execute_checked<T, F>(
+        &mut self,
+        request: &Request,
+        additional_denial: Option<Denial>,
+        operation_id: Option<&str>,
+        operation: F,
+    ) -> Result<T, ExecuteError>
+    where
+        F: FnOnce() -> Result<T, String>,
+    {
         if self.poisoned {
             return Err(ExecuteError::Audit(AuditError::Poisoned));
         }
@@ -403,8 +477,9 @@ impl AuditedExecutor {
         self.next_id = id
             .checked_add(1)
             .ok_or(ExecuteError::Audit(AuditError::CapacityExhausted))?;
-        if let Err(denial) = authorize(request) {
-            self.record(request, id, Outcome::Denied, denial.reason())
+        if let Err(denial) = authorize(request).and_then(|()| additional_denial.map_or(Ok(()), Err))
+        {
+            self.record_update(request, id, Outcome::Denied, denial.reason(), operation_id)
                 .map_err(ExecuteError::Audit)?;
             return Err(ExecuteError::Denied(denial));
         }
@@ -412,7 +487,7 @@ impl AuditedExecutor {
         // This is a capacity reservation, not a promise against subsequent I/O
         // failure. Private directory ownership and the exclusive writer are required.
         let started = self
-            .encode_record(request, id, Outcome::Started, "authorized")
+            .encode_update_record(request, id, Outcome::Started, "authorized", operation_id)
             .map_err(ExecuteError::Audit)?;
         self.ensure_capacity(&[started.len(), self.config.max_record_bytes])
             .map_err(ExecuteError::Audit)?;
@@ -423,19 +498,25 @@ impl AuditedExecutor {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation));
         match result {
             Ok(Ok(value)) => {
-                self.record(request, id, Outcome::Succeeded, "completed")
+                self.record_update(request, id, Outcome::Succeeded, "completed", operation_id)
                     .map_err(ExecuteError::AuditAfterExecution)?;
                 Ok(value)
             }
             Ok(Err(reason)) => {
-                self.record(request, id, Outcome::Failed, &reason)
+                self.record_update(request, id, Outcome::Failed, &reason, operation_id)
                     .map_err(ExecuteError::AuditAfterExecution)?;
                 Err(ExecuteError::OperationFailed)
             }
             Err(payload) => {
                 // Never format the panic payload; application panic hooks are a
                 // separate logging boundary and must redact their own output.
-                let _ = self.record(request, id, Outcome::Panicked, "operation_panicked");
+                let _ = self.record_update(
+                    request,
+                    id,
+                    Outcome::Panicked,
+                    "operation_panicked",
+                    operation_id,
+                );
                 std::panic::resume_unwind(payload)
             }
         }
@@ -505,8 +586,19 @@ impl AuditedExecutor {
         result: Outcome,
         reason: &str,
     ) -> Result<(), AuditError> {
+        self.record_update(request, id, result, reason, None)
+    }
+
+    fn record_update(
+        &mut self,
+        request: &Request,
+        id: u64,
+        result: Outcome,
+        reason: &str,
+        operation_id: Option<&str>,
+    ) -> Result<(), AuditError> {
         let result = self
-            .encode_record(request, id, result, reason)
+            .encode_update_record(request, id, result, reason, operation_id)
             .and_then(|bytes| self.append(&bytes));
         if result.is_err() {
             self.poisoned = true;
@@ -520,6 +612,17 @@ impl AuditedExecutor {
         id: u64,
         result: Outcome,
         reason: &str,
+    ) -> Result<Vec<u8>, AuditError> {
+        self.encode_update_record(request, id, result, reason, None)
+    }
+
+    fn encode_update_record(
+        &self,
+        request: &Request,
+        id: u64,
+        result: Outcome,
+        reason: &str,
+        operation_id: Option<&str>,
     ) -> Result<Vec<u8>, AuditError> {
         let timestamp_unix_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -539,6 +642,7 @@ impl AuditedExecutor {
         let mut record = Record {
             timestamp_unix_ms,
             request_id: id,
+            operation_id: operation_id.map(str::to_owned),
             subject: redact(request.principal.subject.as_deref().unwrap_or("anonymous")),
             role: request.principal.role.as_deref().map(redact),
             operation: redact(&request.operation),
