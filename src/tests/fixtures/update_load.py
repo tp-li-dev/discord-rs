@@ -408,6 +408,10 @@ class Run:
                 slash = event_id % 2 == 0
                 value = {"type": "slash" if slash else "prefix", "id": event_id,
                          "key": event_id, "rest_addr": gateway.addr}
+                if self.rolling:
+                    # Stable semantic identity across both mock sessions for
+                    # the local admission barrier; it does not select Core/Shard.
+                    value["event_id"] = event_id
                 value["name" if slash else "content"] = "ping" if slash else "!ping"
                 try:
                     gateway.send(value)

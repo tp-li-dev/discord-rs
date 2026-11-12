@@ -23,13 +23,186 @@ use subtle::ConstantTimeEq;
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
-    sync::{Mutex, mpsc},
+    sync::{Mutex, Notify, mpsc},
     task::JoinHandle,
 };
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const LEASE: Duration = Duration::from_secs(120);
 type Result<T> = std::result::Result<T, &'static str>;
+
+const HANDOFF_EVENTS: usize = 1024;
+const HANDOFF_BYTES: usize = 2 * 1024 * 1024;
+const RECENT_EVENTS: usize = 4096;
+
+#[derive(Default)]
+struct IngressState {
+    active: Option<u64>,
+    holding: bool,
+    pending: VecDeque<(u64, Value, usize)>,
+    pending_bytes: usize,
+    recent: HashSet<u64>,
+    recent_order: VecDeque<u64>,
+    unaccepted: HashMap<u64, HashSet<u64>>,
+}
+
+#[derive(Default)]
+struct Ingress {
+    state: StdMutex<IngressState>,
+    changed: Notify,
+}
+
+enum IngressRoute {
+    Forward(Value),
+    Held,
+    Suppressed,
+    Rejected,
+}
+
+impl IngressState {
+    fn remember(&mut self, id: u64) {
+        self.recent.insert(id);
+        self.recent_order.push_back(id);
+        if self.recent_order.len() > RECENT_EVENTS
+            && let Some(expired) = self.recent_order.pop_front()
+        {
+            self.recent.remove(&expired);
+        }
+    }
+
+    fn route(&mut self, generation: u64, value: Value, open: bool) -> IngressRoute {
+        let Some(event) = value["event_id"].as_u64() else {
+            return if open {
+                IngressRoute::Forward(value)
+            } else {
+                IngressRoute::Suppressed
+            };
+        };
+        if self.recent.contains(&event) {
+            return IngressRoute::Suppressed;
+        }
+        let awaiting_acceptance = self
+            .unaccepted
+            .get(&generation)
+            .is_some_and(|events| !events.is_empty());
+        if self.holding
+            || (self.active == Some(generation)
+                && (!self.pending.is_empty() || awaiting_acceptance))
+        {
+            let bytes = serde_json::to_vec(&value).map_or(usize::MAX, |bytes| bytes.len());
+            if self.pending.len() >= HANDOFF_EVENTS
+                || bytes > HANDOFF_BYTES.saturating_sub(self.pending_bytes)
+            {
+                return IngressRoute::Rejected;
+            }
+            self.remember(event);
+            self.pending_bytes += bytes;
+            self.pending.push_back((event, value, bytes));
+            return IngressRoute::Held;
+        }
+        if open && self.active == Some(generation) {
+            self.remember(event);
+            self.unaccepted.entry(generation).or_default().insert(event);
+            IngressRoute::Forward(value)
+        } else {
+            // A shadow copy is not an admission. The Active session or the
+            // bounded handoff queue will claim the semantic event identity.
+            IngressRoute::Suppressed
+        }
+    }
+
+    fn next(&mut self, generation: u64) -> Option<Value> {
+        if self.holding
+            || self.active != Some(generation)
+            || self
+                .unaccepted
+                .get(&generation)
+                .is_some_and(|events| !events.is_empty())
+        {
+            return None;
+        }
+        let (event, value, bytes) = self.pending.pop_front()?;
+        self.pending_bytes -= bytes;
+        self.unaccepted.entry(generation).or_default().insert(event);
+        Some(value)
+    }
+}
+
+impl Ingress {
+    fn activate(&self, generation: u64) {
+        let mut state = self.state.lock().unwrap();
+        if !state.holding {
+            state.active = Some(generation);
+        }
+    }
+
+    fn release(&self, generation: u64) {
+        let mut state = self.state.lock().unwrap();
+        state.active = Some(generation);
+        state.holding = false;
+        drop(state);
+        self.changed.notify_waiters();
+    }
+
+    fn begin_pause(&self, generation: u64) {
+        let mut state = self.state.lock().unwrap();
+        if state.active == Some(generation) {
+            state.active = None;
+            state.holding = true;
+        }
+    }
+
+    async fn wait_accepted(&self, generation: u64) -> Result<()> {
+        // The control socket and event socket are independent. Wait until the
+        // Gateway has actually reserved every forwarded response, not merely
+        // until the daemon has written the event into its TCP send buffer.
+        tokio::time::timeout(IO_TIMEOUT, async {
+            loop {
+                let changed = self.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if self
+                    .state
+                    .lock()
+                    .unwrap()
+                    .unaccepted
+                    .get(&generation)
+                    .is_none_or(HashSet::is_empty)
+                {
+                    return;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .map_err(|_| "Gateway input admission barrier timed out")
+    }
+
+    fn accepted(&self, generation: u64, event: u64) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        let Some(events) = state.unaccepted.get_mut(&generation) else {
+            return Err("Gateway input admission acknowledgement mismatch");
+        };
+        if !events.remove(&event) {
+            return Err("Gateway input admission acknowledgement mismatch");
+        }
+        if events.is_empty() {
+            state.unaccepted.remove(&generation);
+        }
+        drop(state);
+        self.changed.notify_waiters();
+        Ok(())
+    }
+
+    fn close(&self) -> bool {
+        let mut state = self.state.lock().unwrap();
+        state.active = None;
+        state.holding = false;
+        // Retained input is not a successful drain. The owner must report a
+        // failed/cancelled handoff rather than silently treating it as work done.
+        !state.pending.is_empty() || !state.unaccepted.is_empty()
+    }
+}
 
 async fn checked_artifact(
     check: JoinHandle<Result<PathBuf>>,
@@ -64,16 +237,21 @@ async fn write_json(
     value: &impl Serialize,
     limit: usize,
 ) -> Result<()> {
-    let mut bytes = serde_json::to_vec(value).map_err(|_| "Gateway IPC encoding failed")?;
-    bytes.push(b'\n');
-    if bytes.len() > limit {
-        return Err("Gateway IPC frame exceeds limit");
-    }
+    let bytes = json_frame(value, limit)?;
     writer
         .write_all(&bytes)
         .await
         .map_err(|_| "Gateway IPC write failed")?;
     writer.flush().await.map_err(|_| "Gateway IPC flush failed")
+}
+
+fn json_frame(value: &impl Serialize, limit: usize) -> Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec(value).map_err(|_| "Gateway IPC encoding failed")?;
+    bytes.push(b'\n');
+    if bytes.len() > limit {
+        return Err("Gateway IPC frame exceeds limit");
+    }
+    Ok(bytes)
 }
 
 struct Peer {
@@ -137,6 +315,8 @@ struct Gateway {
     view_open: Arc<AtomicBool>,
     heartbeat: JoinHandle<()>,
     relay: JoinHandle<Result<()>>,
+    ingress: Arc<Ingress>,
+    generation: u64,
 }
 
 impl Drop for Gateway {
@@ -147,13 +327,15 @@ impl Drop for Gateway {
     }
 }
 
-// Data gating complements (and does not replace) the gate inside the real
-// Gateway's Manager. A mock shadow event is explicitly suppressed, not queued
-// for later execution. Results from already accepted work flow in all states.
+// Data gating complements the real Gateway's Manager admission. Only events
+// carrying a semantic identity can be deduplicated and held across the gap;
+// unkeyed shadow inputs retain their explicit suppression contract.
 async fn relay(
     mut upstream: TcpStream,
     downstream: TcpStream,
     gate: Arc<AtomicBool>,
+    ingress: Arc<Ingress>,
+    generation: u64,
 ) -> Result<()> {
     let (up_read, mut up_write) = upstream.split();
     let (down_read, mut down_write) = downstream.into_split();
@@ -164,16 +346,52 @@ async fn relay(
     let mut up_frame = Vec::new();
     let mut down_frame = Vec::new();
     let mut inputs_open = true;
+    // Keep a partially written event across select cancellation. Reading the
+    // Gateway's ACK/results must continue even when its input socket is full.
+    let mut outbound: Option<(Vec<u8>, usize)> = None;
     loop {
+        let changed = ingress.changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        let held = if outbound.is_none() && gate.load(Ordering::SeqCst) {
+            ingress.state.lock().unwrap().next(generation)
+        } else {
+            None
+        };
+        if let Some(value) = held {
+            outbound = Some((json_frame(&value, 64 * 1024)?, 0));
+        }
         tokio::select! {
-            input = relay_frame(&mut up_read, &mut up_frame), if inputs_open => {
+            _ = changed => {},
+            written = async {
+                let (bytes, offset) = outbound.as_ref().expect("pending relay write");
+                down_write.write(&bytes[*offset..]).await
+            }, if outbound.is_some() => {
+                let count = written.map_err(|_| "Gateway IPC write failed")?;
+                if count == 0 {
+                    return Err("Gateway IPC write ended");
+                }
+                let (bytes, offset) = outbound.as_mut().expect("pending relay write");
+                *offset += count;
+                if *offset == bytes.len() {
+                    outbound = None;
+                }
+            }
+            input = relay_frame(&mut up_read, &mut up_frame), if inputs_open && outbound.is_none() => {
                 match input {
                     Ok(value) => {
                         let inspection = matches!(value["type"].as_str(), Some("status" | "crash"));
-                        if inspection || gate.load(Ordering::SeqCst) {
-                            write_json(&mut down_write, &value, 64 * 1024).await?;
+                        if inspection {
+                            outbound = Some((json_frame(&value, 64 * 1024)?, 0));
                         } else {
-                            write_json(&mut up_write, &json!({"type":"suppressed","id":value["id"]}), 64*1024).await?;
+                            let id = value["id"].clone();
+                            let route = ingress.state.lock().unwrap().route(generation, value, gate.load(Ordering::SeqCst));
+                            match route {
+                                IngressRoute::Forward(value) => outbound = Some((json_frame(&value, 64 * 1024)?, 0)),
+                                IngressRoute::Held => ingress.changed.notify_waiters(),
+                                IngressRoute::Suppressed => write_json(&mut up_write, &json!({"type":"suppressed","id":id}), 64*1024).await?,
+                                IngressRoute::Rejected => write_json(&mut up_write, &json!({"type":"result","id":id,"outcome":"handoff_full"}), 64*1024).await?,
+                            }
                         }
                     }
                     Err(_) => inputs_open = false,
@@ -181,6 +399,10 @@ async fn relay(
             }
             result = relay_frame(&mut down_read, &mut down_frame) => {
                 let value = result?;
+                if value["type"] == "accepted" {
+                    ingress.accepted(generation, value["event_id"].as_u64().ok_or("invalid Gateway input admission acknowledgement")?)?;
+                    continue;
+                }
                 let stopped = value["type"] == "stopped";
                 write_json(&mut up_write, &value, 64 * 1024).await?;
                 if stopped { return Ok(()); }
@@ -282,6 +504,7 @@ impl Gateway {
         core_program: &Path,
         collector: SocketAddr,
         generation: u64,
+        ingress: Arc<Ingress>,
     ) -> Result<(Child, JoinHandle<Result<Self>>)> {
         let spec = generation_spec(spec, generation);
         let control = local_listener()?;
@@ -407,7 +630,13 @@ impl Gateway {
             }));
             let gate = Arc::new(AtomicBool::new(false));
             let healthy = Arc::new(AtomicBool::new(true));
-            let relay = tokio::spawn(relay(upstream, downstream, gate.clone()));
+            let relay = tokio::spawn(relay(
+                upstream,
+                downstream,
+                gate.clone(),
+                ingress.clone(),
+                generation,
+            ));
             let heartbeat_peer = peer.clone();
             let heartbeat_gate = gate.clone();
             let heartbeat_healthy = healthy.clone();
@@ -433,6 +662,8 @@ impl Gateway {
                 view_open,
                 heartbeat,
                 relay,
+                ingress,
+                generation,
             })
         });
         Ok((child, ready_task))
@@ -444,9 +675,16 @@ impl Gateway {
         core_program: &Path,
         collector: SocketAddr,
         generation: u64,
+        ingress: Arc<Ingress>,
     ) -> Result<Self> {
-        let (mut child, ready) =
-            Self::launch(spec, gateway_program, core_program, collector, generation)?;
+        let (mut child, ready) = Self::launch(
+            spec,
+            gateway_program,
+            core_program,
+            collector,
+            generation,
+            ingress,
+        )?;
         match ready.await {
             Ok(Ok(mut gateway)) => {
                 gateway.child = Some(child);
@@ -464,8 +702,14 @@ impl Gateway {
     }
 
     async fn control(&mut self, action: Action, epoch: OwnershipEpoch) -> Result<()> {
+        if matches!(action, Action::Pause) {
+            self.ingress.begin_pause(self.generation);
+        }
         if !matches!(action, Action::Status | Action::Activate) {
             self.gate.store(false, Ordering::SeqCst);
+        }
+        if matches!(action, Action::Pause) {
+            self.ingress.wait_accepted(self.generation).await?;
         }
         let state = self.peer.lock().await.exchange(action, Some(epoch)).await?;
         let expected = match action {
@@ -478,7 +722,9 @@ impl Gateway {
             return Err("Gateway acknowledgement state mismatch");
         }
         if matches!(action, Action::Activate) {
+            self.ingress.activate(self.generation);
             self.gate.store(true, Ordering::SeqCst);
+            self.ingress.changed.notify_waiters();
         }
         Ok(())
     }
@@ -566,6 +812,7 @@ struct RecoveryLaunch<'a> {
     now: Duration,
     deferral: &'a mut Option<Value>,
     ready: &'a mut Option<(u64, JoinHandle<Result<Gateway>>)>,
+    ingress: Arc<Ingress>,
 }
 
 impl RecoveryHost for RecoveryLaunch<'_> {
@@ -613,6 +860,7 @@ impl RecoveryHost for RecoveryLaunch<'_> {
             self.core_program,
             self.collector,
             request.generation,
+            self.ingress.clone(),
         )
         .map_err(|_| std::io::Error::other("Gateway launch failed"))?;
         *self.ready = Some((request.generation, ready));
@@ -645,6 +893,7 @@ struct Actor {
     recovery_key: ChildKey,
     ready: Option<(u64, JoinHandle<Result<Gateway>>)>,
     core_event_sequences: StdMutex<HashMap<(u64, usize), u64>>,
+    ingress: Arc<Ingress>,
 }
 
 impl Drop for Actor {
@@ -868,6 +1117,7 @@ impl Actor {
             &self.core_program,
             self.collector,
             generation,
+            self.ingress.clone(),
         )
         .await?;
         self.gateways.insert(generation, gateway);
@@ -894,6 +1144,7 @@ impl Actor {
             now: self.started.elapsed(),
             deferral: &mut self.deferral,
             ready: &mut self.ready,
+            ingress: self.ingress.clone(),
         });
         let mut failure = None;
         for event in events {
@@ -1179,6 +1430,9 @@ impl Actor {
             .is_some_and(|m| m.phase() == Phase::Stable)
         {
             self.promote_active()?;
+            if let Some(active) = self.machine.as_ref().and_then(|machine| machine.active()) {
+                self.ingress.release(active.generation.0);
+            }
             self.finish_job(None);
             self.publish();
         }
@@ -1207,6 +1461,7 @@ impl Actor {
             }
         }
         self.faulted = true;
+        self.ingress.close();
         let epoch = self
             .machine
             .as_ref()
@@ -1259,6 +1514,7 @@ impl Actor {
         }
         self.pending = Some(job);
         if self.pending.as_ref().unwrap().command == "stop" {
+            let pending_input = self.ingress.close();
             let epoch = self
                 .machine
                 .as_ref()
@@ -1269,7 +1525,7 @@ impl Actor {
             if let Some((_, ready)) = self.ready.take() {
                 ready.abort();
             }
-            let mut error = None;
+            let mut error = pending_input.then_some("Gateway stopped with pending input admission");
             let mut reaped = Vec::new();
             for (generation, gateway) in &mut self.gateways {
                 gateway.gate.store(false, Ordering::SeqCst);
@@ -1653,6 +1909,7 @@ impl Runtime {
                 recovery_key,
                 ready: None,
                 core_event_sequences: StdMutex::new(HashMap::new()),
+                ingress: Arc::new(Ingress::default()),
             };
             runtime.actors.insert(key, sender);
             runtime.tasks.push(tokio::spawn(actor.run(receiver)));
@@ -1949,6 +2206,157 @@ impl Runtime {
 #[cfg(test)]
 mod update_tests {
     use super::*;
+
+    fn keyed_input(id: u64) -> Value {
+        json!({"type":"prefix","id":id,"event_id":id,"key":id,"content":"!ping","rest_addr":"127.0.0.1:1"})
+    }
+
+    #[tokio::test]
+    async fn handoff_waits_for_admission_and_deduplicates_fifo_across_repeated_switches() {
+        let ingress = Ingress::default();
+        ingress.activate(1);
+        assert!(matches!(
+            ingress.state.lock().unwrap().route(1, keyed_input(1), true),
+            IngressRoute::Forward(_)
+        ));
+        ingress.begin_pause(1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), ingress.wait_accepted(1))
+                .await
+                .is_err()
+        );
+        ingress.accepted(1, 1).unwrap();
+        ingress.wait_accepted(1).await.unwrap();
+        assert!(ingress.accepted(1, 1).is_err());
+        {
+            let mut state = ingress.state.lock().unwrap();
+            assert!(matches!(
+                state.route(2, keyed_input(1), false),
+                IngressRoute::Suppressed
+            ));
+            assert!(matches!(
+                state.route(1, keyed_input(2), false),
+                IngressRoute::Held
+            ));
+            assert!(matches!(
+                state.route(2, keyed_input(2), false),
+                IngressRoute::Suppressed
+            ));
+            assert!(matches!(
+                state.route(2, keyed_input(3), false),
+                IngressRoute::Held
+            ));
+        }
+        ingress.activate(2);
+        assert!(
+            ingress.state.lock().unwrap().next(2).is_none(),
+            "old results have not drained"
+        );
+        ingress.release(2);
+        for id in [2, 3] {
+            assert_eq!(ingress.state.lock().unwrap().next(2).unwrap()["id"], id);
+            assert!(
+                ingress.state.lock().unwrap().next(2).is_none(),
+                "receive the preceding admission ACK before forwarding another event"
+            );
+            ingress.accepted(2, id).unwrap();
+        }
+        ingress.begin_pause(2);
+        ingress.wait_accepted(2).await.unwrap();
+        assert!(matches!(
+            ingress
+                .state
+                .lock()
+                .unwrap()
+                .route(3, keyed_input(3), false),
+            IngressRoute::Suppressed
+        ));
+        assert!(matches!(
+            ingress
+                .state
+                .lock()
+                .unwrap()
+                .route(2, keyed_input(4), false),
+            IngressRoute::Held
+        ));
+        ingress.release(3);
+        assert_eq!(ingress.state.lock().unwrap().next(3).unwrap()["id"], 4);
+        ingress.accepted(3, 4).unwrap();
+        let state = ingress.state.lock().unwrap();
+        assert!(state.pending.is_empty());
+        assert!(state.unaccepted.is_empty());
+        assert_eq!(state.pending_bytes, 0);
+    }
+
+    #[test]
+    fn handoff_active_inputs_wait_in_fifo_behind_the_unaccepted_frame() {
+        let ingress = Ingress::default();
+        ingress.activate(1);
+        assert!(matches!(
+            ingress.state.lock().unwrap().route(1, keyed_input(1), true),
+            IngressRoute::Forward(_)
+        ));
+        for id in [2, 3] {
+            assert!(matches!(
+                ingress
+                    .state
+                    .lock()
+                    .unwrap()
+                    .route(1, keyed_input(id), true),
+                IngressRoute::Held
+            ));
+        }
+        assert!(ingress.state.lock().unwrap().next(1).is_none());
+        for id in [1, 2] {
+            ingress.accepted(1, id).unwrap();
+            assert_eq!(ingress.state.lock().unwrap().next(1).unwrap()["id"], id + 1);
+            assert!(ingress.state.lock().unwrap().next(1).is_none());
+        }
+        ingress.accepted(1, 3).unwrap();
+        assert!(ingress.state.lock().unwrap().next(1).is_none());
+    }
+
+    #[test]
+    fn handoff_bounds_refuse_admission_and_unkeyed_shadow_inputs_stay_suppressed() {
+        let mut state = IngressState {
+            holding: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            state.route(1, json!({"type":"prefix","id":1}), false),
+            IngressRoute::Suppressed
+        ));
+        for id in 0..HANDOFF_EVENTS as u64 {
+            assert!(matches!(
+                state.route(1, keyed_input(id), false),
+                IngressRoute::Held
+            ));
+        }
+        assert!(matches!(
+            state.route(1, keyed_input(HANDOFF_EVENTS as u64), false),
+            IngressRoute::Rejected
+        ));
+        assert!(!state.recent.contains(&(HANDOFF_EVENTS as u64)));
+        assert_eq!(state.pending.len(), HANDOFF_EVENTS);
+        let mut state = IngressState {
+            holding: true,
+            ..Default::default()
+        };
+        let mut value = keyed_input(1);
+        value["content"] = json!("x".repeat(HANDOFF_BYTES));
+        assert!(matches!(
+            state.route(1, value, false),
+            IngressRoute::Rejected
+        ));
+        assert!(state.pending.is_empty());
+        assert!(state.recent.is_empty());
+        let mut state = IngressState::default();
+        for id in 0..RECENT_EVENTS as u64 + 1 {
+            state.remember(id);
+        }
+        assert_eq!(state.recent.len(), RECENT_EVENTS);
+        assert!(!state.recent.contains(&0));
+    }
 
     #[test]
     fn core_event_intake_relays_last_degraded_once_and_reports_sequence_gaps() {
