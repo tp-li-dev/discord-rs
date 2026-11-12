@@ -2,7 +2,7 @@
 
 `botctl` / `botd` は、認証付きのローカル接続で複数BotのShard別Gateway子プロセスを管理します。実 `src` Gatewayの起動引数・Workerプール・停止契約へ接続し、Discordに接続しない明示的な模擬モードを追加しました。実Discordでの複数Shard運用や分散制御の検証は完了していません。`manage` は別のローカル単一Bot管理経路で、その表示の「コア」は管理プロセスを指します。以下はリポジトリルートで `cd src` した後のコマンドです。
 
-今回の実装契約・検証範囲は [Shard実行設計](shard-runtime-design.md) を参照してください。[制約一覧](known-limitations.md) と [進捗](progress.md) はPM統合対象で、今回変更していません。そこに残る実起動未接続等の記述は、この変更以前の状態を含みます。
+実装契約と検証範囲は [Shard実行設計](shard-runtime-design.md)、残る制約は [制約一覧](known-limitations.md) を参照してください。
 
 ## 複数Botのローカル制御：botctl / botd
 
@@ -70,7 +70,7 @@ botd --file local-bots.toml --runtime-root ABS_RUNTIME --gateway-program ABS_GAT
 | `botd` → ランチャーのstdout | `port`、`local_only`、`startup_ok`、`mock_discord`。secretは含まない |
 | ランチャー → 各 `botctl --bootstrap-stdin` の匿名stdinパイプ | `port`: 公告されたポート、`secret`: 同じdaemon用の配列 |
 
-各JSONはUTF-8、末尾改行付きです。`botctl` は `127.0.0.1` の公告ポートへ接続し、各要求を認証します。接続情報はそのdaemonの存続期間だけ使用してください。自動検出用endpointファイル、一般用途の常駐ランチャー、OSサービス登録は提供していません。仕様のUnix socket / Named Pipeへの移行とOSユーザー権限の検証、遠隔相互認証・RBACも未実装です。TCPを転送・公開して遠隔管理には使用しないでください。
+各JSONはUTF-8、末尾改行付きです。`botctl` は `127.0.0.1` の公告ポートへ接続し、各要求を認証します。接続情報はそのdaemonの存続期間だけ使用してください。自動検出用endpointファイル、一般用途の常駐ランチャー、OSサービス登録は提供していません。仕様のUnix socket / Named Pipeへの移行とOSユーザー権限の検証、このdaemonへの遠隔相互認証・RBACは未接続です。別途mTLS transportの試験実装がありますが、本daemonの遠隔管理を提供しません。TCPを転送・公開して遠隔管理には使用しないでください。
 
 既定ではdaemon起動時にローカルShardを起動します。`--no-autostart` を追加すると、起動を `botctl start` まで保留できます。`startup_ok` は初回起動要求の結果であり、以後の実状態は `status` で確認します。Gatewayの環境は初期化し、通常モードではそのBot用のtokenとBot/Shard/起動世代だけを注入します。Windowsではネットワーク初期化に必要なOS変数 `SystemRoot` だけを追加継承し、`PATH` や他Botの環境は継承しません。`SystemRoot` とidentity用4変数はtoken参照名に使えません。
 
@@ -201,6 +201,8 @@ cargo run --offline --bin manage -- start
 cargo run --offline --bin manage -- status
 cargo run --offline --bin manage -- logs
 cargo run --offline --bin manage -- list-unknown
+cargo run --offline --bin manage -- metrics-json
+cargo run --offline --bin manage -- metrics-prometheus
 cargo run --offline --bin manage -- stop
 cargo run --offline --bin manage -- start
 cargo run --offline --bin manage -- restart
@@ -213,11 +215,12 @@ cargo run --offline --bin manage -- shutdown
 | `status` | 管理/Botプロセスの生存、直近エラー、再起動回数、ログパスを表示。Discord接続成功は判定しない |
 | `logs` | ログファイル全体を読み取り表示。追尾・ページ化はない |
 | `list-unknown` | 認証付きのローカル制御経路で外部応答の結果不明一覧を照会。timestampとvolatile表示付き。解除操作はない |
+| `metrics-json` / `metrics-prometheus` | 管理プロセス内のregistryをJSON / Prometheusテキストで表示。現状Shardの計測値が自動収集されるわけではなく、HTTP公開もない |
 | `stop` | Bot親を強制終了し、管理プロセスを残す。メモリ状態を失う |
 | `restart` | 現在のBot親バイナリを再起動。再ビルドはせず、メモリ状態を失う |
 | `shutdown` | Bot親と管理プロセスを終了。メモリ状態を失う |
 
-既定の管理TCPは `127.0.0.1:39483`。`DISCORD_CORE_DIR` で管理ディレクトリ、`DISCORD_CORE_PORT` でポートを変更できます。起動時と操作時で揃えてください。既定ログは `src/core-runtime/core.log`、endpointは `src/core-runtime/core.json`（リポジトリルート基準）です。endpointは管理認証情報を含むため内容を共有しないでください。
+既定の管理TCPは `127.0.0.1:39483`。`DISCORD_CORE_DIR` で管理ディレクトリ、`DISCORD_CORE_PORT` でポートを変更できます。起動時と操作時で揃えてください。既定ログは `src/core-runtime/core.log`、endpointは `src/core-runtime/core.json` と読み取り権限用 `viewer.json`（リポジトリルート基準）です。両方とも管理認証情報を含むため内容を共有しないでください。管理経路はadmin/viewerを区別し `audit.jsonl` に監査します。管理ディレクトリのアクセス権保護が必要です。
 
 管理操作とビルドは直列です。更新ビルド中はstatusやBot親の異常終了監視も待機する場合があります。Bot親が異常終了すると管理プロセスは最大3回再起動を試み、60秒の安定稼働後に回数をリセットします。OSサービス登録やホスト障害からの復旧機能ではありません。
 
@@ -235,7 +238,7 @@ reloadはreleaseビルド → `src/workers/` への成果物コピー → `src/w
 
 上記は従来のmanage/reload経路です。botd配下のGatewayはShard別のWorker更新監視ファイルを使用するため、共有の既定ファイルを書き換えて全Shardを更新できるとは扱わないでください。botctlのCore更新コマンドは未実装です。
 
-対象Workerの受付を止め、処理と外部応答確認を待ち、snapshotを新Workerへ移して切り替えます。別Workerは処理を継続できます。途中失敗時は切替済みWorkerが新版、未切替Workerが旧版のまま残り得ます。全体を旧版へ戻す原子的rollbackやCLIはありません。結果不明の外部応答があるWorkerは旧版を維持します。`list-unknown` で照会できますが、照合・解除CLIや永続監査は未実装です。再起動で追跡が消えても外部操作の成否が判明したことにはなりません。
+対応capabilityを交渉できた場合、snapshotを引き継いだ新Workerへの配送を開始し、旧Workerの受付済み処理と外部応答の確認を並行して待ちます。旧版が対応しない場合は直列切替です。別Workerは処理を継続できます。途中失敗時は切替済みWorkerが新版、未切替Workerが旧版のまま残り得ます。全体を旧版へ戻す原子的rollbackやCLIはありません。切替前に結果不明があれば更新を拒否し、切替後に不明になった場合は新版をActiveのまま旧世代の記録を保持します。`list-unknown` で照会できますが、照合・解除CLIや永続的な結果不明操作の記録は未実装です。再起動で追跡が消えても外部操作の成否が判明したことにはなりません。
 
 実Gatewayで使う成果物にはWorkerのReady/Helloで `api-result-v1`、`command-dispatch-v1`、`slash-arguments-v1`、`ready-event-v1` を確認できることが必要です。初回起動・更新・復旧で不足する候補は採用前に拒否し、更新時の旧Workerの状態・受付を維持します。汎用Manager APIの旧v5互換は残りますが、それだけを実Gateway用成果物の適合性確認とは扱わないでください。
 
