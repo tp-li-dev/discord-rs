@@ -253,6 +253,68 @@ impl Config {
     }
 }
 
+impl fmt::Debug for Cluster {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Cluster")
+            .field("id", &crate::redact::Secret::new(&self.id))
+            .field("mode", &self.mode)
+            .finish()
+    }
+}
+
+impl fmt::Debug for Node {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Node")
+            .field("id", &crate::redact::Secret::new(&self.id))
+            .field("remote_bind", &self.remote_bind)
+            .finish()
+    }
+}
+
+impl fmt::Debug for BotPlacement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BotPlacement")
+            .field("name", &crate::redact::Secret::new(&self.name))
+            .field("bot_id", &crate::redact::Secret::new(&self.bot_id))
+            .field(
+                "application_id",
+                &crate::redact::Secret::new(&self.application_id),
+            )
+            .field("token_env", &crate::redact::Secret::new(&self.token_env))
+            .field("total_shards", &self.total_shards)
+            .field("prefix", &crate::redact::Secret::new(&self.prefix))
+            .field("shard_placement", &self.shard_placement)
+            .finish()
+    }
+}
+
+impl fmt::Debug for ShardPlacement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ShardPlacement")
+            .field("shard_id", &self.shard_id)
+            .field("primary", &crate::redact::Secret::new(&self.primary))
+            .field("failover", &crate::redact::Secret::new(&self.failover))
+            .finish()
+    }
+}
+
+impl fmt::Debug for LocalShardIntent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LocalShardIntent")
+            .field("bot_id", &crate::redact::Secret::new(&self.bot_id))
+            .field("shard_id", &self.shard_id)
+            .field("total_shards", &self.total_shards)
+            .field("token_env", &crate::redact::Secret::new(&self.token_env))
+            .finish()
+    }
+}
+
+impl fmt::Debug for PlacementError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,67 +428,5 @@ mod tests {
         assert!(serde_json::from_str::<BotPlacement>(json).is_err());
         let json = r#"{"name":"x","bot_id":"i","application_id":"1","token_env":"TOKEN","total_shards":1,"token":"secret"}"#;
         assert!(serde_json::from_str::<BotPlacement>(json).is_err());
-    }
-}
-
-impl fmt::Debug for Cluster {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Cluster")
-            .field("id", &crate::redact::Secret::new(&self.id))
-            .field("mode", &self.mode)
-            .finish()
-    }
-}
-
-impl fmt::Debug for Node {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Node")
-            .field("id", &crate::redact::Secret::new(&self.id))
-            .field("remote_bind", &self.remote_bind)
-            .finish()
-    }
-}
-
-impl fmt::Debug for BotPlacement {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BotPlacement")
-            .field("name", &crate::redact::Secret::new(&self.name))
-            .field("bot_id", &crate::redact::Secret::new(&self.bot_id))
-            .field(
-                "application_id",
-                &crate::redact::Secret::new(&self.application_id),
-            )
-            .field("token_env", &crate::redact::Secret::new(&self.token_env))
-            .field("total_shards", &self.total_shards)
-            .field("prefix", &crate::redact::Secret::new(&self.prefix))
-            .field("shard_placement", &self.shard_placement)
-            .finish()
-    }
-}
-
-impl fmt::Debug for ShardPlacement {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ShardPlacement")
-            .field("shard_id", &self.shard_id)
-            .field("primary", &crate::redact::Secret::new(&self.primary))
-            .field("failover", &crate::redact::Secret::new(&self.failover))
-            .finish()
-    }
-}
-
-impl fmt::Debug for LocalShardIntent {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("LocalShardIntent")
-            .field("bot_id", &crate::redact::Secret::new(&self.bot_id))
-            .field("shard_id", &self.shard_id)
-            .field("total_shards", &self.total_shards)
-            .field("token_env", &crate::redact::Secret::new(&self.token_env))
-            .finish()
-    }
-}
-
-impl fmt::Debug for PlacementError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(self, f)
     }
 }
