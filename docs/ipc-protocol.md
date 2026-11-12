@@ -4,7 +4,7 @@
 
 `worker.rs` の親 Manager と `--worker` 子プロセス間で、stdin/stdout の改行区切り UTF-8 JSON を使用する。各 JSON オブジェクトの `type` は snake_case。stdout はプロトコル専用。1 フレームは末尾 LF を含め最大 **1 MiB (1,048,576 bytes)**、LF のない EOF と超過フレームは拒否する。受信は上限 + 1 byte までに制限する。親の要求/応答は 5 秒 timeout。一般の親送信には共通サイズ事前検査がなく、子側受信で拒否する。状態・結果・restore は生成時にもサイズ検査する。
 
-architecture §8 の u32 big-endian length prefix + MessagePack / 初期 8 MiB は設計案であり、現行 Worker の実フレームではない。`protocol.rs` の Envelope/Control/Data も現行 Worker の wire envelope ではない。JSON の独立したネスト深度・イベントサイズ・キュー長制御はここでは追加していない。
+architecture §8 の u32 big-endian length prefix + MessagePack / 初期 8 MiB は設計案であり、現行 Worker の実フレームではない。`protocol.rs` の Envelope/Control/Data も現行 Worker の wire envelope ではない。JSON の独立したネスト深度制限はない。Ready の保持容量・受付制限は末尾の event-seq-v1 を参照。
 
 ## 起動と互換性
 
@@ -37,4 +37,40 @@ Hello 本体の実例:
 | snapshot | snapshot / version:u32, state:JSON |
 | restore / version:u32, state:JSON | restored、または rejected / reason |
 
-アプリ処理失敗も rejected を返す。SlashValue は framework の serde 型に従う。snapshot の状態形式は現在 version=3。独立した ACK、request_id、timestamp、drain/switch 制御メッセージ、MessagePack 分割転送はこの Worker wire にはない。プロセスの起動世代とアプリ状態 version は別の概念。
+アプリ処理失敗も rejected を返す。SlashValue は framework の serde 型に従う。snapshot の状態形式は現在 version=3。request_id、timestamp、drain/switch 制御メッセージ、MessagePack 分割転送はこの Worker wire にはない。プロセスの起動世代とアプリ状態 version は別の概念。
+
+## event-seq-v1 (Ready delivery)
+
+Only connections negotiating `event-seq-v1` in both Hello messages use
+`{"type":"sequenced_ready","local_sequence":0,"bot_name":"..."}`.
+Health advertisement alone does not enable it. Legacy/non-negotiating Workers
+receive the original `ready_event` and return one result, without an ACK.
+
+Sequences start at zero per connection, independently of Discord WS sequence.
+The child validates ordering with event_seq::Receiver and admits the event to its
+serial execution slot (capacity one). It flushes
+`{"type":"event_accepted","local_sequence":0}` before running the handler.
+The subsequent result/rejected is the processing outcome. Acceptance does not
+mean successful processing or persistence. Unnegotiated sequenced requests,
+gaps and duplicate sequences terminate the connection without an ACK.
+
+The parent uses event_seq::Sender with a 64-event / 1 MiB retained-payload bound.
+A matching single-event ACK releases the payload. Buffer rejection logs only its
+reason and returns an error. Missing/wrong ACKs and the existing five-second
+request deadline break the connection; outstanding ranges and retained byte
+counts are logged without payloads. Serial requests normally retain at most one
+event. This bound does not limit caller tasks waiting for the process lock or OS
+pipe capacity. Events are not retried after ACK, including handler failure or timeout.
+
+**Unacknowledged replay across Worker replacement/crash recovery is not connected.**
+Sender and admission cursor are connection-local and restart in each generation.
+Safe replay requires transferring the admission checkpoint consistently with
+application state. Parent termination also loses the memory buffer. Only Ready
+uses this extension; dispatch/command/REST are unchanged. This does not guarantee
+all-path at-least-once, exactly-once effects or lossless delivery.
+
+Validation (Windows, 2026-11-12): offline tests cover real-process ACK/result
+ordering, sequence gaps, parent rejection of missing/wrong/timed-out ACKs,
+oversized Ready rejection, legacy request format, existing handshake and
+Sender/Receiver bounds (51 tests including library tests). Linux, real Discord,
+process suspension and cross-generation replay remain unverified.
