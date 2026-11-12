@@ -30,11 +30,28 @@
 //! to the socket cannot be withdrawn. An ACK lost during an update still means
 //! delivery may be unknown. Resumption, tickets and early data remain disabled.
 //!
-//! These APIs require a trusted in-process caller. Distribution, persistence,
-//! file watching, CA/root rotation and remote administration are not provided.
-//! On restart callers must isolate the listener until peer policies are restored;
-//! bind accepts initial revocations, but does not restore old rotation state.
-//! A new transport otherwise defaults to the configured CA/membership policy.
+//! These APIs require a trusted in-process caller. CA rotation and exact-DER
+//! CA/intermediate revocation use the same admission/write boundary. Trust is
+//! revalidated against current eligible anchors, including when a root is not
+//! sent by a peer. All observed chains for each node/serial must remain eligible;
+//! serial reuse across chains is conservative and can deny all such credentials.
+//! Public chain evidence is bounded to 8192 chains / 16 MiB per listener lifetime.
+//! Each node is limited to 64 chain/role proofs and 1 MiB; 64 proofs / 1 MiB of
+//! the global budget are reserved for the local node. An authenticated peer can
+//! exhaust its own allowance; longer-lived deployments need controlled restarts.
+//! Exhaustion fails closed until a controlled restart; it never evicts evidence
+//! belonging to a live connection. Certificate validation runs on policy checks;
+//! its CPU cost under load has not been benchmarked.
+//!
+//! Use `certificate_policy_snapshot` with `crate::cert_policy::PolicyStore`, and
+//! load/authenticate/revision-check BEFORE `bind_with_policy` on restart. A plain
+//! `bind` still uses explicit bootstrap policy only. Persisted deadlines need a
+//! trustworthy wall clock across downtime; a future saved timestamp is refused.
+//! Live overlap uses the monotonic clock and cannot be extended by clock jumps.
+//! Saving and activation are separate operations under caller control; durable
+//! before activation can be achieved by preparing a DTO and using
+//! `install_certificate_policy` after successful persistence. No automatic file
+//! watching, distribution, remote administration, CRL or OCSP is provided.
 //!
 //! Envelope timestamps are local elapsed times, not synchronized clock evidence.
 //! Heartbeat/proposal payload times retain their caller-provided clock domain.
@@ -44,6 +61,10 @@
 //! measures request/hold deadlines locally and binds an exact test configuration.
 
 use crate::{
+    cert_policy::{
+        CaRotationSnapshot, CertificateFingerprint, PeerRotationSnapshot, PolicySnapshot,
+        certificate_fingerprint,
+    },
     cluster::{
         ControlMessage, Envelope, Heartbeat, NodeId, OwnershipProposal, OwnershipRecord,
         ProposalKind, SimulationError, TestOnlyClaim, TestOnlyMessage, TestOnlyPayload,
@@ -78,7 +99,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
     task::Poll,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -206,14 +227,160 @@ struct PeerRotation {
     old: CertificateSerial,
     new: CertificateSerial,
     deadline: Instant,
+    retire_at_unix_ms: u64,
 }
 
+#[derive(Debug)]
+struct CaRotation {
+    old: Vec<CertificateDer<'static>>,
+    deadline: Instant,
+    retire_at_unix_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CertificateUsage {
+    Client,
+    Server,
+    Both,
+}
+#[derive(Debug)]
+struct CertificateProof {
+    chain: Vec<CertificateDer<'static>>,
+    usage: CertificateUsage,
+}
 #[derive(Debug, Default)]
 struct CertificatePolicy {
+    revision: u64,
+    own_node: Option<NodeId>,
     revocations: RevocationList,
     rotations: BTreeMap<NodeId, PeerRotation>,
+    trusted_cas: Vec<CertificateDer<'static>>,
+    ca_rotation: Option<CaRotation>,
+    revoked_cas: BTreeSet<CertificateFingerprint>,
+    // Retain all observed chains for a node/serial. Reusing a serial across
+    // chains is deliberately conservative: every observed chain must remain
+    // eligible. This also protects existing RPC users of CertificateIdentity
+    // without changing their admission/write interfaces. Bounded to 16 MiB and
+    // 8192 chains per listener lifetime; exhaustion refuses new credentials.
+    proofs: BTreeMap<(NodeId, CertificateSerial), Vec<CertificateProof>>,
+    proof_bytes: usize,
+    proof_count: usize,
+    proof_usage: BTreeMap<NodeId, (usize, usize)>,
 }
 impl CertificatePolicy {
+    fn roots(&self) -> Result<Arc<RootCertStore>, TransportError> {
+        let mut roots = RootCertStore::empty();
+        let old = self
+            .ca_rotation
+            .as_ref()
+            .filter(|r| Instant::now() < r.deadline);
+        for cert in self
+            .trusted_cas
+            .iter()
+            .chain(old.into_iter().flat_map(|r| &r.old))
+        {
+            if !self.revoked_cas.contains(&certificate_fingerprint(cert)) {
+                roots.add(cert.clone()).map_err(|_| TransportError::Tls)?;
+            }
+        }
+        Ok(Arc::new(roots))
+    }
+
+    fn check_chain(
+        &self,
+        chain: &[CertificateDer<'_>],
+        usage: CertificateUsage,
+    ) -> Result<(), TransportError> {
+        if chain.is_empty() || chain.len() > 8 || chain.iter().any(|c| c.len() > MAX_CERT) {
+            return Err(TransportError::InvalidIdentity);
+        }
+        if chain
+            .iter()
+            .any(|c| self.revoked_cas.contains(&certificate_fingerprint(c)))
+        {
+            return Err(TransportError::CertificateRevoked);
+        }
+        let roots = self.roots()?;
+        verified_identity(
+            &chain[0],
+            &chain[1..],
+            roots.roots.iter().all(|r| r.name_constraints.is_none()),
+        )
+        .map_err(|_| TransportError::Tls)?;
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        if usage != CertificateUsage::Server {
+            WebPkiClientVerifier::builder_with_provider(roots.clone(), provider.clone())
+                .build()
+                .map_err(|_| TransportError::Tls)?
+                .verify_client_cert(&chain[0], &chain[1..], UnixTime::now())
+                .map_err(|_| TransportError::Tls)?;
+        }
+        if usage != CertificateUsage::Client {
+            verify_server_cert_signed_by_trust_anchor(
+                &ParsedCertificate::try_from(&chain[0]).map_err(|_| TransportError::Tls)?,
+                &roots,
+                &chain[1..],
+                UnixTime::now(),
+                provider.signature_verification_algorithms.all,
+            )
+            .map_err(|_| TransportError::Tls)?;
+        }
+        Ok(())
+    }
+
+    fn remember(
+        &mut self,
+        chain: &[CertificateDer<'_>],
+        usage: CertificateUsage,
+    ) -> Result<CertificateIdentity, TransportError> {
+        self.check_chain(chain, usage)?;
+        let identity = certificate_identity(&chain[0])?;
+        self.check(&identity)?;
+        let key = (identity.node, identity.serial.clone());
+        if !self.proofs.get(&key).is_some_and(|proofs| {
+            proofs.iter().any(|p| {
+                p.usage == usage
+                    && p.chain
+                        .iter()
+                        .map(|c| c.as_ref())
+                        .eq(chain.iter().map(|c| c.as_ref()))
+            })
+        }) {
+            let bytes: usize = chain.iter().map(|c| c.len()).sum();
+            let (node_count, node_bytes) = self
+                .proof_usage
+                .get(&identity.node)
+                .copied()
+                .unwrap_or_default();
+            // A peer cannot consume another peer's entire budget or the local
+            // rotation reserve by varying unused chain elements. Do not evict
+            // proof needed to reject an already authenticated connection.
+            let local = self.own_node == Some(identity.node);
+            let byte_limit = if local { 16 } else { 15 } * 1024 * 1024;
+            let count_limit = if local { 8192 } else { 8192 - 64 };
+            if self.proof_count >= count_limit
+                || self.proof_bytes.saturating_add(bytes) > byte_limit
+                || node_count >= 64
+                || node_bytes.saturating_add(bytes) > 1024 * 1024
+            {
+                return Err(TransportError::InvalidConfig);
+            }
+            self.proofs.entry(key).or_default().push(CertificateProof {
+                chain: chain
+                    .iter()
+                    .cloned()
+                    .map(CertificateDer::into_owned)
+                    .collect(),
+                usage,
+            });
+            self.proof_bytes += bytes;
+            self.proof_count += 1;
+            self.proof_usage
+                .insert(identity.node, (node_count + 1, node_bytes + bytes));
+        }
+        Ok(identity)
+    }
+
     fn check(&self, identity: &CertificateIdentity) -> Result<(), TransportError> {
         self.revocations.check(identity.node, &identity.serial)?;
         if let Some(rotation) = self.rotations.get(&identity.node)
@@ -222,8 +389,122 @@ impl CertificatePolicy {
         {
             return Err(TransportError::CertificateRetired);
         }
+        if let Some(proofs) = self.proofs.get(&(identity.node, identity.serial.clone())) {
+            for chain in proofs {
+                self.check_chain(&chain.chain, chain.usage)?;
+            }
+        }
         Ok(())
     }
+}
+
+fn wall_millis() -> Result<u64, TransportError> {
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| TransportError::InvalidConfig)?
+            .as_millis(),
+    )
+    .map_err(|_| TransportError::InvalidConfig)
+}
+
+fn retirement(overlap: Duration) -> Result<(Instant, u64), TransportError> {
+    if overlap.is_zero() {
+        return Err(TransportError::InvalidConfig);
+    }
+    let deadline = Instant::now()
+        .checked_add(overlap)
+        .ok_or(TransportError::InvalidConfig)?;
+    let millis = u64::try_from(overlap.as_millis()).map_err(|_| TransportError::InvalidConfig)?;
+    // Millisecond persistence must never round an overlap up after restart.
+    let absolute = wall_millis()?
+        .checked_add(millis)
+        .ok_or(TransportError::InvalidConfig)?;
+    Ok((deadline, absolute))
+}
+
+fn validate_cas(cas: &[CertificateDer<'_>]) -> Result<(), TransportError> {
+    if cas.is_empty() || cas.len() > 64 || cas.iter().any(|c| c.len() > MAX_CERT) {
+        return Err(TransportError::InvalidConfig);
+    }
+    let mut roots = RootCertStore::empty();
+    let mut unique = BTreeSet::new();
+    for ca in cas {
+        if !unique.insert(certificate_fingerprint(ca)) {
+            return Err(TransportError::InvalidConfig);
+        }
+        roots
+            .add(ca.clone().into_owned())
+            .map_err(|_| TransportError::Tls)?;
+    }
+    Ok(())
+}
+
+fn policy_from_snapshot(
+    snapshot: PolicySnapshot,
+    allowed: &BTreeSet<NodeId>,
+) -> Result<CertificatePolicy, TransportError> {
+    snapshot
+        .validate()
+        .map_err(|_| TransportError::InvalidConfig)?;
+    let restored_at = Instant::now();
+    let now = wall_millis()?;
+    if snapshot.saved_at_unix_ms > now {
+        return Err(TransportError::InvalidConfig);
+    }
+    let deadline = |absolute: u64| {
+        restored_at
+            .checked_add(Duration::from_millis(absolute.saturating_sub(now)))
+            .ok_or(TransportError::InvalidConfig)
+    };
+    let mut policy = CertificatePolicy {
+        revision: snapshot.revision,
+        trusted_cas: snapshot
+            .trusted_cas
+            .into_iter()
+            .map(CertificateDer::from)
+            .collect(),
+        revoked_cas: snapshot.revoked_cas,
+        revocations: RevocationList {
+            nodes: snapshot.revoked_nodes.into_iter().map(NodeId).collect(),
+            serials: snapshot
+                .revoked_serials
+                .iter()
+                .map(|s| CertificateSerial::from_bytes(s))
+                .collect::<Result<_, _>>()?,
+        },
+        ..Default::default()
+    };
+    validate_cas(&policy.trusted_cas)?;
+    if let Some(rotation) = snapshot.ca_rotation {
+        let old: Vec<_> = rotation
+            .old_cas
+            .into_iter()
+            .map(CertificateDer::from)
+            .collect();
+        validate_cas(&old)?;
+        policy.ca_rotation = Some(CaRotation {
+            old,
+            deadline: deadline(rotation.retire_at_unix_ms)?,
+            retire_at_unix_ms: rotation.retire_at_unix_ms,
+        });
+    }
+    for rotation in snapshot.peer_rotations {
+        let node = NodeId(rotation.node);
+        if !allowed.contains(&node) {
+            return Err(TransportError::UnauthorizedNode);
+        }
+        policy.rotations.insert(
+            node,
+            PeerRotation {
+                old: CertificateSerial::from_bytes(&rotation.old)?,
+                new: CertificateSerial::from_bytes(&rotation.new)?,
+                deadline: deadline(rotation.retire_at_unix_ms)?,
+                retire_at_unix_ms: rotation.retire_at_unix_ms,
+            },
+        );
+    }
+    Ok(policy)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -269,8 +550,8 @@ impl TransportLimits {
     }
 }
 
-/// Trust anchors and membership are immutable for one listener lifetime.
-/// Leaf credentials and revocations can be updated through `TlsTransport`.
+/// Bootstrap trust anchors and immutable membership for one listener lifetime.
+/// Credentials and trust/revocation policy can be updated through `TlsTransport`.
 pub struct TlsTransportConfig {
     pub node_id: NodeId,
     /// Caller must allocate a fresh, nonzero incarnation after a node restart.
@@ -366,7 +647,6 @@ pub struct TlsTransport {
     incarnation: u64,
     address: SocketAddr,
     allowed: BTreeSet<NodeId>,
-    trusted_cas: Vec<CertificateDer<'static>>,
     credentials: Arc<RwLock<Arc<TlsCredentials>>>,
     policy: Arc<RwLock<CertificatePolicy>>,
     peers: BTreeMap<NodeId, SocketAddr>,
@@ -394,7 +674,25 @@ impl fmt::Debug for TlsTransport {
 impl TlsTransport {
     /// Must be called inside a Tokio runtime with I/O and time enabled.
     pub async fn bind(config: TlsTransportConfig) -> Result<Self, TransportError> {
+        Self::bind_inner(config, None).await
+    }
+
+    /// Restore an authenticated, revision-checked snapshot BEFORE opening the
+    /// listener. Load it using PolicyStore; this method does not authenticate a
+    /// caller-supplied DTO. A trusted wall clock is required across restarts.
+    pub async fn bind_with_policy(
+        config: TlsTransportConfig,
+        snapshot: PolicySnapshot,
+    ) -> Result<Self, TransportError> {
+        Self::bind_inner(config, Some(snapshot)).await
+    }
+
+    async fn bind_inner(
+        config: TlsTransportConfig,
+        snapshot: Option<PolicySnapshot>,
+    ) -> Result<Self, TransportError> {
         config.limits.validate()?;
+        validate_cas(&config.trusted_cas)?;
         if !config.bind_addr.ip().is_loopback() && !config.allow_external_bind {
             return Err(TransportError::ExternalBindDenied);
         }
@@ -411,10 +709,27 @@ impl TlsTransport {
             return Err(TransportError::InvalidConfig);
         }
         config.revocations.validate()?;
-        let policy = Arc::new(RwLock::new(CertificatePolicy {
+        let mut initial = CertificatePolicy {
+            own_node: Some(config.node_id),
             revocations: config.revocations.clone(),
-            rotations: BTreeMap::new(),
-        }));
+            trusted_cas: config.trusted_cas.clone(),
+            ..Default::default()
+        };
+        if let Some(snapshot) = snapshot {
+            initial = policy_from_snapshot(snapshot, &config.allowed_nodes)?;
+            initial.own_node = Some(config.node_id);
+            // Explicit bootstrap denials may strengthen, never weaken, restore.
+            initial
+                .revocations
+                .nodes
+                .extend(config.revocations.nodes.iter().copied());
+            initial
+                .revocations
+                .serials
+                .extend(config.revocations.serials.iter().cloned());
+            initial.revocations.validate()?;
+        }
+        let policy = Arc::new(RwLock::new(initial));
         let credentials = Arc::new(RwLock::new(Arc::new(tls_configs(&config, policy.clone())?)));
         let listener = TcpListener::bind(config.bind_addr)
             .await
@@ -455,7 +770,6 @@ impl TlsTransport {
             incarnation: config.incarnation,
             address,
             allowed: config.allowed_nodes,
-            trusted_cas: config.trusted_cas,
             credentials,
             policy,
             peers: config.peers,
@@ -482,7 +796,8 @@ impl TlsTransport {
     }
     /// Atomically replaces the local deny-list. Removing an entry explicitly
     /// restores its eligibility; it does not remove a peer's rotation policy.
-    /// The list is memory-only. Self-revocation disables local traffic too.
+    /// Updates memory; persist a snapshot separately. Self-revocation disables
+    /// local traffic too.
     pub fn set_revocations(&mut self, revocations: RevocationList) -> Result<(), TransportError> {
         self.ensure_open()?;
         revocations.validate()?;
@@ -520,6 +835,7 @@ impl TlsTransport {
         let deadline = now
             .checked_add(overlap)
             .ok_or(TransportError::InvalidConfig)?;
+        let (_, retire_at_unix_ms) = retirement(overlap)?;
         policy.revocations.check(node, &new)?;
         if let Some(previous) = policy.rotations.get(&node) {
             if now < previous.deadline {
@@ -529,9 +845,156 @@ impl TlsTransport {
                 return Err(TransportError::InvalidConfig);
             }
         }
-        policy
-            .rotations
-            .insert(node, PeerRotation { old, new, deadline });
+        policy.rotations.insert(
+            node,
+            PeerRotation {
+                old,
+                new,
+                deadline,
+                retire_at_unix_ms,
+            },
+        );
+        Ok(())
+    }
+
+    /// Install new trust anchors alongside the previous set for a bounded
+    /// overlap. Install on every peer before issuing identities under the new
+    /// CA. Revocations take precedence. Expiry can disable this node until its
+    /// own identity is rotated. Concurrent CA overlaps are rejected.
+    pub fn rotate_certificate_authorities(
+        &mut self,
+        new: Vec<CertificateDer<'static>>,
+        overlap: Duration,
+    ) -> Result<(), TransportError> {
+        self.ensure_open()?;
+        validate_cas(&new)?;
+        let (deadline, retire_at_unix_ms) = retirement(overlap)?;
+        let mut policy = self.policy.write().map_err(|_| TransportError::Tls)?;
+        if policy
+            .ca_rotation
+            .as_ref()
+            .is_some_and(|r| Instant::now() < r.deadline)
+        {
+            return Err(TransportError::RotationInProgress);
+        }
+        if new == policy.trusted_cas
+            || new
+                .iter()
+                .any(|c| policy.revoked_cas.contains(&certificate_fingerprint(c)))
+        {
+            return Err(TransportError::InvalidConfig);
+        }
+        let old = std::mem::replace(&mut policy.trusted_cas, new);
+        policy.ca_rotation = Some(CaRotation {
+            old,
+            deadline,
+            retire_at_unix_ms,
+        });
+        Ok(())
+    }
+
+    /// Replace exact DER SHA-256 CA/intermediate denials. All presented chain
+    /// elements are checked, even unused intermediates (conservative rejection).
+    /// Root denials also remove omitted trust anchors during path validation.
+    /// Cross-signed certificates have distinct fingerprints; deny each form.
+    /// A separately trusted certificate with the same subject/key can still
+    /// authenticate that issuer's leaves. Retiring an issuing key requires
+    /// removing/revoking all its trusted forms; use a fresh CA key for rollover.
+    pub fn set_revoked_certificate_authorities(
+        &mut self,
+        revoked: BTreeSet<CertificateFingerprint>,
+    ) -> Result<(), TransportError> {
+        self.ensure_open()?;
+        if revoked.len() > 4096 {
+            return Err(TransportError::InvalidConfig);
+        }
+        self.policy
+            .write()
+            .map_err(|_| TransportError::Tls)?
+            .revoked_cas = revoked;
+        Ok(())
+    }
+
+    /// Capture public policy only, for synchronous PolicyStore persistence off
+    /// the Tokio I/O thread. Deadlines are never extended, even if the live wall
+    /// clock regresses before capture. Saving
+    /// and activating are separate trusted-caller operations; there is no
+    /// automatic disk write or atomic disk-plus-memory transaction.
+    pub fn certificate_policy_snapshot(
+        &self,
+        revision: u64,
+    ) -> Result<PolicySnapshot, TransportError> {
+        self.ensure_open()?;
+        let policy = self.policy.read().map_err(|_| TransportError::Tls)?;
+        let now = wall_millis()?;
+        let persist_deadline = |deadline: Instant, absolute: u64| {
+            absolute.min(
+                now.saturating_add(
+                    u64::try_from(
+                        deadline
+                            .saturating_duration_since(Instant::now())
+                            .as_millis(),
+                    )
+                    .unwrap_or(u64::MAX),
+                ),
+            )
+        };
+        let snapshot = PolicySnapshot {
+            version: 1,
+            revision,
+            saved_at_unix_ms: now,
+            trusted_cas: policy.trusted_cas.iter().map(|c| c.to_vec()).collect(),
+            ca_rotation: policy.ca_rotation.as_ref().map(|r| CaRotationSnapshot {
+                old_cas: r.old.iter().map(|c| c.to_vec()).collect(),
+                retire_at_unix_ms: persist_deadline(r.deadline, r.retire_at_unix_ms),
+            }),
+            revoked_cas: policy.revoked_cas.clone(),
+            revoked_nodes: policy.revocations.nodes.iter().map(|n| n.0).collect(),
+            revoked_serials: policy
+                .revocations
+                .serials
+                .iter()
+                .map(|s| s.as_bytes().to_vec())
+                .collect(),
+            peer_rotations: policy
+                .rotations
+                .iter()
+                .map(|(node, r)| PeerRotationSnapshot {
+                    node: node.0,
+                    old: r.old.as_bytes().to_vec(),
+                    new: r.new.as_bytes().to_vec(),
+                    retire_at_unix_ms: persist_deadline(r.deadline, r.retire_at_unix_ms),
+                })
+                .collect(),
+        };
+        snapshot
+            .validate()
+            .map_err(|_| TransportError::InvalidConfig)?;
+        Ok(snapshot)
+    }
+
+    /// Activate a prepared snapshot after PolicyStore::save succeeds. Callers
+    /// must serialize preparation/persistence/activation with all other policy
+    /// updates and stop on any persistence or activation error. This trusted API
+    /// does not verify an envelope MAC; never pass unauthenticated network data.
+    /// Retained chain evidence still protects already authenticated connections.
+    /// A snapshot may deliberately revoke this node and disable its traffic.
+    pub fn install_certificate_policy(
+        &mut self,
+        snapshot: PolicySnapshot,
+    ) -> Result<(), TransportError> {
+        self.ensure_open()?;
+        let mut replacement = policy_from_snapshot(snapshot, &self.allowed)?;
+        let mut policy = self.policy.write().map_err(|_| TransportError::Tls)?;
+        if replacement.revision <= policy.revision {
+            return Err(TransportError::InvalidConfig);
+        }
+        replacement.proofs = std::mem::take(&mut policy.proofs);
+        replacement.proof_bytes = policy.proof_bytes;
+        replacement.proof_count = policy.proof_count;
+        replacement.proof_usage = std::mem::take(&mut policy.proof_usage);
+        replacement.own_node = Some(self.node);
+        *policy = replacement;
         Ok(())
     }
     /// Validates and atomically installs a replacement leaf/key pair under the
@@ -542,7 +1005,15 @@ impl TlsTransport {
     /// Register the overlap on every peer BEFORE calling this method.
     pub fn rotate_identity(&mut self, identity: TlsIdentity) -> Result<(), TransportError> {
         self.ensure_open()?;
-        let mut config = TlsTransportConfig::new(self.node, identity, self.trusted_cas.clone());
+        let cas = {
+            let policy = self.policy.read().map_err(|_| TransportError::Tls)?;
+            let mut cas = policy.trusted_cas.clone();
+            if let Some(rotation) = &policy.ca_rotation {
+                cas.extend(rotation.old.clone());
+            }
+            cas
+        };
+        let mut config = TlsTransportConfig::new(self.node, identity, cas);
         config.allowed_nodes = self.allowed.clone();
         let replacement = Arc::new(tls_configs(&config, self.policy.clone())?);
         *self.credentials.write().map_err(|_| TransportError::Tls)? = replacement;
@@ -983,21 +1454,14 @@ struct TlsCredentials {
     client: Arc<ClientConfig>,
     acceptor: TlsAcceptor,
     local: CertificateIdentity,
-    local_chain: Vec<CertificateDer<'static>>,
-    client_validation: Arc<dyn ClientCertVerifier>,
-    roots: Arc<RootCertStore>,
-    provider: Arc<CryptoProvider>,
+    policy: Arc<RwLock<CertificatePolicy>>,
 }
 impl TlsCredentials {
     fn validate_local(&self) -> Result<(), TransportError> {
-        self.client_validation
-            .verify_client_cert(
-                &self.local_chain[0],
-                &self.local_chain[1..],
-                UnixTime::now(),
-            )
-            .map_err(|_| TransportError::Tls)?;
-        Ok(())
+        self.policy
+            .read()
+            .map_err(|_| TransportError::Tls)?
+            .check(&self.local)
     }
 
     fn validate_peer(
@@ -1005,22 +1469,17 @@ impl TlsCredentials {
         certificates: &[CertificateDer<'_>],
         server: bool,
     ) -> Result<CertificateIdentity, TransportError> {
-        let (leaf, chain) = certificates.split_first().ok_or(TransportError::Tls)?;
-        if server {
-            verify_server_cert_signed_by_trust_anchor(
-                &ParsedCertificate::try_from(leaf).map_err(|_| TransportError::Tls)?,
-                &self.roots,
-                chain,
-                UnixTime::now(),
-                self.provider.signature_verification_algorithms.all,
+        self.policy
+            .write()
+            .map_err(|_| TransportError::Tls)?
+            .remember(
+                certificates,
+                if server {
+                    CertificateUsage::Server
+                } else {
+                    CertificateUsage::Client
+                },
             )
-            .map_err(|_| TransportError::Tls)?;
-        } else {
-            self.client_validation
-                .verify_client_cert(leaf, chain, UnixTime::now())
-                .map_err(|_| TransportError::Tls)?;
-        }
-        certificate_identity(leaf)
     }
 }
 
@@ -1031,7 +1490,7 @@ fn tls_configs(
     if config.identity.certificates.is_empty()
         || config.identity.certificates.len() > 8
         || config.trusted_cas.is_empty()
-        || config.trusted_cas.len() > 64
+        || config.trusted_cas.len() > 128
         || config
             .identity
             .certificates
@@ -1050,12 +1509,12 @@ fn tls_configs(
         .read()
         .map_err(|_| TransportError::Tls)?
         .check(&local)?;
+    policy
+        .read()
+        .map_err(|_| TransportError::Tls)?
+        .check_chain(&config.identity.certificates, CertificateUsage::Both)?;
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut roots = RootCertStore::empty();
-    for cert in &config.trusted_cas {
-        roots.add(cert.clone()).map_err(|_| TransportError::Tls)?;
-    }
-    let roots = Arc::new(roots);
+    let roots = policy.read().map_err(|_| TransportError::Tls)?.roots()?;
     let cn_fallback = roots
         .roots
         .iter()
@@ -1085,7 +1544,6 @@ fn tls_configs(
     let verifier = Arc::new(MemberClientVerifier {
         inner: client_verifier.clone(),
         members: members.clone(),
-        cn_fallback,
         policy: policy.clone(),
     });
     let mut server = ServerConfig::builder_with_provider(provider.clone())
@@ -1106,11 +1564,9 @@ fn tls_configs(
         .map_err(|_| TransportError::Tls)?
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(MemberServerVerifier {
-            roots: roots.clone(),
             provider: provider.clone(),
             members,
-            cn_fallback,
-            policy,
+            policy: policy.clone(),
         }))
         .with_client_auth_cert(
             config.identity.certificates.clone(),
@@ -1120,14 +1576,15 @@ fn tls_configs(
     client.alpn_protocols = vec![ALPN.to_vec()];
     client.resumption = rustls::client::Resumption::disabled();
     client.enable_early_data = false;
+    policy
+        .write()
+        .map_err(|_| TransportError::Tls)?
+        .remember(&config.identity.certificates, CertificateUsage::Both)?;
     Ok(TlsCredentials {
         client: Arc::new(client),
         acceptor: TlsAcceptor::from(Arc::new(server)),
         local,
-        local_chain: config.identity.certificates.clone(),
-        client_validation: client_verifier,
-        roots,
-        provider,
+        policy,
     })
 }
 
@@ -1137,12 +1594,15 @@ fn identity_tls_error() -> rustls::Error {
 fn verify_certificate_policy(
     policy: &RwLock<CertificatePolicy>,
     cert: &CertificateDer<'_>,
+    chain: &[CertificateDer<'_>],
+    usage: CertificateUsage,
 ) -> Result<(), rustls::Error> {
-    let identity = certificate_identity(cert).map_err(|_| identity_tls_error())?;
+    let mut certificates = vec![cert.clone()];
+    certificates.extend_from_slice(chain);
+    let policy = policy.read().map_err(|_| identity_tls_error())?;
     policy
-        .read()
-        .map_err(|_| identity_tls_error())?
-        .check(&identity)
+        .check_chain(&certificates, usage)
+        .and_then(|_| policy.check(&certificate_identity(cert)?))
         .map_err(|error| match error {
             TransportError::CertificateRevoked => {
                 rustls::Error::InvalidCertificate(rustls::CertificateError::Revoked)
@@ -1165,12 +1625,13 @@ fn verified_identity(
 struct MemberClientVerifier {
     inner: Arc<dyn ClientCertVerifier>,
     members: Arc<BTreeSet<NodeId>>,
-    cn_fallback: bool,
     policy: Arc<RwLock<CertificatePolicy>>,
 }
 impl ClientCertVerifier for MemberClientVerifier {
     fn root_hint_subjects(&self) -> &[DistinguishedName] {
-        self.inner.root_hint_subjects()
+        // Empty hints permit peers to select their installed certificate across
+        // CA updates; the dynamic verifier remains the trust decision.
+        &[]
     }
     fn verify_client_cert(
         &self,
@@ -1178,13 +1639,15 @@ impl ClientCertVerifier for MemberClientVerifier {
         chain: &[CertificateDer<'_>],
         now: UnixTime,
     ) -> Result<ClientCertVerified, rustls::Error> {
-        let verified = self.inner.verify_client_cert(cert, chain, now)?;
-        let node = verified_identity(cert, chain, self.cn_fallback)?;
+        let _ = now;
+        verify_certificate_policy(&self.policy, cert, chain, CertificateUsage::Client)?;
+        let node = certificate_identity(cert)
+            .map_err(|_| identity_tls_error())?
+            .node;
         if !self.members.contains(&node) {
             return Err(identity_tls_error());
         }
-        verify_certificate_policy(&self.policy, cert)?;
-        Ok(verified)
+        Ok(ClientCertVerified::assertion())
     }
     fn verify_tls12_signature(
         &self,
@@ -1208,10 +1671,8 @@ impl ClientCertVerifier for MemberClientVerifier {
 }
 #[derive(Debug)]
 struct MemberServerVerifier {
-    roots: Arc<RootCertStore>,
     provider: Arc<CryptoProvider>,
     members: Arc<BTreeSet<NodeId>>,
-    cn_fallback: bool,
     policy: Arc<RwLock<CertificatePolicy>>,
 }
 impl ServerCertVerifier for MemberServerVerifier {
@@ -1223,15 +1684,11 @@ impl ServerCertVerifier for MemberServerVerifier {
         _ocsp: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        let parsed = ParsedCertificate::try_from(cert)?;
-        verify_server_cert_signed_by_trust_anchor(
-            &parsed,
-            &self.roots,
-            chain,
-            now,
-            self.provider.signature_verification_algorithms.all,
-        )?;
-        let node = verified_identity(cert, chain, self.cn_fallback)?;
+        let _ = now;
+        verify_certificate_policy(&self.policy, cert, chain, CertificateUsage::Server)?;
+        let node = certificate_identity(cert)
+            .map_err(|_| identity_tls_error())?
+            .node;
         let ServerName::DnsName(expected) = name else {
             return Err(identity_tls_error());
         };
@@ -1241,7 +1698,6 @@ impl ServerCertVerifier for MemberServerVerifier {
         if !self.members.contains(&node) || expected.as_ref() != node_name(node) {
             return Err(identity_tls_error());
         }
-        verify_certificate_policy(&self.policy, cert)?;
         Ok(ServerCertVerified::assertion())
     }
     fn verify_tls12_signature(
