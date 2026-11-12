@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use src::daemon::control::{CommandRequest, ControlPlane, NOTE};
+use src::daemon::update_control::{ControlAccess, UpdateHub};
+use src::{local_control::DaemonControlEnvelope, update_rollback::UpdateControlRequest};
 use std::{ffi::OsString, io, net::SocketAddr, path::PathBuf, time::Duration};
 use subtle::ConstantTimeEq;
 use tokio::{
@@ -121,6 +123,8 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
 #[serde(deny_unknown_fields)]
 struct Bootstrap {
     secret: [u8; 32],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    access: Option<ControlAccess>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -140,7 +144,18 @@ struct StatusRequest {
 
 struct Envelope {
     request: CommandRequest,
+    update: Option<UpdateControlRequest>,
+    access: ControlAccess,
     response: oneshot::Sender<Value>,
+}
+
+// Each alternative is strict, including the flattened update payload. No role,
+// subject or scope supplied by a connected client is accepted here.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum WireRequest {
+    Update(Box<DaemonControlEnvelope<UpdateControlRequest>>),
+    Command(StatusRequest),
 }
 
 async fn read_frame<R: AsyncRead + Unpin>(reader: R) -> io::Result<Vec<u8>> {
@@ -163,7 +178,7 @@ async fn read_bootstrap<R: AsyncRead + Unpin>(reader: R) -> io::Result<Bootstrap
         let frame = read_frame(reader).await?;
         let bootstrap: Bootstrap = serde_json::from_slice(&frame)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid control bootstrap"))?;
-        if bootstrap.secret == [0; 32] {
+        if bootstrap.secret == [0; 32] || bootstrap.access.as_ref().is_some_and(|a| !a.valid()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid control bootstrap",
@@ -175,29 +190,58 @@ async fn read_bootstrap<R: AsyncRead + Unpin>(reader: R) -> io::Result<Bootstrap
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "control bootstrap timed out"))?
 }
 
+#[cfg(test)]
 async fn serve_status<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: S,
+    secret: &[u8; 32],
+    commands: &mpsc::Sender<Envelope>,
+) -> io::Result<()> {
+    serve_control(stream, secret, &ControlAccess::default(), commands).await
+}
+
+async fn serve_control<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
     secret: &[u8; 32],
+    access: &ControlAccess,
     commands: &mpsc::Sender<Envelope>,
 ) -> io::Result<()> {
     tokio::time::timeout(DEADLINE, async {
         let frame = read_frame(&mut stream).await?;
-        let request: StatusRequest = serde_json::from_slice(&frame)
+        let request: WireRequest = serde_json::from_slice(&frame)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid status request"))?;
-        if !bool::from(request.secret.ct_eq(secret)) {
+        let received_secret = match &request {
+            WireRequest::Update(wire) => &wire.secret,
+            WireRequest::Command(wire) => &wire.secret,
+        };
+        if !bool::from(received_secret.ct_eq(secret)) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "status request denied",
             ));
         }
-        let command = CommandRequest {
-            command: request.command,
-            bot: request.bot,
-            operation_id: request.operation_id,
-            force: request.force,
-            yes: request.yes,
+        let (command, update) = match request {
+            WireRequest::Update(wire) => (
+                CommandRequest {
+                    command: wire.request.command_name().into(),
+                    bot: Some(wire.request.bot.clone()),
+                    operation_id: Some(wire.request.operation_id.clone()),
+                    force: false,
+                    yes: wire.request.yes,
+                },
+                Some(wire.request),
+            ),
+            WireRequest::Command(request) => (
+                CommandRequest {
+                    command: request.command,
+                    bot: request.bot,
+                    operation_id: request.operation_id,
+                    force: request.force,
+                    yes: request.yes,
+                },
+                None,
+            ),
         };
-        if !command.valid() {
+        if update.is_none() && !command.valid() {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "control request denied",
@@ -209,6 +253,8 @@ async fn serve_status<S: AsyncRead + AsyncWrite + Unpin>(
         let value = if commands
             .try_send(Envelope {
                 request: command,
+                update,
+                access: access.clone(),
                 response,
             })
             .is_ok()
@@ -237,6 +283,7 @@ async fn serve_status<S: AsyncRead + AsyncWrite + Unpin>(
 async fn status_server(
     listener: TcpListener,
     secret: [u8; 32],
+    access: ControlAccess,
     commands: mpsc::Sender<Envelope>,
 ) -> io::Result<()> {
     let mut sessions = JoinSet::new();
@@ -246,7 +293,8 @@ async fn status_server(
                 let (stream, peer) = accepted?;
                 if !peer.ip().is_loopback() { continue; }
                 let commands = commands.clone();
-                sessions.spawn(async move { let _ = serve_status(stream, &secret, &commands).await; });
+                let access = access.clone();
+                sessions.spawn(async move { let _ = serve_control(stream, &secret, &access, &commands).await; });
             }
             _ = sessions.join_next(), if !sessions.is_empty() => {}
         }
@@ -307,9 +355,20 @@ async fn run() -> Result<(), &'static str> {
     // Partial startup failures remain visible through snapshots. Dropping this
     // daemon, including any error below, deliberately does not force-kill children.
     let startup_ok = options.no_autostart || daemon.start_all(&credentials).is_ok();
-    let mut control = ControlPlane::new(daemon, config, startup_ok);
+    let local = daemon.snapshots().into_iter().map(|s| s.key).collect();
+    let mut updates = UpdateHub::new(
+        config.clone(),
+        local,
+        options.runtime_root.join("update-audit.jsonl"),
+    );
+    let mut control = ControlPlane::new(daemon, config.clone(), startup_ok);
     let (sender, mut receiver) = mpsc::channel::<Envelope>(64);
-    let mut server = tokio::spawn(status_server(listener, bootstrap.secret, sender));
+    let mut server = tokio::spawn(status_server(
+        listener,
+        bootstrap.secret,
+        bootstrap.access.clone().unwrap_or_default(),
+        sender,
+    ));
     let mut announcement = serde_json::to_vec(&json!({
         "port": port, "local_only": true, "startup_ok": startup_ok,
         "mock_discord": options.mock_discord.is_some(),
@@ -330,10 +389,26 @@ async fn run() -> Result<(), &'static str> {
             }
             _ = interval.tick() => {
                 control.tick(&credentials).await;
+                for job in updates.drain() {
+                    updates.complete(job, json!({"ok":false,"error":"update execution is unavailable in the default runtime; Core readiness/drain and Gateway authority are not connected"}));
+                }
             }
             Some(envelope) = receiver.recv() => {
                 if !envelope.response.is_closed() {
-                    let _ = envelope.response.send(control.request(&envelope.request));
+                    let response = if let Some(update) = envelope.update {
+                        if control.operation_exists(&update.operation_id) {
+                            json!({"ok":false,"error":"operation ID conflicts with an earlier request"})
+                        } else {
+                            let busy = control.bot_busy(&update.bot);
+                            updates.admit(update, envelope.access, busy)
+                        }
+                    } else if envelope.request.command == "operation" && envelope.request.operation_id.as_deref().is_some_and(|id| updates.contains(id)) {
+                        updates.query(envelope.request.operation_id.as_deref().unwrap(), &envelope.access)
+                    } else if matches!(envelope.request.command.as_str(), "start" | "stop" | "restart")
+                        && (envelope.request.operation_id.as_deref().is_some_and(|id| updates.contains(id)) || envelope.request.bot.as_deref().and_then(|selector| src::botref::resolve(&config.bots, selector).ok().map(|b| updates.busy(&b.bot_id))).unwrap_or(false)) {
+                        json!({"ok":false,"error":"Bot or operation ID is already busy"})
+                    } else { control.request_as(&envelope.request, &envelope.access) };
+                    let _ = envelope.response.send(response);
                 }
             }
             _ = &mut server => break Err("local daemon control stopped"),
@@ -390,6 +465,15 @@ async fn run_test_cluster(
     let bootstrap = read_bootstrap(tokio::io::stdin())
         .await
         .map_err(|_| "invalid anonymous control bootstrap")?;
+    // The experimental cluster exposes an aggregate view. Restrict it to its
+    // original full local administrator capability until scoped views exist.
+    if bootstrap
+        .access
+        .as_ref()
+        .is_some_and(|a| a.role != "admin" || a.scope.is_some())
+    {
+        return Err("test cluster requires a full local administrator capability");
+    }
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .map_err(|_| "cannot bind local daemon control")?;
@@ -398,7 +482,12 @@ async fn run_test_cluster(
         .map_err(|_| "cannot inspect local daemon control")?
         .port();
     let (sender, mut receiver) = mpsc::channel::<Envelope>(64);
-    let mut server = tokio::spawn(status_server(listener, bootstrap.secret, sender));
+    let mut server = tokio::spawn(status_server(
+        listener,
+        bootstrap.secret,
+        bootstrap.access.clone().unwrap_or_default(),
+        sender,
+    ));
     let announcement = json!({"port":port,"local_only":true,"startup_ok":true,
         "mock_discord":true,"test_quorum":true,"production_ready":false});
     let mut bytes =
@@ -506,8 +595,27 @@ async fn run_test_gateway_switch(
         options.mock_discord.ok_or("mock Discord required")?,
         limits,
     )?;
+    let local = config
+        .local_primary_intents(&std::collections::HashMap::new())
+        .map_err(|_| "invalid local update targets")?
+        .into_iter()
+        .map(|s| src::daemon::ShardKey {
+            bot_id: s.bot_id,
+            shard_id: s.shard_id,
+        })
+        .collect::<Vec<_>>();
+    let mut updates = UpdateHub::new(
+        config.clone(),
+        local.clone(),
+        options.runtime_root.join("update-audit.jsonl"),
+    );
     let (sender, mut receiver) = mpsc::channel::<Envelope>(64);
-    let mut server = tokio::spawn(status_server(listener, bootstrap.secret, sender));
+    let mut server = tokio::spawn(status_server(
+        listener,
+        bootstrap.secret,
+        bootstrap.access.clone().unwrap_or_default(),
+        sender,
+    ));
     let mut announcement =
         serde_json::to_vec(&json!({"port":port,"local_only":true,"startup_ok":true,
         "mock_discord":true,"test_gateway_switch":true,"production_ready":false}))
@@ -518,10 +626,53 @@ async fn run_test_gateway_switch(
         server.abort();
         return Err("cannot announce local daemon control");
     }
+    let mut update_tick = tokio::time::interval(Duration::from_millis(25));
+    update_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let result = loop {
         tokio::select! {
             signal = tokio::signal::ctrl_c() => break signal.map_err(|_| "cannot receive daemon shutdown signal"),
-            Some(envelope) = receiver.recv() => { let _ = envelope.response.send(runtime.request(&envelope.request)); },
+            Some(envelope) = receiver.recv() => {
+                let response = if let Some(update) = envelope.update {
+                    if runtime.legacy_operation_exists(&update.operation_id) {
+                        json!({"ok":false,"error":"operation ID conflicts with an earlier request"})
+                    } else { updates.admit(update, envelope.access, false) }
+                } else if envelope.request.command == "operation" && envelope.request.operation_id.as_deref().is_some_and(|id| updates.contains(id)) {
+                    updates.query(envelope.request.operation_id.as_deref().unwrap(), &envelope.access)
+                } else {
+                    let selector = envelope.request.bot.as_deref();
+                    let bot = selector.and_then(|s| src::botref::resolve(&config.bots,s.split('/').next().unwrap_or(s)).ok());
+                    let keys: Vec<_> = local.iter().filter(|key| bot.is_none_or(|b| key.bot_id == b.bot_id)).cloned().collect();
+                    let read = matches!(envelope.request.command.as_str(), "ps"|"status"|"inspect"|"shards"|"operation");
+                    if !envelope.access.allows_command(read, bot.map(|b| b.bot_id.as_str()), &keys) {
+                        json!({"ok":false,"error":"control permission or scope denied"})
+                    } else if !read && (envelope.request.operation_id.as_deref().is_some_and(|id| updates.contains(id)) || bot.is_some_and(|b| updates.busy(&b.bot_id))) {
+                        json!({"ok":false,"error":"Bot or operation ID is already busy"})
+                    } else if envelope.request.command == "inspect" {
+                        runtime.inspect_bot(selector.unwrap_or_default())
+                    } else {
+                        let mut value = runtime.request(&envelope.request);
+                        // The legacy experimental runtime returns an aggregate
+                        // view; never expose another Bot through a scoped selector.
+                        if let Some(bot) = bot {
+                            if let Some(shards) = value["shards"].as_array_mut() {
+                                shards.retain(|s| s["bot_id"] == bot.bot_id);
+                            }
+                            if let Some(transitions) = value["transitions"].as_array_mut() {
+                                transitions.retain(|s| s["bot_id"] == bot.bot_id);
+                            }
+                        }
+                        value
+                    }
+                };
+                let _ = envelope.response.send(response);
+            },
+            _ = update_tick.tick() => {
+                updates.poll_backend(|id| runtime.update_status(id));
+                for job in updates.drain() {
+                    let response = runtime.request_update(&job.request);
+                    updates.complete(job,response);
+                }
+            },
             _ = &mut server => break Err("local daemon control stopped"),
         }
     };
@@ -768,18 +919,30 @@ mod tests {
 
     #[tokio::test]
     async fn bootstrap_is_bounded_and_rejects_zero_or_unknown_fields() {
-        let mut valid = serde_json::to_vec(&Bootstrap { secret: [7; 32] }).unwrap();
+        let mut valid = serde_json::to_vec(&Bootstrap {
+            secret: [7; 32],
+            access: None,
+        })
+        .unwrap();
         valid.push(b'\n');
         assert_eq!(bootstrap_input(valid).await.unwrap().secret, [7; 32]);
         for frame in [
             b"{\"secret\":[0]}\n".to_vec(),
             b"{}\n".to_vec(),
             vec![b'x'; REQUEST_LIMIT as usize + 1],
-            serde_json::to_vec(&Bootstrap { secret: [0; 32] }).unwrap(),
+            serde_json::to_vec(&Bootstrap {
+                secret: [0; 32],
+                access: None,
+            })
+            .unwrap(),
         ] {
             assert!(bootstrap_input(frame).await.is_err());
         }
-        let mut zero = serde_json::to_vec(&Bootstrap { secret: [0; 32] }).unwrap();
+        let mut zero = serde_json::to_vec(&Bootstrap {
+            secret: [0; 32],
+            access: None,
+        })
+        .unwrap();
         zero.push(b'\n');
         assert!(bootstrap_input(zero).await.is_err());
         let mut extra = json!({"secret": vec![7; 32], "port": 1})

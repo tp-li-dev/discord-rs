@@ -9,6 +9,17 @@ const REQUEST_LIMIT: u64 = 4096;
 const RESPONSE_LIMIT: usize = 64 * 1024;
 const DEADLINE: Duration = Duration::from_secs(3);
 
+/// Existing daemon newline-JSON envelope. The capability is delivered by an
+/// anonymous bootstrap pipe, never by argv or by the manifest. Deliberately no
+/// Debug implementation. The payload must reject unknown fields on decoding.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonControlEnvelope<T> {
+    pub secret: [u8; 32],
+    #[serde(flatten)]
+    pub request: T,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ListRequest {

@@ -563,6 +563,234 @@ async fn assert_exited(pids: &[u32]) {
     .await;
 }
 
+async fn update_plan(root: &Path, label: &str, current: u64, candidate: u64) -> PathBuf {
+    let program = PathBuf::from(env!("CARGO_BIN_EXE_src"));
+    let digest = tokio::task::spawn_blocking({
+        let program = program.clone();
+        move || {
+            let bytes = std::fs::read(program).unwrap();
+            let digest = rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256
+                .tls13()
+                .unwrap()
+                .common
+                .hash_provider
+                .hash(&bytes);
+            digest
+                .as_ref()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        }
+    })
+    .await
+    .unwrap();
+    let plan = root.join(format!("{label}-plan.json"));
+    std::fs::write(&plan, serde_json::to_vec(&json!({"bot_id":"101","bot_name":"alpha","total_shards":2,
+        "shards":[{"shard_id":0,"gateway":{"current":current,"candidate":candidate}}],
+        "artifacts":{"gateway":{"path":program,"sha256":digest},
+            "core":{"path":"unselected-relative-core","sha256":"a".repeat(64)}},
+        "identify":{"limits":{"max_concurrency":1,"remaining":8,"total":10,"reset_after":60000},"observed_age_ms":0}})).unwrap()).unwrap();
+    plan
+}
+
+async fn update_cli(port: u16, command: &str, id: &str, plan: &Path, success: bool) -> Value {
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_botctl"))
+        .args([
+            command,
+            "alpha",
+            "--component",
+            "gateway",
+            "--yes",
+            "--bootstrap-stdin",
+            "--json",
+            "--timeout",
+            "15s",
+            "--operation-id",
+            id,
+            "--plan",
+        ])
+        .arg(plan)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("DISCORD_TOKEN", SENTINELS[2])
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let bootstrap = format!("{}\n", json!({"port":port,"secret":SECRET}));
+    bounded(child.stdin.take().unwrap().write_all(bootstrap.as_bytes()))
+        .await
+        .unwrap();
+    let output = bounded(child.wait_with_output()).await.unwrap();
+    no_secrets(&output.stdout);
+    no_secrets(&output.stderr);
+    assert!(output.stderr.is_empty());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output.status.success(), success, "CLI result: {value}");
+    assert_eq!(value["ok"], success);
+    value
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn typed_botctl_update_and_rollback_execute_real_gateways_and_audit_final_generations() {
+    let _serial = SERIAL.acquire().await.unwrap();
+    // A single Identify bucket deliberately leaves the admitted update waiting
+    // while the daemon and the other Bot must remain responsive.
+    let mut fixture = Fixture::new(budget(10, 1, 800)).await;
+    for command in ["status", "shards"] {
+        let selected = fixture
+            .request(json!({"command":command,"bot":"alpha"}))
+            .await;
+        assert_eq!(selected["shards"].as_array().unwrap().len(), 2);
+        assert!(
+            selected["shards"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|s| s["bot_id"] == "101")
+        );
+        assert!(
+            selected["transitions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|s| s["bot_id"] == "101")
+        );
+    }
+    let sibling = fixture.gateway(101, 1);
+    let beta = fixture.gateway(202, 0);
+    let sibling_pid = fixture.gateways[sibling].ready["pid"].clone();
+    let beta_pid = fixture.gateways[beta].ready["pid"].clone();
+    let mut old = fixture.gateway(101, 0);
+    let mut ids = Vec::new();
+    for (command, current, candidate) in [("update", 1, 2), ("rollback", 2, 3)] {
+        let plan = update_plan(&fixture.root, command, current, candidate).await;
+        let id = next_id();
+        let port = fixture.port;
+        let task_id = id.clone();
+        let task_plan = plan.clone();
+        let task =
+            tokio::spawn(
+                async move { update_cli(port, command, &task_id, &task_plan, true).await },
+            );
+        bounded(async {
+            loop {
+                let status = fixture
+                    .request(json!({"command":"operation","operation_id":id}))
+                    .await;
+                if status["operation"]["state"] == "running" {
+                    break;
+                }
+                assert!(
+                    !task.is_finished(),
+                    "typed operation never exposed running state"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        let status = tokio::time::timeout(
+            Duration::from_secs(1),
+            fixture.request(json!({"command":"status"})),
+        )
+        .await
+        .expect("update blocked daemon monitoring");
+        single_active(&status);
+        assert_eq!(row(&status, "101", 1)["processes"][0]["pid"], sibling_pid);
+        assert_eq!(row(&status, "202", 0)["processes"][0]["pid"], beta_pid);
+        assert_eq!(
+            fixture.gateways[beta].command(false, "!ping").await["content"],
+            "Pong! 🦀"
+        );
+        let new = fixture.accept().await;
+        assert_eq!(fixture.gateways[new].generation(), candidate);
+        let result = bounded(task).await.unwrap();
+        assert_eq!(result["operation"]["command"], command);
+        assert_eq!(result["operation"]["bot_id"], "101");
+        assert_eq!(result["operation"]["state"], "succeeded");
+        assert_eq!(result["operation"]["failed_shards"], json!([]));
+        assert_eq!(
+            result["operation"]["final_generations"],
+            json!([{"shard_id":0,"gateway":candidate}])
+        );
+        assert_eq!(
+            result["operation"]["shards"][0]["key"],
+            json!({"bot_id":"101","shard_id":0})
+        );
+        assert!(result["operation"]["elapsed_ms"].is_u64());
+        fixture.gateways[old].stopped().await;
+        assert_exited(&fixture.gateways[old].pids()).await;
+        assert_eq!(
+            fixture.gateways[new].command(true, "ping").await["content"],
+            "Pong! 🦀"
+        );
+        let replay = update_cli(fixture.port, command, &id, &plan, true).await;
+        assert_eq!(
+            replay["operation"], result["operation"],
+            "replay changed terminal execution result"
+        );
+        ids.push(id);
+        old = new;
+    }
+    // The stale manifest is valid offline but must be rejected against the
+    // server's live generation before another candidate is launched.
+    let stale = update_plan(&fixture.root, "stale", 1, 2).await;
+    let stale_id = next_id();
+    let rejected = update_cli(fixture.port, "update", &stale_id, &stale, false).await;
+    assert_eq!(rejected["operation"]["state"], "failed");
+    assert_eq!(
+        rejected["operation"]["failed_shards"],
+        json!([{"bot_id":"101","shard_id":0}])
+    );
+    let status = fixture.request(json!({"command":"status"})).await;
+    single_active(&status);
+    assert_eq!(row(&status, "101", 0)["active_generation"], 3);
+    assert_eq!(
+        row(&status, "101", 0)["processes"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), fixture.collector.accept())
+            .await
+            .is_err(),
+        "stale admission launched a process"
+    );
+    let audit_path = fixture.root.join("update-audit.jsonl");
+    // The exclusive audit writer intentionally holds a mandatory file lock on
+    // Windows. Stop/reap the owner before inspecting its persisted records.
+    fixture.finish().await;
+    let audit = std::fs::read(audit_path).unwrap();
+    no_secrets(&audit);
+    let records: Vec<Value> = String::from_utf8(audit)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    for (id, command) in ids.iter().zip(["update", "rollback"]) {
+        let correlated: Vec<_> = records
+            .iter()
+            .filter(|r| r["operation_id"] == *id)
+            .collect();
+        assert_eq!(correlated.len(), 2, "replay produced extra audit execution");
+        assert_eq!(correlated[0]["result"], "started");
+        assert_eq!(correlated[1]["result"], "succeeded");
+        assert_eq!(correlated[0]["request_id"], correlated[1]["request_id"]);
+        assert_eq!(correlated[1]["operation"], command);
+        assert_eq!(correlated[1]["role"], "admin");
+        assert_eq!(correlated[1]["bot_id"], "101");
+    }
+    let failed: Vec<_> = records
+        .iter()
+        .filter(|r| r["operation_id"] == stale_id)
+        .collect();
+    assert_eq!(failed.len(), 2);
+    assert_eq!(failed[0]["result"], "started");
+    assert_eq!(failed[1]["result"], "failed");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prepared_real_gateway_is_standby_then_switch_preserves_old_rest_origin() {
     let _serial = SERIAL.acquire().await.unwrap();
