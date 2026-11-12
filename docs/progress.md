@@ -94,3 +94,11 @@ Worker の双方向受信に 1 MiB、管理要求に 4095 byte（改行込み）
 - `benches/ipc_codec.rs`/docs/benchmarks.md：JSON と MessagePack の codec を Windows 開発機で計測。Linux 本番性能の根拠ではなく、採用判断は保留。
 - 統合時に、管理試験が操作IDの固定値（0）に依存し並列試験で不安定になり得る問題を、worker 番号の確認に修正。
 - main 統合後、fmt、clippy（警告禁止）、workspace test が Windows / Rust 1.99.0 で成功。Linux、Windows CI、実 Discord、複数ホストは未検証。
+
+## 2026-11-12：並列開発 第3弾（Codex CLI）
+- docs：README、developer-guide、operator-guide、known-limitations を実コード基準で整備（掲載サンプルのコンパイル・実行、doctor、register dry-run を確認）。
+- `botref.rs`：Bot の名前/完全ID/一意なID接頭辞の解決、名前のスラッグ安全性、名前とIDの曖昧衝突の拒否、token env・状態パス重複検査（純関数。CLI/daemon 未接続）。
+- `event_seq.rs`：local_sequence、有限バッファ（件数・バイト上限、優先度別満杯拒否）、ACK 範囲、未 ACK 再配送、受信側の欠落/重複検出。受付 ACK と処理完了を型で区別。実 IPC・切替には未接続。
+- Worker identity：`BOT_ID`/`SHARD_ID`/`TOTAL_SHARDS`/`GENERATION_ID` を handshake と Gateway に接続（未指定は従来の 0/0/1）。不一致拒否を統合試験。世代番号の永続化は未実装。
+- main 統合後、fmt・clippy（警告禁止）・workspace test が Windows / Rust 1.99.0 で成功。Linux、CI、実 Discord、複数ホストは未検証。
+- 次候補：event_seq を実 IPC に接続、failover/ownership の接続、daemon/botctl の骨格、Core 世代切替の統合、secret マスクの既存ログ経路への適用、Linux CI の実行確認。
