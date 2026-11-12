@@ -59,7 +59,12 @@ async fn parent_preserves_legacy_format_and_rejects_missing_or_wrong_ack() {
         if mode == "legacy-event" {
             result.unwrap();
         } else if mode == "timeout-ack" {
-            assert_eq!(result.unwrap_err().to_string(), "worker timed out");
+            // ACK admission keeps the control deadline even though handler
+            // completion now has a separate, longer application deadline.
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "worker event ACK timed out"
+            );
         } else {
             assert_eq!(
                 result.unwrap_err().to_string(),
