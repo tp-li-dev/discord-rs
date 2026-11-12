@@ -1,23 +1,28 @@
-//! Loopback process-test adapter for the **test-only** majority ACK coordinator.
+//! Shard failover/failback runtime with explicit, separately gated backends.
 //!
-//! This is not Raft, a durable consensus backend, or production cluster support.
-//! It runs only with explicit opt-in and the token-free mock Discord Gateway.
+//! `bind` retains the legacy test-only majority ACK fixture. `bind_raft` uses
+//! durable OpenRaft epoch CAS over real mTLS RPC; it never counts ownership ACKs.
+//! Both require explicit opt-in and the token-free mock Discord Gateway. The
+//! production execution path remains disabled pending host/clock/fencing tests.
 //! All lease deadlines leaving this module are in this process's `Instant`
 //! domain. Peer clocks and peer payload timestamps never become local deadlines.
 
 use crate::{
     cluster::{
-        ControlMessage, NodeId, TestOnlyPayload, TestOnlyQuorumConfig, TestOnlyQuorumCoordinator,
-        Transport,
+        ControlMessage, NodeId, TestOnlyMessage, TestOnlyPayload, TestOnlyQuorumConfig,
+        TestOnlyQuorumCoordinator, Transport,
     },
     daemon::ShardKey,
     failover::{self, Event, Failover, State},
-    ownership::{Clock, Lease, OwnershipCoordinator, OwnershipKey},
+    ownership::{Clock, Lease, OwnershipCoordinator, OwnershipError, OwnershipKey},
     placement::{self, ClusterMode, LocalShardIntent, ShardCount},
-    protocol::BotId,
+    protocol::{BotId, OwnershipEpoch},
+    raft_quorum::{self, QuorumCoordinator, RaftNode, StorageMode},
     redact::Secret,
     shard_runtime::{self, ShardRuntimeSpec},
-    tls_transport::{TlsIdentity, TlsTransport, TlsTransportConfig, TransportLimits},
+    tls_transport::{
+        TlsIdentity, TlsTransport, TlsTransportConfig, TransportLimits, raft_rpc::TlsRpcTransport,
+    },
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde::Deserialize;
@@ -28,8 +33,10 @@ use std::{
     io::Read,
     net::SocketAddr,
     path::{Component, Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant},
 };
+use tokio::{sync::oneshot, task::JoinHandle};
 
 const MAX_CONFIG: usize = 1024 * 1024;
 const MAX_DER: usize = 64 * 1024;
@@ -45,6 +52,8 @@ pub enum ClusterRuntimeError {
     ConfigTooLarge,
     InvalidConfig,
     TestOnlyOptInRequired,
+    RaftOptInRequired,
+    ProductionNotReady,
     MockDiscordRequired,
     UnsupportedMode,
     CertificateRead,
@@ -54,10 +63,11 @@ pub enum ClusterRuntimeError {
     Policy,
     CounterExhausted,
     UnknownShard,
+    EpochRequired,
 }
 impl fmt::Display for ClusterRuntimeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "test cluster: {self:?}")
+        write!(f, "cluster runtime: {self:?}")
     }
 }
 impl std::error::Error for ClusterRuntimeError {}
@@ -369,6 +379,8 @@ struct RuntimeShard {
     policy: Failover<RuntimeClock>,
     phase: ProcessPhase,
     published: Option<Lease>,
+    // Survives cancellation/draining; only the matching reaped callback clears it.
+    delegated_epoch: Option<u64>,
     next_request: Duration,
     returning: bool,
 }
@@ -414,14 +426,414 @@ impl RuntimePeer {
     }
 }
 
-/// Every botd owns one runtime, one transport, and one test ACK coordinator.
+/// Explicit startup inputs for the Raft path. Creating a store, reopening one,
+/// and bootstrapping a cluster are separate decisions; a missing/corrupt store
+/// is never silently replaced. Routes are for the dedicated mTLS Raft listener.
+/// This API currently requires mock Discord even when `allow_raft` is set.
+#[derive(Clone)]
+pub struct RaftRuntimeOptions {
+    pub allow_raft: bool,
+    pub enable_production: bool,
+    pub storage_path: PathBuf,
+    pub storage_mode: StorageMode,
+    pub bootstrap: bool,
+    pub rpc_listen: SocketAddr,
+    pub rpc_peers: BTreeMap<NodeId, SocketAddr>,
+}
+
+impl Default for RaftRuntimeOptions {
+    fn default() -> Self {
+        Self {
+            allow_raft: false,
+            enable_production: false,
+            storage_path: PathBuf::new(),
+            storage_mode: StorageMode::Open,
+            bootstrap: false,
+            rpc_listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+            rpc_peers: BTreeMap::new(),
+        }
+    }
+}
+
+type RaftGate = QuorumCoordinator<RuntimeClock>;
+
+enum RaftWork {
+    Acquire { blocked_owners: BTreeSet<u64> },
+    Renew(OwnershipEpoch),
+    Finish(OwnershipEpoch),
+    Release(OwnershipEpoch),
+}
+
+enum RaftReply {
+    Lease(Lease),
+    Reserved(OwnershipEpoch),
+    Released,
+    Deferred,
+}
+
+struct PendingRaftWork {
+    task: JoinHandle<()>,
+    result: oneshot::Receiver<(RaftGate, RaftWork, Result<RaftReply, OwnershipError>)>,
+}
+
+struct RaftSlot {
+    gate: Option<RaftGate>,
+    pending: Option<PendingRaftWork>,
+    lease: Option<Lease>,
+    reservation: Option<OwnershipEpoch>,
+    takeover: bool,
+    revoked: bool,
+    // False from Start until process_exited confirms the delegated gate stopped.
+    reaped: bool,
+    retry_at: Duration,
+}
+
+impl RaftSlot {
+    fn new(node: Arc<RaftNode>, clock: RuntimeClock) -> Result<Self, ClusterRuntimeError> {
+        Ok(Self {
+            gate: Some(
+                QuorumCoordinator::new(node, clock)
+                    .map_err(|_| ClusterRuntimeError::Coordinator)?,
+            ),
+            pending: None,
+            lease: None,
+            reservation: None,
+            takeover: false,
+            revoked: false,
+            reaped: true,
+            retry_at: Duration::ZERO,
+        })
+    }
+}
+
+/// At most one asynchronous request per shard. The synchronous runtime only
+/// polls bounded receipts; neither Raft/disk waits nor other shards can block
+/// the watchdog. Each shard has a separate session for ambiguous-write recovery.
+struct RaftLeaseDriver {
+    node: Arc<RaftNode>,
+    rpc: TlsRpcTransport,
+    clock: RuntimeClock,
+    ttl: Duration,
+    retry: Duration,
+    slots: HashMap<OwnershipKey, RaftSlot>,
+}
+
+impl RaftLeaseDriver {
+    fn local_lease(&self, key: OwnershipKey) -> Option<Lease> {
+        let slot = self.slots.get(&key)?;
+        slot.lease
+            .filter(|lease| !slot.revoked && self.clock.now() < lease.expires_at)
+    }
+
+    fn start_work(&mut self, key: OwnershipKey, work: RaftWork) {
+        let slot = self.slots.get_mut(&key).expect("configured shard");
+        let Some(mut gate) = slot.gate.take() else {
+            return;
+        };
+        let node = self.node.clone();
+        let ttl = self.ttl;
+        let (sender, result) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let reply = async {
+                match &work {
+                    RaftWork::Acquire { blocked_owners } => {
+                        // Local state is ONLY a CAS hint. Staleness can reject
+                        // or defer a request, but can never authorize a lease.
+                        let data = node
+                            .machine
+                            .data()
+                            .await
+                            .map_err(|_| OwnershipError::QuorumUnavailable)?;
+                        let previous = data.0.get(&key.into());
+                        let epoch = OwnershipEpoch(previous.map_or(0, |o| o.epoch));
+                        if previous.is_some_and(|o| o.held) {
+                            if previous.is_some_and(|o| {
+                                o.owner != node.node_id && blocked_owners.contains(&o.owner)
+                            }) {
+                                return Ok(RaftReply::Deferred);
+                            }
+                            gate.begin_takeover(key, epoch)
+                                .await
+                                .map(RaftReply::Reserved)
+                        } else {
+                            gate.acquire_quorum(key, epoch, ttl)
+                                .await
+                                .map(RaftReply::Lease)
+                        }
+                    }
+                    RaftWork::Renew(epoch) => gate
+                        .renew_quorum(key, *epoch, ttl)
+                        .await
+                        .map(RaftReply::Lease),
+                    RaftWork::Finish(epoch) => gate
+                        .finish_takeover(key, *epoch, ttl)
+                        .await
+                        .map(RaftReply::Lease),
+                    RaftWork::Release(epoch) => gate
+                        .release_quorum(key, *epoch)
+                        .await
+                        .map(|()| RaftReply::Released),
+                }
+            }
+            .await;
+            let _ = sender.send((gate, work, reply));
+        });
+        slot.pending = Some(PendingRaftWork { task, result });
+    }
+
+    fn poll(&mut self) -> Result<(), ClusterRuntimeError> {
+        let now = self.clock.now();
+        let mut releases = Vec::new();
+        for (&key, slot) in &mut self.slots {
+            if let Some(pending) = &mut slot.pending {
+                let result = match pending.result.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(oneshot::error::TryRecvError::Empty) => None,
+                    Err(oneshot::error::TryRecvError::Closed) => {
+                        // An unexpected task failure never recovers authority.
+                        slot.lease = None;
+                        return Err(ClusterRuntimeError::Coordinator);
+                    }
+                };
+                if let Some((gate, work, reply)) = result {
+                    slot.pending = None;
+                    slot.gate = Some(gate);
+                    match reply {
+                        Ok(RaftReply::Lease(lease)) => {
+                            let continuous = !matches!(work, RaftWork::Renew(_))
+                                || slot.lease.is_some_and(|old| now < old.expires_at);
+                            slot.reservation = Some(lease.epoch);
+                            slot.takeover = false;
+                            if !slot.revoked && continuous && now < lease.expires_at {
+                                slot.lease = Some(lease);
+                            }
+                        }
+                        Ok(RaftReply::Reserved(epoch)) => {
+                            slot.reservation = Some(epoch);
+                            slot.takeover = true;
+                        }
+                        Ok(RaftReply::Released) => {
+                            *slot = RaftSlot::new(self.node.clone(), self.clock.clone())?;
+                        }
+                        Ok(RaftReply::Deferred) => {}
+                        Err(error) => {
+                            let fenced =
+                                matches!(error, OwnershipError::Fenced | OwnershipError::NotOwned);
+                            if matches!(work, RaftWork::Acquire { .. })
+                                || (matches!(work, RaftWork::Finish(_) | RaftWork::Release(_))
+                                    && fenced)
+                            {
+                                // No receipt was delegated. An unknown Acquire
+                                // may still commit, so a new session must CAS a
+                                // new epoch and wait the FULL quarantine.
+                                let reaped = slot.reaped;
+                                let revoked = slot.revoked;
+                                *slot = RaftSlot::new(self.node.clone(), self.clock.clone())?;
+                                slot.reaped = reaped;
+                                slot.revoked = revoked;
+                            } else if fenced {
+                                slot.lease = None;
+                            }
+                        }
+                    }
+                    slot.retry_at = now.saturating_add(self.retry);
+                }
+            }
+            if slot.lease.is_some_and(|lease| now >= lease.expires_at) {
+                slot.lease = None;
+            }
+            if let Some(gate) = &mut slot.gate {
+                gate.watchdog()
+                    .map_err(|_| ClusterRuntimeError::Coordinator)?;
+            }
+            if slot.revoked && slot.reaped && slot.pending.is_none() && now >= slot.retry_at {
+                match slot.reservation {
+                    Some(epoch) if slot.takeover => {
+                        // Even an unstarted cancelled takeover must wait out all
+                        // previous holders before Release can allow Acquire.
+                        if slot
+                            .gate
+                            .as_ref()
+                            .and_then(|g| g.takeover_ready_at(key))
+                            .is_some_and(|ready| now >= ready)
+                        {
+                            releases.push((key, RaftWork::Finish(epoch)));
+                        }
+                    }
+                    Some(epoch) => releases.push((key, RaftWork::Release(epoch))),
+                    None => slot.revoked = false,
+                }
+            }
+        }
+        for (key, work) in releases {
+            self.start_work(key, work);
+        }
+        Ok(())
+    }
+
+    fn begin(&mut self, key: OwnershipKey, blocked_owners: BTreeSet<u64>) {
+        let slot = self.slots.get(&key).expect("configured shard");
+        if slot.pending.is_some() || slot.revoked || self.clock.now() < slot.retry_at {
+            return;
+        }
+        let work = if let Some(lease) = self.local_lease(key) {
+            RaftWork::Renew(lease.epoch)
+        } else if slot.takeover {
+            if slot
+                .gate
+                .as_ref()
+                .and_then(|g| g.takeover_ready_at(key))
+                .is_none_or(|ready| self.clock.now() < ready)
+            {
+                return;
+            }
+            RaftWork::Finish(slot.reservation.expect("takeover reservation"))
+        } else if let Some(epoch) = slot.reservation {
+            // A grant that arrived too late was never delegated. Release it
+            // before a fresh acquisition; never revive an expired gate.
+            if !slot.reaped {
+                return;
+            }
+            RaftWork::Release(epoch)
+        } else {
+            RaftWork::Acquire { blocked_owners }
+        };
+        self.start_work(key, work);
+    }
+
+    fn cancel(&mut self, key: OwnershipKey) {
+        if let Some(slot) = self.slots.get_mut(&key) {
+            slot.revoked = true;
+            slot.lease = None;
+            if let (Some(gate), Some(epoch)) = (&mut slot.gate, slot.reservation) {
+                let _ = gate.release(key, epoch); // local gate only, not a Raft Release
+            }
+        }
+    }
+
+    async fn shutdown(&mut self) {
+        for slot in self.slots.values_mut() {
+            slot.lease = None;
+            slot.revoked = true;
+            if let Some(pending) = slot.pending.take() {
+                pending.task.abort();
+                let _ = pending.task.await;
+            }
+        }
+        // Do not release durable reservations: stopping this runtime does not
+        // prove delegated Gateway/guardian processes have stopped.
+        self.rpc.shutdown().await;
+        let _ = self.node.shutdown().await;
+    }
+}
+
+impl Drop for RaftLeaseDriver {
+    fn drop(&mut self) {
+        for slot in self.slots.values_mut() {
+            if let Some(pending) = slot.pending.take() {
+                pending.task.abort();
+            }
+        }
+    }
+}
+
+enum RuntimeCoordinator {
+    Test(TestOnlyQuorumCoordinator<RuntimeClock>),
+    Raft(RaftLeaseDriver),
+}
+
+impl RuntimeCoordinator {
+    fn local_lease(&self, key: OwnershipKey) -> Option<Lease> {
+        match self {
+            Self::Test(c) => c.local_lease(key),
+            Self::Raft(c) => c.local_lease(key),
+        }
+    }
+
+    fn has_pending(&self, key: OwnershipKey) -> bool {
+        match self {
+            Self::Test(c) => c.has_pending(key),
+            Self::Raft(c) => c
+                .slots
+                .get(&key)
+                .is_some_and(|s| s.pending.is_some() || s.revoked),
+        }
+    }
+
+    fn cancel(&mut self, key: OwnershipKey) {
+        match self {
+            Self::Test(c) => c.cancel(key),
+            Self::Raft(c) => c.cancel(key),
+        }
+    }
+
+    fn delegated(&mut self, key: OwnershipKey) {
+        if let Self::Raft(c) = self {
+            c.slots.get_mut(&key).expect("configured shard").reaped = false;
+        }
+    }
+
+    fn process_exited(&mut self, key: OwnershipKey) {
+        self.cancel(key);
+        if let Self::Raft(c) = self {
+            c.slots.get_mut(&key).expect("configured shard").reaped = true;
+        }
+    }
+
+    fn watchdog(&mut self) -> Result<(), ClusterRuntimeError> {
+        match self {
+            Self::Test(c) => c
+                .watchdog()
+                .map(|_| ())
+                .map_err(|_| ClusterRuntimeError::Coordinator),
+            Self::Raft(c) => c.poll(),
+        }
+    }
+
+    fn receive(
+        &mut self,
+        from: NodeId,
+        incarnation: u64,
+        message: &TestOnlyMessage,
+    ) -> Result<Option<TestOnlyMessage>, ClusterRuntimeError> {
+        match self {
+            Self::Test(c) => c
+                .receive(from, incarnation, message)
+                .map_err(|_| ClusterRuntimeError::Coordinator),
+            // Heartbeats are health hints only. Legacy ownership Request/Vote
+            // messages can never reach the Raft admission path.
+            Self::Raft(_) => Ok(None),
+        }
+    }
+
+    fn begin(
+        &mut self,
+        key: OwnershipKey,
+        renew: bool,
+        blocked_owners: BTreeSet<u64>,
+    ) -> Result<Option<TestOnlyMessage>, ClusterRuntimeError> {
+        match self {
+            Self::Test(c) => c
+                .begin(key, renew)
+                .map(Some)
+                .map_err(|_| ClusterRuntimeError::Coordinator),
+            Self::Raft(c) => {
+                c.begin(key, blocked_owners);
+                Ok(None)
+            }
+        }
+    }
+}
+
+/// Every botd owns one runtime, health transport and one explicitly chosen backend.
 /// A process supervisor must honour every Stop and independently enforce the
 /// passed deadline; keeping an Active-looking snapshot is never permission.
 pub struct ClusterRuntime {
     node: NodeId,
     clock: RuntimeClock,
     transport: TlsTransport,
-    coordinator: TestOnlyQuorumCoordinator<RuntimeClock>,
+    coordinator: RuntimeCoordinator,
+    incarnation: u64,
     configuration: String,
     peers: BTreeMap<NodeId, RuntimePeer>,
     shards: BTreeMap<ShardKey, RuntimeShard>,
@@ -446,6 +858,56 @@ impl ClusterRuntime {
         if !mock_discord {
             return Err(ClusterRuntimeError::MockDiscordRequired);
         }
+        Self::bind_inner(loaded, None).await
+    }
+
+    /// Real OpenRaft/mTLS path, opt-in and mock-only until external process and
+    /// clock guarantees have been validated. Never falls back to majority ACKs.
+    pub async fn bind_raft(
+        loaded: &LoadedClusterConfig,
+        options: RaftRuntimeOptions,
+        mock_discord: bool,
+    ) -> Result<Self, ClusterRuntimeError> {
+        if options.enable_production {
+            return Err(ClusterRuntimeError::ProductionNotReady);
+        }
+        if !options.allow_raft {
+            return Err(ClusterRuntimeError::RaftOptInRequired);
+        }
+        if !mock_discord {
+            return Err(ClusterRuntimeError::MockDiscordRequired);
+        }
+        loaded.validate_test_cluster()?;
+        let config = loaded.test_cluster.as_ref().expect("validated extension");
+        let members = loaded.members();
+        let mut routes = BTreeSet::from([options.rpc_listen]);
+        if members.len().is_multiple_of(2)
+            || !loopback_endpoint(options.rpc_listen)
+            || options.rpc_listen == config.listen
+            || options.rpc_peers.keys().copied().collect::<BTreeSet<_>>()
+                != config.peers.iter().map(|p| NodeId(p.id)).collect()
+            || options
+                .rpc_peers
+                .values()
+                .any(|&address| !loopback_endpoint(address) || !routes.insert(address))
+            || !options.storage_path.is_absolute()
+            || options
+                .storage_path
+                .components()
+                .any(|part| part == Component::ParentDir)
+            || (options.bootstrap
+                && (options.storage_mode != StorageMode::Create
+                    || members.keys().next() != Some(&NodeId(config.node_id))))
+        {
+            return Err(ClusterRuntimeError::InvalidConfig);
+        }
+        Self::bind_inner(loaded, Some(options)).await
+    }
+
+    async fn bind_inner(
+        loaded: &LoadedClusterConfig,
+        raft_options: Option<RaftRuntimeOptions>,
+    ) -> Result<Self, ClusterRuntimeError> {
         loaded.validate_test_cluster()?;
         let config = loaded.test_cluster.as_ref().expect("validated extension");
         let certificate = bounded_file(&config.cert_path, MAX_DER)
@@ -536,26 +998,135 @@ impl ClusterRuntime {
                             .map_err(|_| ClusterRuntimeError::Policy)?,
                         phase: ProcessPhase::Idle,
                         published: None,
+                        delegated_epoch: None,
                         next_request: Duration::ZERO,
                         returning: false,
                     },
                 );
             }
         }
-        let configuration = loaded.configuration()?;
-        let coordinator = TestOnlyQuorumCoordinator::new(
-            clock.clone(),
-            TestOnlyQuorumConfig {
+        let mut configuration = loaded.configuration()?;
+        let coordinator = if let Some(options) = raft_options {
+            // Bind the complete public deployment/lease policy into both RPC
+            // scope and persistent store identity. Legacy ACK health packets do
+            // not match this configuration either.
+            configuration.insert_str(0, "raft-runtime-v1:");
+            let digest = rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256
+                .tls13()
+                .expect("TLS13 suite")
+                .common
+                .hash_provider
+                .hash(configuration.as_bytes());
+            let mut cluster_id = [0; 16];
+            cluster_id.copy_from_slice(&digest.as_ref()[..16]);
+            let cluster_name = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
+            use raft_quorum::transport::{
+                AuthenticatedRpcAdapter, RpcEndpoint, RpcLimits, RpcScope,
+            };
+            let limits = RpcLimits::default();
+            let mut rpc = transport
+                .bind_raft_rpc(options.rpc_listen)
+                .await
+                .map_err(|_| ClusterRuntimeError::Transport)?;
+            let adapter = Arc::new(
+                AuthenticatedRpcAdapter::new_with_lease_ceiling(
+                    rpc.channel(),
+                    RpcScope {
+                        cluster_id,
+                        members: members.keys().map(|id| id.0).collect(),
+                    },
+                    limits,
+                    Duration::from_millis(config.lease_ms),
+                )
+                .map_err(|_| ClusterRuntimeError::Coordinator)?,
+            );
+            let scope = adapter.scope().clone();
+            let node = Arc::new(
+                RaftNode::start(
+                    &options.storage_path,
+                    config.node_id,
+                    scope.members.clone(),
+                    options.storage_mode,
+                    raft_quorum::NodeOptions {
+                        allow_test_mode: true,
+                        max_lease_ttl: Duration::from_millis(config.lease_ms),
+                        // Requests can expire without blocking the runtime watchdog.
+                        write_timeout: Duration::from_millis((config.lease_ms / 2).min(3000)),
+                        raft_config: openraft::Config {
+                            cluster_name,
+                            heartbeat_interval: f.heartbeat_ms,
+                            election_timeout_min: f.heartbeat_ms.saturating_mul(4),
+                            election_timeout_max: f.heartbeat_ms.saturating_mul(8),
+                            snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(256),
+                            ..openraft::Config::default()
+                        },
+                        ..raft_quorum::NodeOptions::default()
+                    },
+                    adapter,
+                )
+                .await
+                .map_err(|_| ClusterRuntimeError::Coordinator)?,
+            );
+            let setup = async {
+                rpc.set_endpoint(Arc::new(
+                    RpcEndpoint::new(config.node_id, scope, node.raft.clone(), limits)
+                        .map_err(|_| ClusterRuntimeError::Coordinator)?,
+                ))
+                .map_err(|_| ClusterRuntimeError::Transport)?;
+                for (peer, route) in options.rpc_peers {
+                    rpc.set_peer(peer, route)
+                        .map_err(|_| ClusterRuntimeError::Transport)?;
+                }
+                if options.bootstrap {
+                    node.initialize()
+                        .await
+                        .map_err(|_| ClusterRuntimeError::Coordinator)?;
+                }
+                let slots = shards
+                    .values()
+                    .map(|shard| {
+                        RaftSlot::new(node.clone(), clock.clone())
+                            .map(|slot| (shard.ownership, slot))
+                    })
+                    .collect::<Result<_, _>>()?;
+                Ok::<_, ClusterRuntimeError>(slots)
+            }
+            .await;
+            let slots = match setup {
+                Ok(slots) => slots,
+                Err(error) => {
+                    rpc.shutdown().await;
+                    let _ = node.shutdown().await;
+                    return Err(error);
+                }
+            };
+            RuntimeCoordinator::Raft(RaftLeaseDriver {
                 node,
-                incarnation,
-                members: members.keys().copied().collect(),
-                keys: shards.values().map(|shard| shard.ownership).collect(),
-                configuration: configuration.clone(),
-                vote_ttl: Duration::from_millis(config.lease_ms),
-                stop_margin: Duration::from_millis(config.stop_margin_ms),
-            },
-        )
-        .map_err(|_| ClusterRuntimeError::Coordinator)?;
+                rpc,
+                clock: clock.clone(),
+                // Delegated admission ends before the fleet-wide quarantine
+                // ceiling, leaving the guardian time to stop/reap its child.
+                ttl: Duration::from_millis(config.lease_ms - config.stop_margin_ms),
+                retry: failover.heartbeat_interval,
+                slots,
+            })
+        } else {
+            RuntimeCoordinator::Test(
+                TestOnlyQuorumCoordinator::new(
+                    clock.clone(),
+                    TestOnlyQuorumConfig {
+                        node,
+                        incarnation,
+                        members: members.keys().copied().collect(),
+                        keys: shards.values().map(|shard| shard.ownership).collect(),
+                        configuration: configuration.clone(),
+                        vote_ttl: Duration::from_millis(config.lease_ms),
+                        stop_margin: Duration::from_millis(config.stop_margin_ms),
+                    },
+                )
+                .map_err(|_| ClusterRuntimeError::Coordinator)?,
+            )
+        };
         let peers = members
             .into_iter()
             .filter(|(id, _)| *id != node)
@@ -579,6 +1150,7 @@ impl ClusterRuntime {
             clock,
             transport,
             coordinator,
+            incarnation,
             configuration,
             peers,
             shards,
@@ -834,6 +1406,8 @@ impl ClusterRuntime {
                     }
                     shard.phase = ProcessPhase::Starting;
                     shard.published = Some(lease);
+                    shard.delegated_epoch = Some(lease.epoch.0);
+                    self.coordinator.delegated(shard.ownership);
                     actions.push(ClusterAction::Start {
                         key: shard.key.clone(),
                         epoch: lease.epoch.0,
@@ -857,11 +1431,23 @@ impl ClusterRuntime {
                 && !self.coordinator.has_pending(shard.ownership)
             {
                 let renew = self.coordinator.local_lease(shard.ownership).is_some();
-                messages.push(
+                let blocked_owners = self
+                    .peers
+                    .iter()
+                    .filter_map(|(&id, peer)| {
+                        (healthy.contains(&id)
+                            && peer
+                                .claims
+                                .contains(&(shard.ownership.bot_id.0, shard.ownership.shard_id)))
+                        .then_some(id.0)
+                    })
+                    .collect();
+                if let Some(message) =
                     self.coordinator
-                        .begin(shard.ownership, renew)
-                        .map_err(|_| ClusterRuntimeError::Coordinator)?,
-                );
+                        .begin(shard.ownership, renew, blocked_owners)?
+                {
+                    messages.push(message);
+                }
                 shard.next_request = now.saturating_add(self.failover.heartbeat_interval);
             }
         }
@@ -873,14 +1459,27 @@ impl ClusterRuntime {
                 .heartbeat_sequence
                 .checked_add(1)
                 .ok_or(ClusterRuntimeError::CounterExhausted)?;
-            let mut heartbeat = self.coordinator.heartbeat(self.heartbeat_sequence);
-            if let TestOnlyPayload::Heartbeat { ownership, .. } = &mut heartbeat.payload {
-                ownership.retain(|claim| {
-                    self.shards.values().any(|shard| {
-                        shard.ownership == claim.key && shard.phase == ProcessPhase::Active
-                    })
-                });
-            }
+            // Keep the existing bounded authenticated health wire format. On
+            // the Raft backend these claims are advisory; Request/Vote packets
+            // are ignored and only committed CAS receipts authorize admission.
+            let heartbeat = TestOnlyMessage {
+                configuration: self.configuration.clone(),
+                payload: TestOnlyPayload::Heartbeat {
+                    sequence: self.heartbeat_sequence,
+                    ownership: self
+                        .shards
+                        .values()
+                        .filter(|shard| shard.phase == ProcessPhase::Active)
+                        .filter_map(|shard| self.coordinator.local_lease(shard.ownership))
+                        .map(|lease| crate::cluster::TestOnlyClaim {
+                            key: lease.key,
+                            owner: self.node,
+                            incarnation: self.incarnation,
+                            epoch: lease.epoch,
+                        })
+                        .collect(),
+                },
+            };
             self.broadcast(heartbeat);
             self.next_heartbeat = now.saturating_add(self.failover.heartbeat_interval);
         }
@@ -890,6 +1489,38 @@ impl ClusterRuntime {
     /// The supervisor calls this only after observing the real Gateway's Ready,
     /// including its Worker handshake. Spawning an OS process is not readiness.
     pub fn startup_complete(&mut self, key: &ShardKey) -> Result<(), ClusterRuntimeError> {
+        if matches!(self.coordinator, RuntimeCoordinator::Raft(_)) {
+            return Err(ClusterRuntimeError::EpochRequired);
+        }
+        self.startup_complete_inner(key)
+    }
+
+    /// Epoch-bound readiness; a late notification from an old process is ignored.
+    pub fn startup_complete_epoch(
+        &mut self,
+        key: &ShardKey,
+        epoch: u64,
+    ) -> Result<(), ClusterRuntimeError> {
+        if !self.matches_delegated_epoch(key, epoch)? {
+            return Ok(());
+        }
+        self.startup_complete_inner(key)
+    }
+
+    fn matches_delegated_epoch(
+        &self,
+        key: &ShardKey,
+        epoch: u64,
+    ) -> Result<bool, ClusterRuntimeError> {
+        Ok(self
+            .shards
+            .get(key)
+            .ok_or(ClusterRuntimeError::UnknownShard)?
+            .delegated_epoch
+            == Some(epoch))
+    }
+
+    fn startup_complete_inner(&mut self, key: &ShardKey) -> Result<(), ClusterRuntimeError> {
         let shard = self
             .shards
             .get_mut(key)
@@ -916,6 +1547,26 @@ impl ClusterRuntime {
     /// Call only after the supervisor has reaped its owned child/guardian. A
     /// timeout or a successful shutdown write is not proof of process exit.
     pub fn process_exited(&mut self, key: &ShardKey) -> Result<(), ClusterRuntimeError> {
+        if matches!(self.coordinator, RuntimeCoordinator::Raft(_)) {
+            return Err(ClusterRuntimeError::EpochRequired);
+        }
+        self.process_exited_inner(key)
+    }
+
+    /// Call only after reaping the process associated with this exact epoch.
+    /// An IPC shutdown ACK, timeout or previous generation's exit is insufficient.
+    pub fn process_exited_epoch(
+        &mut self,
+        key: &ShardKey,
+        epoch: u64,
+    ) -> Result<(), ClusterRuntimeError> {
+        if !self.matches_delegated_epoch(key, epoch)? {
+            return Ok(());
+        }
+        self.process_exited_inner(key)
+    }
+
+    fn process_exited_inner(&mut self, key: &ShardKey) -> Result<(), ClusterRuntimeError> {
         let shard = self
             .shards
             .get_mut(key)
@@ -927,9 +1578,10 @@ impl ClusterRuntime {
                 .handle(Event::StartupFailed { attempt })
                 .map_err(|_| ClusterRuntimeError::Policy)?;
         }
-        self.coordinator.cancel(shard.ownership);
+        self.coordinator.process_exited(shard.ownership);
         shard.phase = ProcessPhase::Idle;
         shard.published = None;
+        shard.delegated_epoch = None;
         shard.next_request = self.clock.now().saturating_add(self.failover.cooldown);
         Ok(())
     }
@@ -938,6 +1590,28 @@ impl ClusterRuntime {
     /// The caller still retains/reaps the child and calls `process_exited` only
     /// once exit is observed; this method is not evidence of a stopped Gateway.
     pub fn process_failed(
+        &mut self,
+        key: &ShardKey,
+    ) -> Result<Option<ClusterAction>, ClusterRuntimeError> {
+        if matches!(self.coordinator, RuntimeCoordinator::Raft(_)) {
+            return Err(ClusterRuntimeError::EpochRequired);
+        }
+        self.process_failed_inner(key)
+    }
+
+    /// Revoke only the generation whose supervisor control write failed.
+    pub fn process_failed_epoch(
+        &mut self,
+        key: &ShardKey,
+        epoch: u64,
+    ) -> Result<Option<ClusterAction>, ClusterRuntimeError> {
+        if !self.matches_delegated_epoch(key, epoch)? {
+            return Ok(None);
+        }
+        self.process_failed_inner(key)
+    }
+
+    fn process_failed_inner(
         &mut self,
         key: &ShardKey,
     ) -> Result<Option<ClusterAction>, ClusterRuntimeError> {
@@ -974,8 +1648,24 @@ impl ClusterRuntime {
                 "returning": shard.returning})
         }).collect();
         let transport = self.transport.stats();
-        json!({"implementation": "TestOnlyQuorumCoordinator", "production_ready": false,
+        let (implementation, raft) = match &self.coordinator {
+            RuntimeCoordinator::Test(_) => ("TestOnlyQuorumCoordinator", Value::Null),
+            RuntimeCoordinator::Raft(driver) => {
+                let metrics = driver.node.raft.metrics().borrow().clone();
+                let stats = driver.rpc.stats();
+                (
+                    "OpenRaft",
+                    json!({"leader_hint": metrics.current_leader,
+                    "lease_ceiling_ms": driver.node.lease_ceiling().as_millis(),
+                    "rpc_received": stats.received, "rpc_delivered": stats.delivered,
+                    "pending_requests": driver.slots.values().filter(|s| s.pending.is_some()).count(),
+                    "quarantined_shards": driver.slots.values().filter(|s| s.takeover).count()}),
+                )
+            }
+        };
+        json!({"implementation": implementation, "production_ready": false,
             "node_id": self.node.0, "quorum": self.quorum, "peers": peers, "shards": shards,
+            "quorum_source": "heartbeat_availability_hint", "raft": raft,
             "primary_stable_ms": self.quorum_since.map(|since| now.saturating_sub(since).as_millis()),
             "transport": {"received": transport.received, "delivered": transport.delivered,
                 "rejected": transport.rejected, "failed": transport.failed}})
@@ -987,7 +1677,31 @@ impl ClusterRuntime {
         for shard in self.shards.values() {
             self.coordinator.cancel(shard.ownership);
         }
+        if let RuntimeCoordinator::Raft(driver) = &mut self.coordinator {
+            driver.shutdown().await;
+        }
         self.transport.shutdown().await;
+    }
+
+    /// Local admission/fencing check. Call before each new mock dispatch; no
+    /// network, storage or renewal occurs. Delegated processes need their own
+    /// deadline watchdog because they can outlive or lose contact with botd.
+    pub fn check_active(&self, key: &ShardKey, epoch: u64) -> Result<(), OwnershipError> {
+        if self.stopped {
+            return Err(OwnershipError::NotOwned);
+        }
+        let shard = self.shards.get(key).ok_or(OwnershipError::NotOwned)?;
+        if shard.phase != ProcessPhase::Active {
+            return Err(OwnershipError::NotOwned);
+        }
+        let lease = self
+            .coordinator
+            .local_lease(shard.ownership)
+            .ok_or(OwnershipError::Expired)?;
+        if lease.epoch.0 != epoch {
+            return Err(OwnershipError::Fenced);
+        }
+        Ok(())
     }
 }
 

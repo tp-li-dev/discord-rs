@@ -138,6 +138,19 @@ pub trait RaftRpcTransport: Send + Sync + 'static {
     fn is_authenticated(&self) -> bool {
         false
     }
+
+    /// An immutable fleet-wide lease ceiling enforced by this transport's RPC
+    /// scope. A local timeout or a peer's advertised health is not such evidence.
+    /// Wrappers must preserve both this declaration and `cluster_scope`.
+    fn cluster_lease_ceiling(&self) -> Option<Duration> {
+        None
+    }
+
+    /// The exact scope enforced on requests AND responses. This is a trusted
+    /// adapter contract, like `is_authenticated`, not peer-provided metadata.
+    fn cluster_scope(&self) -> Option<RpcScope> {
+        None
+    }
 }
 
 pub struct NetworkFactory {
@@ -386,6 +399,62 @@ impl RpcScope {
     fn peers(&self, source: u64, target: u64) -> bool {
         source != target && self.members.contains(&source) && self.members.contains(&target)
     }
+
+    /// Derive a separate protocol namespace for a fixed fleet-wide lease bound.
+    /// Every member must use this policy from cluster creation onward. Changing
+    /// it is NOT a live configuration update or a supported cluster migration.
+    /// Legacy adapters using the base scope cannot communicate with this scope.
+    pub fn with_lease_ceiling(&self, ceiling: Duration) -> Result<Self, TransportError> {
+        let member = self
+            .members
+            .first()
+            .copied()
+            .ok_or(TransportError::InvalidConfig)?;
+        self.validate(member)?;
+        if ceiling.is_zero() || ceiling > super::TAKEOVER_QUARANTINE {
+            return Err(TransportError::InvalidConfig);
+        }
+        let digest = lease_policy_digest(b"botd-raft-lease-scope-v1\0", self, ceiling, "");
+        let mut cluster_id = [0; 16];
+        cluster_id.copy_from_slice(&digest[..16]);
+        if cluster_id == [0; 16] {
+            return Err(TransportError::InvalidConfig);
+        }
+        Ok(Self {
+            cluster_id,
+            members: self.members.clone(),
+        })
+    }
+
+    pub(crate) fn lease_storage_name(&self, name: &str, ceiling: Duration) -> String {
+        let digest = lease_policy_digest(b"botd-raft-lease-store-v1\0", self, ceiling, name);
+        let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+        format!("lease-policy-v1-{hex}")
+    }
+}
+
+fn lease_policy_digest(domain: &[u8], scope: &RpcScope, ceiling: Duration, name: &str) -> [u8; 32] {
+    // Reuse the existing cryptographic provider; do not introduce a handwritten
+    // hash or rely on DefaultHasher's unspecified, non-cryptographic behavior.
+    let hash = rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256
+        .tls13()
+        .expect("TLS 1.3 SHA-256 suite")
+        .common
+        .hash_provider;
+    let mut context = hash.start();
+    context.update(domain);
+    context.update(&scope.cluster_id);
+    context.update(&ceiling.as_secs().to_le_bytes());
+    context.update(&ceiling.subsec_nanos().to_le_bytes());
+    context.update(&(scope.members.len() as u64).to_le_bytes());
+    for member in &scope.members {
+        context.update(&member.to_le_bytes());
+    }
+    context.update(&(name.len() as u64).to_le_bytes());
+    context.update(name.as_bytes());
+    let mut digest = [0; 32];
+    digest.copy_from_slice(context.finish().as_ref());
+    digest
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -525,6 +594,7 @@ pub struct AuthenticatedRpcAdapter {
     scope: RpcScope,
     limits: RpcLimits,
     slots: Semaphore,
+    lease_ceiling: Option<Duration>,
 }
 
 impl AuthenticatedRpcAdapter {
@@ -543,13 +613,41 @@ impl AuthenticatedRpcAdapter {
             scope,
             limits,
             slots: Semaphore::new(limits.max_in_flight),
+            lease_ceiling: None,
         })
+    }
+
+    /// Select an immutable lease policy before creating any node or store.
+    /// Pass `scope().clone()` to the matching `RpcEndpoint`, never `base_scope`.
+    /// This creates a new scope even when the ceiling equals the legacy bound.
+    pub fn new_with_lease_ceiling(
+        channel: Arc<dyn AuthenticatedChannel>,
+        base_scope: RpcScope,
+        limits: RpcLimits,
+        ceiling: Duration,
+    ) -> Result<Self, TransportError> {
+        let scope = base_scope.with_lease_ceiling(ceiling)?;
+        let mut adapter = Self::new(channel, scope, limits)?;
+        adapter.lease_ceiling = Some(ceiling);
+        Ok(adapter)
+    }
+
+    pub fn scope(&self) -> &RpcScope {
+        &self.scope
     }
 }
 
 impl RaftRpcTransport for AuthenticatedRpcAdapter {
     fn is_authenticated(&self) -> bool {
         self.channel.provides_mutual_tls()
+    }
+
+    fn cluster_lease_ceiling(&self) -> Option<Duration> {
+        self.lease_ceiling
+    }
+
+    fn cluster_scope(&self) -> Option<RpcScope> {
+        Some(self.scope.clone())
     }
 
     fn request(&self, source: u64, target: u64, request: RpcRequest) -> RpcFuture<'_, RpcResponse> {
