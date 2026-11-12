@@ -2,8 +2,9 @@
 //!
 //! Elections, replication, votes and commit decisions belong exclusively to
 //! OpenRaft. The application state machine implements per-(bot, shard) epoch CAS.
-//! This module is opt-in and is NOT wired into botd or the existing refusing
-//! `ownership::QuorumCoordinator`. Production startup is still refused, even
+//! botd selects this module only with explicit mock-only Raft opt-in through
+//! `daemon::cluster_host`; the existing refusing `ownership::QuorumCoordinator`
+//! remains separate. Production startup is still refused, even
 //! with `enable_production`, until runtime fencing and the production execution
 //! path are integrated and validated. No Bot credentials enter this API or its journal.
 //!

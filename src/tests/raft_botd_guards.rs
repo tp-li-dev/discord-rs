@@ -79,6 +79,15 @@ async fn real_binary_rejects_implicit_raft_real_discord_and_competing_modes_befo
             ],
             "Raft quorum requires exclusive automatic process ownership",
         ),
+        (
+            vec![
+                "--allow-raft-quorum",
+                "--mock-discord",
+                "127.0.0.1:1234",
+                "--no-autostart",
+            ],
+            "Raft quorum requires exclusive automatic process ownership",
+        ),
     ] {
         let output =
             tokio::time::timeout(Duration::from_secs(10), command(&root).args(args).output())
@@ -114,10 +123,22 @@ async fn raft_store_creation_requires_valid_full_admin_bootstrap() {
     .to_string()
     .into_bytes();
     viewer.push(b'\n');
+    let mut scoped_admin = serde_json::json!({
+        "secret": vec![7; 32],
+        "access": {"subject":"fixture-admin", "role":"admin",
+            "scope":[{"bot_id":"101", "shard_id":0}]}
+    })
+    .to_string()
+    .into_bytes();
+    scoped_admin.push(b'\n');
     for (frame, diagnostic) in [
         (invalid, "invalid anonymous control bootstrap"),
         (
             viewer,
+            "Raft cluster requires a full local administrator capability",
+        ),
+        (
+            scoped_admin,
             "Raft cluster requires a full local administrator capability",
         ),
     ] {

@@ -277,33 +277,6 @@ impl Cluster {
         let _ = sender.await;
     }
 
-    pub async fn kill_guardian(&self, gateway: &Gateway) {
-        let pid = gateway.ready["guardian_pid"].as_u64().unwrap() as u32;
-        // Bind this fault to the process identity just observed from our
-        // authenticated botd, in addition to the owned mock collector Ready.
-        self.wait_status(gateway.node, |status| {
-            status["processes"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|process| {
-                    process["shard_id"] == gateway.shard
-                        && process["epoch"] == gateway.epoch
-                        && process["guardian_pid"] == pid
-                        && process["gateway_pid"] == gateway.pid
-                })
-        })
-        .await;
-        kill_observed(pid, env!("CARGO_BIN_EXE_botd")).await;
-    }
-
-    /// Guardian death also removes its relay, so the old mock socket can no
-    /// longer deliver Crash. Explicitly clean up this observed orphan instead.
-    pub async fn cleanup_orphan(gateway: &Gateway) {
-        kill_observed(gateway.pid, env!("CARGO_BIN_EXE_src")).await;
-        assert_exited(gateway.pids()).await;
-    }
-
     pub async fn request(&self, id: u64, mut value: Value) -> Value {
         self.monitor.check();
         value["secret"] = json!(SECRET.to_vec());
@@ -353,34 +326,4 @@ impl Cluster {
         // only the fresh fixture directory after every observed tree has exited.
         self.processes.finish().await;
     }
-}
-
-async fn kill_observed(pid: u32, expected_executable: &'static str) {
-    // Only freshly observed fixture processes reach here. Executable checking
-    // narrows the target; it does not eliminate the PID-reuse race with kill.
-    tokio::task::spawn_blocking(move || {
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            let output = std::process::Command::new("powershell.exe")
-                .args(["-NoProfile", "-NonInteractive", "-Command",
-                    "$fixture = Get-Process -Id ([int]$env:RAFT_TEST_PID) -ErrorAction Stop; if (-not [StringComparer]::OrdinalIgnoreCase.Equals($fixture.MainModule.FileName, $env:RAFT_TEST_EXE)) { throw 'unexpected fixture executable' }; $fixture.Kill(); if (-not $fixture.WaitForExit(5000)) { throw 'fixture did not exit' }"])
-                .env("RAFT_TEST_PID", pid.to_string())
-                .env("RAFT_TEST_EXE", expected_executable)
-                .creation_flags(0x08000000)
-                .output().expect("terminate the observed fixture process");
-            assert!(output.status.success(), "fixture termination failed");
-        }
-        #[cfg(unix)]
-        {
-            #[cfg(target_os = "linux")]
-            assert_eq!(std::fs::read_link(format!("/proc/{pid}/exe")).unwrap(),
-                std::fs::canonicalize(expected_executable).unwrap());
-            #[cfg(not(target_os = "linux"))]
-            let _ = expected_executable;
-            assert!(std::process::Command::new("kill")
-                .args(["-KILL", &pid.to_string()])
-                .stdout(Stdio::null()).stderr(Stdio::null()).status().unwrap().success());
-        }
-    }).await.unwrap();
 }

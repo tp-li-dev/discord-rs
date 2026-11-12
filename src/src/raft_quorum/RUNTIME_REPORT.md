@@ -137,7 +137,11 @@ node 2 / 3 の新規作成では `--raft-create` のみ指定する。同じ clu
 
 ### 検証
 
-検証実行中。Windows / Rust 1.90.0、cargo は `--offline -p src`、`CARGO_NET_OFFLINE=true`、`CARGO_PROFILE_DEV_DEBUG=0`、`CARGO_INCREMENTAL=0`、`CARGO_BUILD_JOBS=2`、試験は `--test-threads=1`。対象試験と package 単位の clippy に限定し、workspace 全体試験は実行しない。
+検証実行中。Windows / Rust 1.90.0、cargo は `--offline -p src`、`CARGO_NET_OFFLINE=true`、`CARGO_PROFILE_DEV_DEBUG=0`、`CARGO_INCREMENTAL=0`、`CARGO_BUILD_JOBS=1`（初回2）、試験は `--test-threads=1`。対象試験と package 単位の clippy に限定し、workspace 全体試験は実行しない。
+
+初回の botd 単体20件・binary guard 2件、host 単体6件は成功。E2E の初回 build は LNK1181（生成 object file 不在）で失敗した。直前の成功 binary / rlib の消失と別操作による WIP commit `bf1ca42` を観測したが、この担当は target 削除・commit を実行していない。1 job の再ビルドは成功した。
+
+最初の E2E 実行は分断・Gateway crash・PID probe の3件成功、2件失敗。failback 試験は API が要求する32桁hexの操作IDを試験が使わず、前段の request validation に拒否されたため修正。任意追加の guardian 強制終了試験は既存 collector が abrupt relay 切断を監視エラーと扱い、cleanup も失敗したため成立しなかった。この追加試験と専用 helper は撤去し、監視エラーを成功扱いする緩和は行っていない。実行後のプロセス照会では、この worktree の botd / Gateway は残っていなかった。guardian 自身の異常死は終了証明の単体試験のみであり、実プロセスでの保証には含めない。
 
 ### 未実装・未検証
 
@@ -152,6 +156,7 @@ node 2 / 3 の新規作成では `--raft-create` のみ指定する。同じ clu
 - `src/src/bin/botd.rs`
 - `src/src/daemon.rs`（mod 宣言1行）
 - `src/src/daemon/cluster_host.rs`（新規）
+- `src/src/raft_quorum.rs`（配線状況の module コメント）
 - `src/tests/raft_botd_guards.rs`（新規）
 - `src/tests/raft_botd_processes.rs`（新規）
 - `src/tests/fixtures/raft_botd_support.rs`（新規）

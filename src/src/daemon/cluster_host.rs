@@ -159,7 +159,7 @@ impl RecoveryBudget {
             self.recent.pop_front();
         }
         self.recent.push_back(now);
-        self.exhausted = self.exhausted.or_else(|| {
+        self.exhausted = self.exhausted.or({
             if self.failures > config.restart.max_restarts {
                 Some("restart_budget")
             } else if self.recent.len() > config.restart.max_restarts_in_window as usize {

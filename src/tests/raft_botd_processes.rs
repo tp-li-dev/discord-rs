@@ -47,7 +47,7 @@ async fn raft_botd_death_persistent_rejoin_and_automatic_failback() {
         .request(
             1,
             json!({
-                "command":"restart", "bot":"alpha", "operation_id":"cluster-owner-only",
+                "command":"restart", "bot":"alpha", "operation_id":"0123456789abcdef0123456789abcdef",
             }),
         )
         .await;
@@ -238,84 +238,4 @@ async fn raft_gateway_crash_recovers_only_after_exit_and_new_epoch() {
     // injection of an old authenticated pipe notification belongs to host unit
     // tests; the process test does not impersonate a guardian.
     cluster.finish().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn raft_guardian_death_latches_unconfirmed_exit_without_releasing() {
-    let _serial = PROCESS_TESTS.acquire().await.unwrap();
-    let cluster = Cluster::new().await;
-    let original = cluster.monitor.owner(0, 1).await;
-    cluster.kill_guardian(&original).await;
-    let target = original.clone();
-    // Capture assertion panics so the observed orphan Gateway is explicitly
-    // cleaned up even if the lifecycle observation fails.
-    let observation = tokio::spawn(async move {
-        let deadline = Instant::now() + support::WAIT;
-        loop {
-            let status = cluster.status(1).await;
-            if status["processes"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|process| {
-                    process["shard_id"] == 0
-                        && process["epoch"] == target.epoch
-                        && process["state"] == "degraded"
-                })
-            {
-                assert_eq!(status["status"]["monitor_ok"], false);
-                let process = status["processes"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .find(|process| process["shard_id"] == 0)
-                    .unwrap();
-                assert_eq!(process["gateway_exit_confirmed"], false);
-                assert_eq!(process["active_admission"], false);
-                let shard = status["cluster"]["shards"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .find(|shard| shard["shard_id"] == 0)
-                    .unwrap();
-                assert_eq!(
-                    shard["process"], "draining",
-                    "unconfirmed child was released"
-                );
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "guardian death did not latch Degraded"
-            );
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-        let monitor = cluster.monitor.clone();
-        monitor.ended(target.session).await;
-        monitor
-            .stable_for(Duration::from_millis(LEASE_MS * 2), |active| {
-                active.iter().all(|gateway| gateway.shard != 0)
-            })
-            .await;
-        let status = cluster.status(1).await;
-        assert!(
-            status["processes"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|process| {
-                    process["shard_id"] == 0
-                        && process["epoch"] == target.epoch
-                        && process["state"] == "degraded"
-                        && process["gateway_exit_confirmed"] == false
-                })
-        );
-        cluster
-    })
-    .await;
-    Cluster::cleanup_orphan(&original).await;
-    observation
-        .expect("guardian failure observation")
-        .finish()
-        .await;
 }
