@@ -28,6 +28,8 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Build examples
+        run: cargo build --workspace --examples
       # Prebuild dependencies outside the integration test's 240 second timeout.
       - name: Prepare reload build
         run: cargo build --release --bin src --target-dir target/reload-build
