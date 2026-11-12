@@ -26,6 +26,111 @@ use crate::{
 };
 use std::{collections::HashMap, time::Duration};
 
+/// Explicit simulation input, never fetched from or substituted for Discord.
+/// One scheduler in the daemon covers initial launches AND rolling candidates
+/// across all local shards. Reservations are spent before spawn and not refunded
+/// on failure: an uncertain session start must not create extra quota.
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MockIdentifyLimit {
+    pub bot_id: u64,
+    pub total: u64,
+    pub remaining: u64,
+    pub reset_after_ms: u64,
+    pub max_concurrency: u32,
+    pub interval_ms: u64,
+}
+
+struct MockBudget {
+    limit: MockIdentifyLimit,
+    reset_at: Duration,
+    buckets: HashMap<u32, Duration>,
+}
+
+/// Local mock-only reservation accounting. No distributed limiter or durable
+/// budget is claimed; production and quorum launchers must not use this type.
+pub struct MockIdentifyScheduler {
+    bots: HashMap<u64, MockBudget>,
+    last_now: Duration,
+}
+
+impl MockIdentifyScheduler {
+    pub fn new(limits: Vec<MockIdentifyLimit>) -> Result<Self, &'static str> {
+        let mut bots = HashMap::new();
+        for limit in limits {
+            if limit.total == 0
+                || limit.remaining > limit.total
+                || limit.reset_after_ms == 0
+                || limit.max_concurrency == 0
+                || limit.interval_ms == 0
+                || bots.contains_key(&limit.bot_id)
+            {
+                return Err("invalid mock Identify budget");
+            }
+            bots.insert(
+                limit.bot_id,
+                MockBudget {
+                    reset_at: Duration::from_millis(limit.reset_after_ms),
+                    limit,
+                    buckets: HashMap::new(),
+                },
+            );
+        }
+        if bots.is_empty() {
+            return Err("mock Identify budget is empty");
+        }
+        Ok(Self {
+            bots,
+            last_now: Duration::ZERO,
+        })
+    }
+
+    pub fn contains_bot(&self, bot: u64) -> bool {
+        self.bots.contains_key(&bot)
+    }
+
+    pub fn reserve(
+        &mut self,
+        bot: u64,
+        shard: u32,
+        now: Duration,
+    ) -> Result<IdentifyDecision, &'static str> {
+        if now < self.last_now {
+            return Err("mock Identify clock regressed");
+        }
+        self.last_now = now;
+        let budget = self
+            .bots
+            .get_mut(&bot)
+            .ok_or("missing mock Identify budget")?;
+        if now >= budget.reset_at {
+            budget.reset_at = now
+                .checked_add(Duration::from_millis(budget.limit.reset_after_ms))
+                .ok_or("mock Identify clock overflow")?;
+            budget.limit.remaining = budget.limit.total;
+        }
+        if budget.limit.remaining == 0 {
+            return Ok(IdentifyDecision::Defer(IdentifyDeferral {
+                reason: IdentifyBlock::BudgetExhausted,
+                retry_after: budget.reset_at.saturating_sub(now),
+            }));
+        }
+        let bucket = shard % budget.limit.max_concurrency;
+        if let Some(until) = budget.buckets.get(&bucket).filter(|until| **until > now) {
+            return Ok(IdentifyDecision::Defer(IdentifyDeferral {
+                reason: IdentifyBlock::RateLimited,
+                retry_after: *until - now,
+            }));
+        }
+        let until = now
+            .checked_add(Duration::from_millis(budget.limit.interval_ms))
+            .ok_or("mock Identify clock overflow")?;
+        budget.limit.remaining -= 1;
+        budget.buckets.insert(bucket, until);
+        Ok(IdentifyDecision::Reserved)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum Phase {
     Stable,

@@ -78,6 +78,7 @@ fn token_reference(value: &str) -> bool {
             "TOTAL_SHARDS",
             "GENERATION_ID",
             "SYSTEMROOT",
+            test_switch::LAUNCH_ENV,
         ]
         .contains(&value.to_ascii_uppercase().as_str())
 }
@@ -208,6 +209,209 @@ pub fn plan(
     Ok(result)
 }
 
+/// Explicit, local mock-Discord switch wiring. This is not a distributed lease,
+/// a production control endpoint, or permission to contact Discord.
+pub mod test_switch {
+    use super::{Role, RuntimePlanError, ShardRuntimeSpec};
+    use crate::protocol::{BotId, GenerationId, Identity, OwnershipEpoch, Shard};
+    use crate::worker::WorkerIdentity;
+    use serde::{Deserialize, Serialize};
+    use std::ffi::OsString;
+    use std::net::SocketAddr;
+    use std::path::{Component, Path, PathBuf};
+    use std::time::Duration;
+
+    pub const LAUNCH_ENV: &str = "BOT_TEST_GATEWAY_SWITCH_LAUNCH";
+    pub const FRAME_LIMIT: usize = 16 * 1024;
+    pub const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+
+    fn absolute(path: &Path) -> bool {
+        path.is_absolute() && !path.components().any(|part| part == Component::ParentDir)
+    }
+
+    /// The reserved Core specification becomes an executable, single-Shard
+    /// launch contract only in this opt-in path. No credential reference/value
+    /// is copied. Paths reserve namespaces; they do not promise durable state.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct CoreLaunch {
+        pub program: PathBuf,
+        pub identity: Identity,
+        pub ipc_path: PathBuf,
+        pub state_path: PathBuf,
+        pub management_path: PathBuf,
+    }
+
+    impl CoreLaunch {
+        pub fn from_spec(
+            spec: &ShardRuntimeSpec,
+            program: &Path,
+            generation: u64,
+        ) -> Result<Self, RuntimePlanError> {
+            let bot = spec
+                .bot_id
+                .parse::<u64>()
+                .ok()
+                .filter(|id| id.to_string() == spec.bot_id)
+                .ok_or(RuntimePlanError("Core requires a canonical numeric Bot ID"))?;
+            let core = Self {
+                program: program.to_path_buf(),
+                identity: Identity {
+                    bot_id: BotId(bot),
+                    shard: Shard::new(spec.shard_id, spec.total_shards)
+                        .map_err(RuntimePlanError)?,
+                    generation_id: GenerationId(generation),
+                    ownership_epoch: OwnershipEpoch(0),
+                },
+                ipc_path: spec.ipc_path.clone(),
+                state_path: spec.core.state_path.clone(),
+                management_path: spec.core.management_path.clone(),
+            };
+            core.validate()?;
+            if spec.core.role != Role::Core
+                || !spec.core.environment.clear_inherited
+                || !spec.core.environment.credential_refs.is_empty()
+                || !spec.core.environment.variables.is_empty()
+                || spec.core.args != core.placement_args()
+            {
+                return Err(RuntimePlanError("Core launch does not match placement"));
+            }
+            Ok(core)
+        }
+
+        pub fn validate(&self) -> Result<(), RuntimePlanError> {
+            let mut paths = std::collections::HashSet::new();
+            if self.identity.generation_id.0 == 0
+                || self.identity.ownership_epoch.0 != 0
+                || [
+                    &self.program,
+                    &self.ipc_path,
+                    &self.state_path,
+                    &self.management_path,
+                ]
+                .into_iter()
+                .any(|path| !absolute(path))
+                || [&self.ipc_path, &self.state_path, &self.management_path]
+                    .into_iter()
+                    .any(|path| !paths.insert(path.as_os_str().to_ascii_lowercase()))
+            {
+                return Err(RuntimePlanError("invalid Core launch specification"));
+            }
+            Ok(())
+        }
+
+        fn placement_args(&self) -> Vec<OsString> {
+            let mut args = Vec::new();
+            for (flag, value) in [
+                ("--bot-id", self.identity.bot_id.0.to_string().into()),
+                ("--shard-id", self.identity.shard.id().to_string().into()),
+                (
+                    "--total-shards",
+                    self.identity.shard.total().to_string().into(),
+                ),
+                ("--ipc-path", self.ipc_path.as_os_str().to_owned()),
+                ("--state-path", self.state_path.as_os_str().to_owned()),
+                (
+                    "--management-path",
+                    self.management_path.as_os_str().to_owned(),
+                ),
+            ] {
+                args.extend([OsString::from(flag), value]);
+            }
+            args
+        }
+
+        pub fn args(&self) -> Vec<OsString> {
+            self.args_for(&self.identity)
+        }
+
+        pub(crate) fn args_for(&self, identity: &Identity) -> Vec<OsString> {
+            let mut args = vec![OsString::from("--shard-core")];
+            args.extend(self.placement_args());
+            args.extend([
+                OsString::from("--generation-id"),
+                identity.generation_id.0.to_string().into(),
+                OsString::from("--ownership-epoch"),
+                identity.ownership_epoch.0.to_string().into(),
+            ]);
+            args
+        }
+    }
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct Launch {
+        pub address: SocketAddr,
+        pub gateway: Identity,
+        pub core: CoreLaunch,
+    }
+
+    impl Launch {
+        pub fn validate(&self) -> Result<(), RuntimePlanError> {
+            self.core.validate()?;
+            if !self.address.ip().is_loopback()
+                || self.address.port() == 0
+                || self.gateway != self.core.identity
+            {
+                return Err(RuntimePlanError("invalid mock Gateway switch launch"));
+            }
+            Ok(())
+        }
+    }
+
+    // Capabilities intentionally have no Debug implementation.
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct Bootstrap {
+        pub secret: [u8; 32],
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct Hello {
+        pub secret: [u8; 32],
+        pub identity: Identity,
+        pub pid: u32,
+        pub workers: Vec<WorkerIdentity>,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum Action {
+        Pause,
+        Activate,
+        Quiesce,
+        Drain,
+        Status,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum State {
+        Standby,
+        Active,
+        Paused,
+        Drained,
+    }
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct Control {
+        pub request_id: u64,
+        pub identity: Identity,
+        pub action: Action,
+    }
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct Reply {
+        pub request_id: u64,
+        pub identity: Identity,
+        pub state: State,
+        pub workers: Vec<WorkerIdentity>,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,6 +445,7 @@ mod tests {
             "Total_Shards",
             "GENERATION_ID",
             "SystemRoot",
+            "BOT_TEST_GATEWAY_SWITCH_LAUNCH",
         ] {
             let intent = LocalShardIntent {
                 bot_id: "101".into(),

@@ -46,6 +46,7 @@ pub struct DeploymentIdentity {
     pub bot_id: crate::protocol::BotId,
     pub shard: crate::protocol::Shard,
     generation: Option<std::sync::atomic::AtomicU64>,
+    core_launch: Option<crate::shard_runtime::test_switch::CoreLaunch>,
 }
 impl DeploymentIdentity {
     pub fn from_env() -> Result<Self, AppError> {
@@ -85,6 +86,7 @@ impl DeploymentIdentity {
             bot_id,
             shard: crate::protocol::Shard::new(id, total).map_err(failure)?,
             generation,
+            core_launch: None,
         })
     }
 
@@ -338,7 +340,7 @@ pub struct ApiReceipt {
 }
 
 /// Identity is absent for legacy peers which did not complete bidirectional Hello.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkerIdentity {
     pub index: usize,
     pub pid: u32,
@@ -453,8 +455,12 @@ impl Process {
         if policy.isolated {
             command.env_clear();
         }
+        if let Some(core) = &deployment.core_launch {
+            command.args(core.args_for(&identity));
+        } else {
+            command.arg("--worker");
+        }
         let mut child = command
-            .arg("--worker")
             .env(IDENTITY_ENV, serde_json::to_string(&identity)?)
             .env_remove("DISCORD_TOKEN")
             .stdin(Stdio::piped())
@@ -814,7 +820,7 @@ impl Generation {
 }
 struct Admission {
     generation: Arc<Generation>,
-    _work: OwnedRwLockReadGuard<()>,
+    _work: Option<OwnedRwLockReadGuard<()>>,
     _state: Option<OwnedRwLockReadGuard<()>>,
 }
 struct RegisteredGeneration {
@@ -838,6 +844,66 @@ pub struct Manager {
     replace_lock: Mutex<()>,
     management: Mutex<ManagementRecord>,
     instance_id: String,
+    gateway_admission: Option<StdMutex<GatewayAdmission>>,
+}
+
+struct GatewayAdmission {
+    identity: crate::protocol::Identity,
+    state: crate::shard_runtime::test_switch::State,
+    last_request_id: u64,
+    disconnected: bool,
+}
+
+impl GatewayAdmission {
+    fn apply(
+        &mut self,
+        control: &crate::shard_runtime::test_switch::Control,
+    ) -> Result<(), AppError> {
+        use crate::shard_runtime::test_switch::{Action, State};
+        let incoming = &control.identity;
+        if self.disconnected
+            || control.request_id <= self.last_request_id
+            || incoming.bot_id != self.identity.bot_id
+            || incoming.shard != self.identity.shard
+            || incoming.generation_id != self.identity.generation_id
+        {
+            return Err(failure("mock Gateway control identity rejected"));
+        }
+        match control.action {
+            Action::Status => {}
+            Action::Activate => {
+                if !matches!(self.state, State::Standby | State::Paused)
+                    || incoming.ownership_epoch.0 <= self.identity.ownership_epoch.0
+                {
+                    return Err(failure("mock Gateway activation rejected"));
+                }
+                self.identity.ownership_epoch = incoming.ownership_epoch;
+                self.state = State::Active;
+            }
+            Action::Pause => {
+                if incoming.ownership_epoch != self.identity.ownership_epoch
+                    || self.state == State::Drained
+                {
+                    return Err(failure("mock Gateway pause rejected"));
+                }
+                self.state = State::Paused;
+            }
+            Action::Quiesce | Action::Drain => {
+                if incoming.ownership_epoch.0 < self.identity.ownership_epoch.0
+                    || self.state == State::Drained
+                    || (control.action == Action::Drain && self.state == State::Active)
+                {
+                    return Err(failure("mock Gateway quiescence rejected"));
+                }
+                // Advancing the fence before ACK prevents a delayed activation
+                // at this epoch from reopening the retiring process.
+                self.identity.ownership_epoch = incoming.ownership_epoch;
+                self.state = State::Paused;
+            }
+        }
+        self.last_request_id = control.request_id;
+        Ok(())
+    }
 }
 
 /// Reserve before dispatch and keep until the external outcome is known. Use
@@ -928,9 +994,21 @@ impl Manager {
     pub async fn start_gateway_pool(
         path: PathBuf,
         count: usize,
-        deployment: DeploymentIdentity,
+        mut deployment: DeploymentIdentity,
     ) -> Result<Arc<Self>, AppError> {
-        Self::start_configured_pool(
+        let launch = mock_switch_launch(&deployment)?;
+        let bootstrap = if launch.is_some() {
+            Some(mock_switch_bootstrap().await?)
+        } else {
+            None
+        };
+        let (path, count) = if let Some(launch) = &launch {
+            deployment.core_launch = Some(launch.core.clone());
+            (launch.core.program.clone(), 1)
+        } else {
+            (path, count)
+        };
+        let manager = Self::start_configured_pool(
             path,
             count,
             deployment,
@@ -939,7 +1017,13 @@ impl Manager {
                 require_gateway_capabilities: true,
             },
         )
-        .await
+        .await?;
+        if let Some(launch) = launch {
+            manager
+                .start_mock_switch_control(launch, bootstrap.expect("explicit bootstrap"))
+                .await?;
+        }
+        Ok(manager)
     }
 
     async fn start_configured_pool(
@@ -966,6 +1050,14 @@ impl Manager {
         let mut instance = [0u8; 16];
         getrandom::fill(&mut instance)?;
         let instance_id = instance.iter().map(|byte| format!("{byte:02x}")).collect();
+        let gateway_admission = deployment.core_launch.as_ref().map(|core| {
+            StdMutex::new(GatewayAdmission {
+                identity: core.identity.clone(),
+                state: crate::shard_runtime::test_switch::State::Standby,
+                last_request_id: 0,
+                disconnected: false,
+            })
+        });
         Ok(Arc::new(Self {
             deployment,
             launch_policy,
@@ -977,7 +1069,119 @@ impl Manager {
             update: Mutex::new(()),
             replace_lock: Mutex::new(()),
             management: Mutex::new(ManagementRecord::default()),
+            gateway_admission,
         }))
+    }
+
+    /// A short synchronous admission boundary, never held across IPC/await.
+    /// Paused ACK is ordered after all previously admitted work, while their
+    /// response guards remain valid until their external outcomes are settled.
+    fn gateway_admit(
+        &self,
+    ) -> Result<Option<std::sync::MutexGuard<'_, GatewayAdmission>>, AppError> {
+        let gate = self
+            .gateway_admission
+            .as_ref()
+            .map(|gate| gate.lock().unwrap());
+        if gate.as_ref().is_some_and(|gate| {
+            gate.disconnected || gate.state != crate::shard_runtime::test_switch::State::Active
+        }) {
+            return Err(failure("mock Gateway is not active"));
+        }
+        Ok(gate)
+    }
+
+    fn gateway_active(&self) -> bool {
+        self.gateway_admit().is_ok()
+    }
+
+    fn close_gateway_admission(&self) {
+        if let Some(gate) = &self.gateway_admission {
+            let mut gate = gate.lock().unwrap();
+            gate.disconnected = true;
+            if gate.state != crate::shard_runtime::test_switch::State::Drained {
+                gate.state = crate::shard_runtime::test_switch::State::Paused;
+            }
+        }
+    }
+
+    async fn start_mock_switch_control(
+        self: &Arc<Self>,
+        launch: crate::shard_runtime::test_switch::Launch,
+        bootstrap: crate::shard_runtime::test_switch::Bootstrap,
+    ) -> Result<(), AppError> {
+        use crate::shard_runtime::test_switch::Hello;
+        let mut stream = timeout(DEADLINE, tokio::net::TcpStream::connect(launch.address))
+            .await
+            .map_err(|_| failure("mock Gateway control connection timed out"))?
+            .map_err(|_| failure("mock Gateway control unavailable"))?;
+        let hello = Hello {
+            secret: bootstrap.secret,
+            identity: launch.gateway,
+            pid: std::process::id(),
+            workers: self.worker_identities().await,
+        };
+        mock_control_write(&mut stream, &hello).await?;
+        let manager = self.clone();
+        tokio::spawn(async move {
+            let _ = manager.mock_switch_session(&mut stream).await;
+            // EOF, timeout, malformed input and failed ACK writes all close
+            // admission. Already accepted work and result delivery survive.
+            // Keep the socket owned until the gate is closed: observing peer
+            // EOF must not race a still-open admission boundary.
+            manager.close_gateway_admission();
+        });
+        Ok(())
+    }
+
+    async fn mock_switch_session(
+        &self,
+        stream: &mut tokio::net::TcpStream,
+    ) -> Result<(), AppError> {
+        use crate::shard_runtime::test_switch::{Action, Control, IDLE_TIMEOUT, Reply, State};
+        let (reader, mut writer) = stream.split();
+        let mut reader = BufReader::new(reader);
+        loop {
+            let control: Control = timeout(IDLE_TIMEOUT, mock_control_read(&mut reader))
+                .await
+                .map_err(|_| failure("mock Gateway control timed out"))??;
+            {
+                let mut gate = self
+                    .gateway_admission
+                    .as_ref()
+                    .expect("mock launch gate")
+                    .lock()
+                    .unwrap();
+                gate.apply(&control)?;
+            }
+            if control.action == Action::Drain {
+                // No receiver timeout may cancel an in-progress drain. Its
+                // own bounded shutdown waits for response tracking and reap.
+                self.shutdown().await?;
+                self.gateway_admission
+                    .as_ref()
+                    .expect("mock launch gate")
+                    .lock()
+                    .unwrap()
+                    .state = State::Drained;
+            }
+            let (identity, state) = {
+                let gate = self
+                    .gateway_admission
+                    .as_ref()
+                    .expect("mock launch gate")
+                    .lock()
+                    .unwrap();
+                (gate.identity.clone(), gate.state)
+            };
+            let reply = Reply {
+                request_id: control.request_id,
+                identity,
+                state,
+                workers: self.worker_identities().await,
+            };
+            mock_control_write(&mut writer, &reply).await?;
+        }
     }
 
     fn install(&self, index: usize, active: &mut Arc<Generation>, next: Arc<Generation>) {
@@ -1038,6 +1242,9 @@ impl Manager {
     }
 
     pub async fn replace(&self, path: PathBuf, force: bool) -> Result<(), AppError> {
+        if self.gateway_admission.is_some() {
+            return Err(failure("mock Shard Core replacement is daemon controlled"));
+        }
         let _replacement = self.replace_lock.lock().await;
         self.require_running()?;
         for (index, worker) in self.workers.iter().enumerate() {
@@ -1214,11 +1421,13 @@ impl Manager {
         deliver_result: bool,
     ) -> Result<ResponseGuard, AppError> {
         self.require_running()?;
+        drop(self.gateway_admit()?);
         let index = self.worker_index(key);
         let active = self.workers[index].read().await;
         let generation = active.clone();
         let work = generation.work.clone().read_owned().await;
         self.require_running()?;
+        let _gate = self.gateway_admit()?;
         if deliver_result
             && !generation
                 .capabilities
@@ -1378,6 +1587,12 @@ impl Manager {
     /// EOF is the existing Worker drain contract. Unknown outcomes are never
     /// reported as a successful graceful shutdown; the caller chooses escalation.
     pub async fn shutdown(&self) -> Result<Vec<u32>, AppError> {
+        if let Some(gate) = &self.gateway_admission {
+            let mut gate = gate.lock().unwrap();
+            if gate.state != crate::shard_runtime::test_switch::State::Drained {
+                gate.state = crate::shard_runtime::test_switch::State::Paused;
+            }
+        }
         self.stopping.store(true, Ordering::Release);
         self.stopped.notify_waiters();
         timeout(DRAIN_DEADLINE, async {
@@ -1484,7 +1699,13 @@ impl Manager {
                         _ = stopped => break,
                         _ = interval.tick() => {}
                     }
+                    if !manager.gateway_active() {
+                        continue;
+                    }
                     if let Err(error) = manager.execute(index, Request::Tick).await {
+                        if !manager.gateway_active() {
+                            continue;
+                        }
                         eprintln!(
                             "Worker {} の仕事を進められません: {}",
                             index + 1,
@@ -1501,9 +1722,15 @@ impl Manager {
         expected: Option<&Arc<Generation>>,
         request: &Request,
     ) -> Result<Admission, AppError> {
+        // In the managed Shard path a ResponseGuard is already an admission
+        // permit. Pause/Drain may not revoke the dispatch reserved before it.
+        let reserved = expected.is_some() && self.gateway_admission.is_some();
         timeout(APPLICATION_DEADLINE, async {
             loop {
-                self.require_running()?;
+                if !reserved {
+                    self.require_running()?;
+                    drop(self.gateway_admit()?);
+                }
                 let active = self.workers[index].read().await;
                 let generation = active.clone();
                 if expected.is_some_and(|expected| !Arc::ptr_eq(expected, &generation)) {
@@ -1524,8 +1751,20 @@ impl Manager {
                 } else {
                     None
                 };
-                let work = generation.work.clone().read_owned().await;
-                self.require_running()?;
+                // Reuse the ResponseGuard's existing read permit. Acquiring a
+                // second read after shutdown queued its write would deadlock:
+                // the guard itself is what that writer is waiting to drain.
+                let work = if reserved {
+                    None
+                } else {
+                    Some(generation.work.clone().read_owned().await)
+                };
+                let _gate = if reserved {
+                    None
+                } else {
+                    self.require_running()?;
+                    self.gateway_admit()?
+                };
                 return Ok(Admission {
                     generation,
                     _work: work,
@@ -1612,6 +1851,12 @@ impl Manager {
             return;
         };
         if !generation.process.lock().await.broken {
+            return;
+        }
+        if self.gateway_admission.is_some() {
+            // A Core failure invalidates this managed generation. Do not mint
+            // a locally overlapping identity behind the daemon's plan.
+            self.close_gateway_admission();
             return;
         }
         let _recovery = self.update.lock().await;
@@ -1707,6 +1952,11 @@ impl Manager {
     }
 
     pub async fn watch(self: Arc<Self>, file: PathBuf) {
+        if self.gateway_admission.is_some() {
+            // This single Core's artifact and generation belong to the daemon
+            // plan. Legacy per-pool file updates remain on their existing path.
+            return;
+        }
         self.management.lock().await.file = Some(file.clone());
         loop {
             let stopped = self.stopped.notified();
@@ -1764,6 +2014,195 @@ impl Manager {
             }
         }
     }
+}
+
+fn mock_switch_launch(
+    deployment: &DeploymentIdentity,
+) -> Result<Option<crate::shard_runtime::test_switch::Launch>, AppError> {
+    use crate::shard_runtime::test_switch::{FRAME_LIMIT, LAUNCH_ENV, Launch};
+    let Some(value) = std::env::var_os(LAUNCH_ENV) else {
+        return Ok(None);
+    };
+    let value = value
+        .to_str()
+        .filter(|value| value.len() <= FRAME_LIMIT)
+        .ok_or_else(|| failure("invalid mock Gateway launch"))?;
+    let launch: Launch =
+        serde_json::from_str(value).map_err(|_| failure("invalid mock Gateway launch"))?;
+    launch
+        .validate()
+        .map_err(|_| failure("invalid mock Gateway launch"))?;
+    let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    let mock = args.windows(2).any(|pair| {
+        pair[0] == "--mock-discord"
+            && pair[1]
+                .to_str()
+                .and_then(|address| address.parse::<std::net::SocketAddr>().ok())
+                .is_some_and(|address| address.ip().is_loopback() && address.port() != 0)
+    });
+    if !mock
+        || args.iter().any(|arg| arg == "--local-control")
+        || launch.gateway.bot_id != deployment.bot_id
+        || launch.gateway.shard != deployment.shard
+        || deployment
+            .generation
+            .as_ref()
+            .map(|generation| generation.load(Ordering::Relaxed))
+            != Some(launch.gateway.generation_id.0)
+    {
+        return Err(failure(
+            "mock Gateway launch requires matching explicit mock mode",
+        ));
+    }
+    Ok(Some(launch))
+}
+
+async fn mock_switch_bootstrap() -> Result<crate::shard_runtime::test_switch::Bootstrap, AppError> {
+    use crate::shard_runtime::test_switch::{Bootstrap, FRAME_LIMIT};
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    // Read exactly the bootstrap line, without BufReader read-ahead stealing a
+    // subsequent Shutdown frame from the existing Gateway main stdin reader.
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let read = || -> Result<Bootstrap, &'static str> {
+            let input = std::io::stdin();
+            let mut input = input.lock();
+            let mut frame = Vec::new();
+            loop {
+                let mut byte = [0u8; 1];
+                input
+                    .read_exact(&mut byte)
+                    .map_err(|_| "invalid mock control bootstrap")?;
+                frame.push(byte[0]);
+                if frame.len() > FRAME_LIMIT {
+                    return Err("invalid mock control bootstrap");
+                }
+                if byte[0] == b'\n' {
+                    break;
+                }
+            }
+            let bootstrap: Bootstrap =
+                serde_json::from_slice(&frame).map_err(|_| "invalid mock control bootstrap")?;
+            if bootstrap.secret == [0; 32] {
+                return Err("invalid mock control bootstrap");
+            }
+            Ok(bootstrap)
+        };
+        let _ = sender.send(read());
+    });
+    timeout(DEADLINE, receiver)
+        .await
+        .map_err(|_| failure("mock control bootstrap timed out"))?
+        .map_err(|_| failure("mock control bootstrap unavailable"))?
+        .map_err(failure)
+}
+
+async fn mock_control_read<T: serde::de::DeserializeOwned, R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+) -> Result<T, AppError> {
+    use crate::shard_runtime::test_switch::FRAME_LIMIT;
+    let mut frame = Vec::new();
+    reader
+        .take(FRAME_LIMIT as u64 + 1)
+        .read_until(b'\n', &mut frame)
+        .await
+        .map_err(|_| failure("mock Gateway control read failed"))?;
+    if frame.len() > FRAME_LIMIT || frame.last() != Some(&b'\n') {
+        return Err(failure("invalid mock Gateway control frame"));
+    }
+    serde_json::from_slice(&frame).map_err(|_| failure("invalid mock Gateway control frame"))
+}
+
+async fn mock_control_write<T: Serialize, W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    value: &T,
+) -> Result<(), AppError> {
+    use crate::shard_runtime::test_switch::FRAME_LIMIT;
+    let mut frame =
+        serde_json::to_vec(value).map_err(|_| failure("mock Gateway control encoding failed"))?;
+    frame.push(b'\n');
+    if frame.len() > FRAME_LIMIT {
+        return Err(failure("mock Gateway control frame too large"));
+    }
+    timeout(DEADLINE, async {
+        writer.write_all(&frame).await?;
+        writer.flush().await
+    })
+    .await
+    .map_err(|_| failure("mock Gateway control write timed out"))?
+    .map_err(|_| failure("mock Gateway control write failed"))
+}
+
+/// Internal `botd --shard-core ...` entry point. Its argv is generated from
+/// placement and must agree exactly with the anonymous-pipe IPC identity.
+/// No Discord client or token is needed by this process.
+pub async fn run_shard_core(args: Vec<std::ffi::OsString>) -> Result<(), AppError> {
+    use crate::shard_runtime::test_switch::CoreLaunch;
+    use std::collections::BTreeMap;
+    let mut args = args.into_iter();
+    if args.next().as_deref() != Some(std::ffi::OsStr::new("--shard-core")) {
+        return Err(failure("invalid Shard Core arguments"));
+    }
+    let mut options = BTreeMap::new();
+    while let Some(flag) = args.next() {
+        let Some(flag) = flag.to_str() else {
+            return Err(failure("invalid Shard Core arguments"));
+        };
+        if ![
+            "--bot-id",
+            "--shard-id",
+            "--total-shards",
+            "--generation-id",
+            "--ownership-epoch",
+            "--ipc-path",
+            "--state-path",
+            "--management-path",
+        ]
+        .contains(&flag)
+        {
+            return Err(failure("invalid Shard Core arguments"));
+        }
+        let value = args
+            .next()
+            .ok_or_else(|| failure("invalid Shard Core arguments"))?;
+        if options.insert(flag.to_owned(), value).is_some() {
+            return Err(failure("invalid Shard Core arguments"));
+        }
+    }
+    if options.len() != 8 || !credential_free_environment() {
+        return Err(failure("invalid Shard Core launch environment"));
+    }
+    let identity: crate::protocol::Identity = std::env::var(IDENTITY_ENV)
+        .ok()
+        .and_then(|value| serde_json::from_str(&value).ok())
+        .ok_or_else(|| failure("invalid Shard Core IPC identity"))?;
+    for (flag, expected) in [
+        ("--bot-id", identity.bot_id.0.to_string()),
+        ("--shard-id", identity.shard.id().to_string()),
+        ("--total-shards", identity.shard.total().to_string()),
+        ("--generation-id", identity.generation_id.0.to_string()),
+        ("--ownership-epoch", identity.ownership_epoch.0.to_string()),
+    ] {
+        if options[flag] != expected.as_str() {
+            return Err(failure("Shard Core arguments do not match IPC identity"));
+        }
+    }
+    CoreLaunch {
+        program: std::env::current_exe().map_err(|_| failure("invalid Shard Core program"))?,
+        identity,
+        ipc_path: PathBuf::from(&options["--ipc-path"]),
+        state_path: PathBuf::from(&options["--state-path"]),
+        management_path: PathBuf::from(&options["--management-path"]),
+    }
+    .validate()
+    .map_err(|_| failure("invalid Shard Core paths"))?;
+    run().await
+}
+
+fn credential_free_environment() -> bool {
+    std::env::vars_os().all(|(name, _)| {
+        name == IDENTITY_ENV || (cfg!(windows) && name.eq_ignore_ascii_case("SystemRoot"))
+    })
 }
 
 pub async fn run() -> Result<(), AppError> {
@@ -1908,10 +2347,7 @@ pub async fn run() -> Result<(), AppError> {
                 ],
                 // No values are inspected, serialized or logged. Windows may
                 // supply SystemRoot even to a process launched with env_clear.
-                credential_free: std::env::vars_os().all(|(name, _)| {
-                    name == IDENTITY_ENV
-                        || (cfg!(windows) && name.eq_ignore_ascii_case("SystemRoot"))
-                }),
+                credential_free: credential_free_environment(),
                 build: crate::cogs::build_id().to_owned(),
                 pid: std::process::id(),
             },
@@ -2032,6 +2468,118 @@ async fn handle_command(
 #[cfg(test)]
 mod frame_tests {
     use super::*;
+
+    fn gateway_gate() -> GatewayAdmission {
+        GatewayAdmission {
+            identity: crate::protocol::Identity {
+                bot_id: crate::protocol::BotId(101),
+                shard: crate::protocol::Shard::new(1, 2).unwrap(),
+                generation_id: crate::protocol::GenerationId(7),
+                ownership_epoch: crate::protocol::OwnershipEpoch(0),
+            },
+            state: crate::shard_runtime::test_switch::State::Standby,
+            last_request_id: 0,
+            disconnected: false,
+        }
+    }
+
+    #[test]
+    fn managed_gateway_rejects_stale_activation_after_the_quiescence_barrier() {
+        use crate::shard_runtime::test_switch::{Action, Control, State};
+        let mut gate = gateway_gate();
+        let mut control = Control {
+            request_id: 1,
+            identity: gate.identity.clone(),
+            action: Action::Activate,
+        };
+        assert!(gate.apply(&control).is_err());
+        control.identity.ownership_epoch.0 = 1;
+        gate.apply(&control).unwrap();
+        assert_eq!(gate.state, State::Active);
+        control.request_id += 1;
+        control.action = Action::Quiesce;
+        control.identity.ownership_epoch.0 = 3;
+        gate.apply(&control).unwrap();
+        assert_eq!(gate.state, State::Paused);
+        control.request_id += 1;
+        control.action = Action::Activate;
+        for stale_epoch in 0..=3 {
+            control.identity.ownership_epoch.0 = stale_epoch;
+            assert!(gate.apply(&control).is_err());
+            assert_eq!(gate.state, State::Paused);
+        }
+        control.identity.ownership_epoch.0 = 4;
+        gate.apply(&control).unwrap();
+        assert_eq!(gate.state, State::Active);
+        assert!(
+            gate.apply(&control).is_err(),
+            "duplicate request is rejected"
+        );
+    }
+
+    #[test]
+    fn managed_gateway_control_cannot_change_scope_or_drain_an_active_core() {
+        use crate::shard_runtime::test_switch::{Action, Control, State};
+        let mut gate = gateway_gate();
+        let mut control = Control {
+            request_id: 1,
+            identity: gate.identity.clone(),
+            action: Action::Activate,
+        };
+        control.identity.ownership_epoch.0 = 1;
+        control.identity.shard = crate::protocol::Shard::new(0, 2).unwrap();
+        assert!(gate.apply(&control).is_err());
+        control.identity.shard = gate.identity.shard;
+        gate.apply(&control).unwrap();
+        control.request_id += 1;
+        control.action = Action::Drain;
+        assert!(gate.apply(&control).is_err());
+        control.action = Action::Pause;
+        gate.apply(&control).unwrap();
+        assert_eq!(gate.state, State::Paused);
+        gate.disconnected = true;
+        control.request_id += 1;
+        control.action = Action::Activate;
+        control.identity.ownership_epoch.0 += 1;
+        assert!(gate.apply(&control).is_err());
+        assert_eq!(gate.state, State::Paused);
+    }
+
+    #[tokio::test]
+    async fn managed_gateway_control_frames_are_bounded_and_strict() {
+        use crate::shard_runtime::test_switch::{Action, Control, FRAME_LIMIT};
+        let control = Control {
+            request_id: 1,
+            identity: gateway_gate().identity,
+            action: Action::Status,
+        };
+        let mut bytes = serde_json::to_vec(&control).unwrap();
+        assert!(
+            mock_control_read::<Control, _>(&mut BufReader::new(bytes.as_slice()))
+                .await
+                .is_err()
+        );
+        bytes.push(b'\n');
+        assert!(
+            mock_control_read::<Control, _>(&mut BufReader::new(bytes.as_slice()))
+                .await
+                .is_ok()
+        );
+        let bytes = vec![b' '; FRAME_LIMIT + 1];
+        assert!(
+            mock_control_read::<Control, _>(&mut BufReader::new(bytes.as_slice()))
+                .await
+                .is_err()
+        );
+        let mut value = serde_json::to_value(control).unwrap();
+        value["unrecognized"] = serde_json::json!(true);
+        let bytes = format!("{value}\n");
+        assert!(
+            mock_control_read::<Control, _>(&mut BufReader::new(bytes.as_bytes()))
+                .await
+                .is_err()
+        );
+    }
 
     #[test]
     fn failed_command_preserves_state_and_redacts_error() {

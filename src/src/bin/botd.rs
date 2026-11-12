@@ -15,7 +15,7 @@ use tokio::{
 const REQUEST_LIMIT: u64 = 4096;
 const RESPONSE_LIMIT: usize = 64 * 1024;
 const DEADLINE: Duration = Duration::from_secs(3);
-const USAGE: &str = "usage: botd --file F --runtime-root ABS --gateway-program ABS --bootstrap-stdin [--no-autostart] [--mock-discord LOOPBACK_IP:PORT] [--allow-test-quorum]";
+const USAGE: &str = "usage: botd --file F --runtime-root ABS --gateway-program ABS --bootstrap-stdin [--no-autostart] [--mock-discord LOOPBACK_IP:PORT] [--allow-test-quorum] [--allow-test-gateway-switch --mock-identify-budget F]";
 
 struct Options {
     file: PathBuf,
@@ -24,6 +24,8 @@ struct Options {
     no_autostart: bool,
     mock_discord: Option<SocketAddr>,
     allow_test_quorum: bool,
+    allow_test_gateway_switch: bool,
+    mock_identify_budget: Option<PathBuf>,
 }
 
 fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'static str> {
@@ -35,11 +37,20 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
     let mut no_autostart = false;
     let mut mock_discord = None;
     let mut allow_test_quorum = false;
+    let mut allow_test_gateway_switch = false;
+    let mut mock_identify_budget = None;
     while let Some(arg) = args.next() {
         let target = match arg.to_str() {
             Some("--file") if file.is_none() => &mut file,
             Some("--runtime-root") if runtime_root.is_none() => &mut runtime_root,
             Some("--gateway-program") if gateway_program.is_none() => &mut gateway_program,
+            Some("--mock-identify-budget") if mock_identify_budget.is_none() => {
+                &mut mock_identify_budget
+            }
+            Some("--allow-test-gateway-switch") if !allow_test_gateway_switch => {
+                allow_test_gateway_switch = true;
+                continue;
+            }
             Some("--bootstrap-stdin") if !bootstrap => {
                 bootstrap = true;
                 continue;
@@ -80,12 +91,27 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
         no_autostart,
         mock_discord,
         allow_test_quorum,
+        allow_test_gateway_switch,
+        mock_identify_budget,
     };
     if !bootstrap {
         return Err("anonymous stdin bootstrap is required");
     }
     if !options.runtime_root.is_absolute() || !options.gateway_program.is_absolute() {
         return Err("runtime root and gateway program must be absolute paths");
+    }
+    if options.allow_test_gateway_switch {
+        if options.mock_discord.is_none() {
+            return Err("test Gateway switch requires --mock-discord");
+        }
+        if options.mock_identify_budget.is_none() {
+            return Err("test Gateway switch requires --mock-identify-budget");
+        }
+        if options.allow_test_quorum || options.no_autostart {
+            return Err("test Gateway switch requires standalone automatic startup");
+        }
+    } else if options.mock_identify_budget.is_some() {
+        return Err("mock Identify budget requires --allow-test-gateway-switch");
     }
     Ok(options)
 }
@@ -235,6 +261,14 @@ async fn run() -> Result<(), &'static str> {
     let options = parse_options(std::env::args_os().skip(1))?;
     let loaded = src::cluster_runtime::LoadedClusterConfig::load(&options.file)
         .map_err(|_| "cannot load daemon configuration")?;
+    if options.allow_test_gateway_switch {
+        if loaded.test_cluster.is_some()
+            || loaded.placement.cluster.mode != src::placement::ClusterMode::Standalone
+        {
+            return Err("test Gateway switch requires standalone configuration");
+        }
+        return run_test_gateway_switch(options, loaded.placement).await;
+    }
     if loaded.test_cluster.is_some()
         || loaded.placement.cluster.mode == src::placement::ClusterMode::Quorum
     {
@@ -432,14 +466,82 @@ async fn run_test_cluster(
     result
 }
 
+async fn run_test_gateway_switch(
+    options: Options,
+    config: src::placement::Config,
+) -> Result<(), &'static str> {
+    // All gates above run before bootstrap, binds, credentials or child launch.
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(
+        options
+            .mock_identify_budget
+            .as_ref()
+            .ok_or("missing mock Identify budget")?,
+    )
+    .map_err(|_| "cannot read mock Identify budget")?
+    .take(64 * 1024 + 1)
+    .read_to_end(&mut bytes)
+    .map_err(|_| "cannot read mock Identify budget")?;
+    if bytes.len() > 64 * 1024 {
+        return Err("mock Identify budget exceeds limit");
+    }
+    let limits = serde_json::from_slice(&bytes).map_err(|_| "invalid mock Identify budget")?;
+    let bootstrap = read_bootstrap(tokio::io::stdin())
+        .await
+        .map_err(|_| "invalid anonymous control bootstrap")?;
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|_| "cannot bind local daemon control")?;
+    let port = listener
+        .local_addr()
+        .map_err(|_| "cannot inspect local daemon control")?
+        .port();
+    let core_program = std::env::current_exe().map_err(|_| "Core executable unavailable")?;
+    let runtime = src::daemon::test_gateway_switch::Runtime::new(
+        &config,
+        &options.runtime_root,
+        &options.gateway_program,
+        &core_program,
+        options.mock_discord.ok_or("mock Discord required")?,
+        limits,
+    )?;
+    let (sender, mut receiver) = mpsc::channel::<Envelope>(64);
+    let mut server = tokio::spawn(status_server(listener, bootstrap.secret, sender));
+    let mut announcement =
+        serde_json::to_vec(&json!({"port":port,"local_only":true,"startup_ok":true,
+        "mock_discord":true,"test_gateway_switch":true,"production_ready":false}))
+        .map_err(|_| "cannot encode daemon announcement")?;
+    announcement.push(b'\n');
+    let mut stdout = tokio::io::stdout();
+    if stdout.write_all(&announcement).await.is_err() || stdout.flush().await.is_err() {
+        server.abort();
+        return Err("cannot announce local daemon control");
+    }
+    let result = loop {
+        tokio::select! {
+            signal = tokio::signal::ctrl_c() => break signal.map_err(|_| "cannot receive daemon shutdown signal"),
+            Some(envelope) = receiver.recv() => { let _ = envelope.response.send(runtime.request(&envelope.request)); },
+            _ = &mut server => break Err("local daemon control stopped"),
+        }
+    };
+    server.abort();
+    result
+}
+
 #[tokio::main(worker_threads = 2)]
 async fn main() {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
-    let result = if args
+    let result = if args.first().is_some_and(|arg| arg == "--shard-core") {
+        src::worker::run_shard_core(args)
+            .await
+            .map_err(|_| "invalid or failed Shard Core process")
+    } else if args
         == [
             OsString::from("--test-cluster-guardian"),
             OsString::from("--allow-test-quorum"),
-        ] {
+        ]
+    {
         src::daemon::test_cluster_processes::run_guardian().await
     } else {
         run().await
