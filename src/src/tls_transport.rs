@@ -89,6 +89,10 @@ use tokio::{
 };
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
+/// Dedicated, bounded Raft request/reply API sharing this transport's TLS policy.
+#[path = "raft_quorum/tls_channel.rs"]
+pub mod raft_rpc;
+
 pub const ALPN: &[u8] = b"botd-cluster/1";
 const VERSION: u16 = 1;
 const MAX_FRAME: usize = 8 * 1024 * 1024;

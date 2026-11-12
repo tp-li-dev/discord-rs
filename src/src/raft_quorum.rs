@@ -4,8 +4,8 @@
 //! OpenRaft. The application state machine implements per-(bot, shard) epoch CAS.
 //! This module is opt-in and is NOT wired into botd or the existing refusing
 //! `ownership::QuorumCoordinator`. Production startup is still refused, even
-//! with `enable_production`, until authenticated RPC and runtime fencing are
-//! integrated and validated. No Bot credentials enter this API or its journal.
+//! with `enable_production`, until runtime fencing and the production execution
+//! path are integrated and validated. No Bot credentials enter this API or its journal.
 //!
 //! # Synchronous ownership boundary
 //!
@@ -16,17 +16,25 @@
 //! BEFORE the Raft request, never at response arrival. A timeout or cancellation
 //! may still commit later, but cannot grant local authority by itself.
 //!
-//! # Conservative handoff, not automatic crash failover
+//! # Handoff and experimental crash takeover
 //!
-//! A durable reservation stays held until its originating coordinator closes its
-//! local admission gate and commits `release_quorum`. Local expiry alone does
+//! Normal handoff holds a reservation until its originating coordinator closes
+//! its local admission gate and commits `release_quorum`. Local expiry alone does
 //! NOT allow another host to take over: remote monotonic timestamps and Raft's
 //! leader lease are not shard lease proofs. `release` on the synchronous trait
 //! closes only the local gate; follow it with `release_quorum` to free the durable
-//! reservation. Cancellation can leave a reservation held; the same coordinator
-//! can release it, but a new session after a crash cannot adopt it. This sacrifices
-//! failover availability rather than revoking a disconnected holder by assumption.
-//! There is intentionally no force-unlock or wall-clock based takeover API.
+//! reservation. A new session cannot adopt an old reservation after a crash.
+//! `begin_takeover` first commits a new epoch that fences all old renewals, then
+//! quarantines the new reservation for the GLOBAL lease upper bound, measured
+//! locally AFTER the commit response. `finish_takeover` requires another quorum
+//! write before admission. Pending takeovers cannot release their reservation;
+//! cancellation/restart never restores a grant or skips quarantine. No remote
+//! monotonic timestamp or Raft leader lease is treated as a shard deadline.
+//!
+//! This experimental protocol assumes clocks advance at the same rate during
+//! relevant pauses and every delegated admission gate obeys the original lease.
+//! Clock-rate drift, suspend and an external effect after admission still require
+//! a runtime fencing design and validation. Production remains refused.
 //!
 //! All new work MUST use this coordinator's admission gate. Release callers must
 //! also stop any delegated admission gates before releasing. Existing work and
@@ -34,7 +42,8 @@
 //! does not stop Gateway/Core processes, guarantee exactly-once effects, or prove
 //! clock safety under OS suspend. Linux, power loss, real hosts and OS suspend
 //! require separate validation. Fixed membership only; no membership CLI/recovery
-//! administration, client forwarding, or automatic journal compaction is provided.
+//! administration or automatic journal compaction is provided. Client writes may
+//! follow bounded, authenticated leader redirects; ambiguous writes are not retried.
 
 pub mod storage;
 pub mod transport;
@@ -49,7 +58,12 @@ use std::{
     time::Duration,
 };
 use storage::{FileStore, StateMachine};
-use transport::{NetworkFactory, RaftRpcTransport};
+use transport::{ForwardResponse, NetworkFactory, RaftRpcTransport, RpcRequest, RpcResponse};
+
+/// Fleet-wide lease ceiling, including nodes started with a different local
+/// `max_lease_ttl`. Never shorten this on an existing cluster without a separate
+/// migration/quarantine protocol. Local options are not cluster-wide evidence.
+pub const TAKEOVER_QUARANTINE: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ShardKey {
@@ -86,7 +100,9 @@ pub struct Ownership {
 }
 
 /// Trusted control-plane commands; remote user authorization precedes this API.
-/// A release is an assertion by the originating holder that its gates are closed.
+/// A release asserts that the originating holder's gates are closed AND, for a
+/// takeover reservation, that quarantine for all previous holders has completed.
+/// Raw commands do not enforce clock safety: use `QuorumCoordinator` for leases.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Command {
     Acquire {
@@ -107,6 +123,15 @@ pub enum Command {
         owner: u64,
         session: [u8; 16],
     },
+    /// Reserve a new epoch before waiting out every possible old local lease.
+    /// This commit is NOT an admission grant. Only the coordinator's two-phase
+    /// takeover API may turn it into one after quarantine and a fresh commit.
+    BeginTakeover {
+        key: ShardKey,
+        expected_epoch: u64,
+        owner: u64,
+        session: [u8; 16],
+    },
 }
 
 impl Command {
@@ -114,7 +139,8 @@ impl Command {
         match self {
             Self::Acquire { owner, session, .. }
             | Self::Renew { owner, session, .. }
-            | Self::Release { owner, session, .. } => (*owner, *session),
+            | Self::Release { owner, session, .. }
+            | Self::BeginTakeover { owner, session, .. } => (*owner, *session),
         }
     }
 }
@@ -177,13 +203,22 @@ impl OwnershipData {
                 key,
                 expected_epoch,
                 ..
+            }
+            | Command::BeginTakeover {
+                key,
+                expected_epoch,
+                ..
             } => {
                 let previous = self.0.get(&key);
                 let current_epoch = previous.map_or(0, |o| o.epoch);
                 if expected_epoch != current_epoch {
                     return Outcome::Stale { current_epoch };
                 }
-                if previous.is_some_and(|o| o.held) {
+                if matches!(request, Command::BeginTakeover { .. }) {
+                    if !previous.is_some_and(|o| o.held) {
+                        return Outcome::NotOwned;
+                    }
+                } else if previous.is_some_and(|o| o.held) {
                     return Outcome::Held;
                 }
                 let Some(epoch) = current_epoch.checked_add(1) else {
@@ -245,7 +280,7 @@ pub struct NodeOptions {
     /// Explicit, non-production use. Never inferred from absent credentials.
     pub allow_test_mode: bool,
     /// Necessary but not sufficient: production is currently refused because
-    /// tls_transport and runtime fencing are not yet connected.
+    /// production runtime fencing is not yet connected or validated.
     pub enable_production: bool,
     pub write_timeout: Duration,
     pub max_lease_ttl: Duration,
@@ -296,6 +331,7 @@ pub struct RaftNode {
     pub machine: StateMachine,
     members: BTreeSet<u64>,
     options: NodeOptions,
+    transport: Arc<dyn RaftRpcTransport>,
 }
 
 impl RaftNode {
@@ -323,7 +359,7 @@ impl RaftNode {
             || options.write_timeout.is_zero()
             || options.write_timeout > Duration::from_secs(60)
             || options.max_lease_ttl.is_zero()
-            || options.max_lease_ttl > Duration::from_secs(300)
+            || options.max_lease_ttl > TAKEOVER_QUARANTINE
         {
             return Err(QuorumError::InvalidConfig);
         }
@@ -356,7 +392,7 @@ impl RaftNode {
         let raft = Raft::new(
             node_id,
             Arc::new(config),
-            NetworkFactory::new(node_id, transport),
+            NetworkFactory::new(node_id, transport.clone()),
             logs,
             machine.clone(),
         )
@@ -368,6 +404,7 @@ impl RaftNode {
             machine,
             members,
             options,
+            transport,
         })
     }
 
@@ -385,21 +422,68 @@ impl RaftNode {
             .map_err(|_| QuorumError::RaftRejected)
     }
 
-    /// The selected node must be leader; no unauthenticated client-forwarding
-    /// endpoint or automatic retries are created. `Applied` is a durable commit
-    /// result, but callers still need a local lease before admitting work.
+    /// Follow only explicit OpenRaft `ForwardToLeader` rejections. Each member
+    /// is visited at most once under one end-to-end deadline. Connection loss,
+    /// timeout or any potentially submitted write is never retried. Forwarding
+    /// binds the command owner to this node's authenticated identity. Direct
+    /// leader calls remain a trusted control-plane API. An `Applied` reservation
+    /// still needs a local lease (and takeover quarantine) before admission.
     pub async fn submit(&self, command: Command) -> Result<Outcome, QuorumError> {
         let (owner, session) = command.identity();
         if !self.members.contains(&owner) || session == [0; 16] {
             return Ok(Outcome::InvalidOwner);
         }
-        match tokio::time::timeout(self.options.write_timeout, self.raft.client_write(command))
-            .await
-        {
-            Ok(Ok(response)) => Ok(response.data),
-            Ok(Err(_)) => Err(QuorumError::RaftRejected),
-            Err(_) => Err(QuorumError::OutcomeUnknown),
-        }
+        tokio::time::timeout(self.options.write_timeout, async {
+            let mut target = self.node_id;
+            let mut visited = BTreeSet::new();
+            loop {
+                if !self.members.contains(&target) || !visited.insert(target) {
+                    return Err(QuorumError::RaftRejected);
+                }
+                let response = if target == self.node_id {
+                    match self.raft.client_write(command.clone()).await {
+                        Ok(response) => ForwardResponse::Applied(response.data),
+                        Err(openraft::error::RaftError::APIError(
+                            openraft::error::ClientWriteError::ForwardToLeader(hint),
+                        )) => ForwardResponse::NotLeader {
+                            leader: hint.leader_id,
+                        },
+                        Err(_) => ForwardResponse::OutcomeUnknown,
+                    }
+                } else {
+                    if owner != self.node_id {
+                        return Err(QuorumError::RaftRejected);
+                    }
+                    match self
+                        .transport
+                        .request(
+                            self.node_id,
+                            target,
+                            RpcRequest::Forward {
+                                source: self.node_id,
+                                command: command.clone(),
+                            },
+                        )
+                        .await
+                    {
+                        Ok(RpcResponse::Forward(response)) => response,
+                        _ => return Err(QuorumError::OutcomeUnknown),
+                    }
+                };
+                match response {
+                    ForwardResponse::Applied(outcome) => return Ok(outcome),
+                    ForwardResponse::NotLeader {
+                        leader: Some(leader),
+                    } => target = leader,
+                    ForwardResponse::NotLeader { leader: None } => {
+                        return Err(QuorumError::RaftRejected);
+                    }
+                    ForwardResponse::OutcomeUnknown => return Err(QuorumError::OutcomeUnknown),
+                }
+            }
+        })
+        .await
+        .map_err(|_| QuorumError::OutcomeUnknown)?
     }
 
     pub async fn shutdown(&self) -> Result<(), QuorumError> {
@@ -425,7 +509,7 @@ struct Prepared {
 
 /// Non-cloneable local admission gate backed by committed Raft reservations.
 /// An asynchronous prepare phase bridges the existing synchronous trait. This
-/// currently uses a leader-local client; it does not transparently forward writes.
+/// forwards writes to the leader without moving local lease deadlines.
 pub struct QuorumCoordinator<C: Clock> {
     node: Arc<RaftNode>,
     clock: C,
@@ -435,6 +519,9 @@ pub struct QuorumCoordinator<C: Clock> {
     // Includes outcome-unknown requests, so an ungranted reservation can be
     // explicitly relinquished by its original session without granting a lease.
     claims: HashMap<OwnershipKey, OwnershipEpoch>,
+    // None means the fence commit is unconfirmed. Neither pending state may
+    // release its durable reservation or grant local authority prematurely.
+    takeovers: HashMap<OwnershipKey, Option<Duration>>,
     last_now: Duration,
     clock_failed: bool,
 }
@@ -454,6 +541,7 @@ impl<C: Clock> QuorumCoordinator<C> {
             leases: HashMap::new(),
             prepared: HashMap::new(),
             claims: HashMap::new(),
+            takeovers: HashMap::new(),
             last_now,
             clock_failed: false,
         })
@@ -561,6 +649,127 @@ impl<C: Clock> QuorumCoordinator<C> {
         self.acquire(key, ttl)
     }
 
+    /// Fence the previous reservation with a new epoch, without granting a
+    /// lease. Failure detection/placement policy belongs to the trusted caller.
+    /// The new owner waits the global maximum TTL AFTER the successful commit,
+    /// so even a renewal ordered immediately before this fence must expire.
+    /// An ambiguous commit keeps an unreleasable pending claim. Recovery uses a
+    /// new coordinator/session and another epoch CAS plus the full quarantine;
+    /// never reconstruct a local deadline from persisted ownership or metrics.
+    pub async fn begin_takeover(
+        &mut self,
+        key: OwnershipKey,
+        expected_epoch: OwnershipEpoch,
+    ) -> Result<OwnershipEpoch, OwnershipError> {
+        self.now()?;
+        if self.claims.contains_key(&key) {
+            return Err(OwnershipError::Fenced);
+        }
+        let epoch = OwnershipEpoch(
+            expected_epoch
+                .0
+                .checked_add(1)
+                .ok_or(OwnershipError::EpochExhausted)?,
+        );
+        self.claims.insert(key, epoch);
+        self.takeovers.insert(key, None);
+        self.prepared.remove(&key);
+        let outcome = self
+            .node
+            .submit(Command::BeginTakeover {
+                key: key.into(),
+                expected_epoch: expected_epoch.0,
+                owner: self.node.node_id,
+                session: self.session,
+            })
+            .await
+            .map_err(|_| OwnershipError::QuorumUnavailable)?;
+        let record = match Self::applied(outcome) {
+            Ok(record) => record,
+            Err(error) => {
+                self.claims.remove(&key);
+                self.takeovers.remove(&key);
+                return Err(error);
+            }
+        };
+        if !record.held
+            || record.epoch != epoch.0
+            || record.owner != self.node.node_id
+            || record.session != self.session
+        {
+            return Err(OwnershipError::QuorumUnavailable);
+        }
+        let not_before = self
+            .now()?
+            .checked_add(TAKEOVER_QUARANTINE)
+            .ok_or(OwnershipError::TimeOverflow)?;
+        self.takeovers.insert(key, Some(not_before));
+        Ok(epoch)
+    }
+
+    /// A local scheduling hint, not an authorization receipt. None also covers
+    /// an ambiguous fence response, which can never complete in this session.
+    pub fn takeover_ready_at(&self, key: OwnershipKey) -> Option<Duration> {
+        self.takeovers.get(&key).copied().flatten()
+    }
+
+    /// After quarantine, confirm ownership with another committed write and
+    /// grant one locally bounded lease. A timeout/cancellation retains pending
+    /// state and grants nothing. A retry uses a fresh request-start deadline.
+    pub async fn finish_takeover(
+        &mut self,
+        key: OwnershipKey,
+        epoch: OwnershipEpoch,
+        ttl: Duration,
+    ) -> Result<Lease, OwnershipError> {
+        let now = self.now()?;
+        let not_before = self
+            .takeover_ready_at(key)
+            .ok_or(OwnershipError::QuorumUnavailable)?;
+        if self.claims.get(&key) != Some(&epoch) {
+            return Err(OwnershipError::Fenced);
+        }
+        if now < not_before {
+            return Err(OwnershipError::QuorumUnavailable);
+        }
+        let expires_at = self.deadline(now, ttl)?;
+        let record = Self::applied(
+            self.node
+                .submit(Command::Renew {
+                    key: key.into(),
+                    epoch: epoch.0,
+                    owner: self.node.node_id,
+                    session: self.session,
+                })
+                .await
+                .map_err(|_| OwnershipError::QuorumUnavailable)?,
+        )?;
+        if !record.held
+            || record.epoch != epoch.0
+            || record.owner != self.node.node_id
+            || record.session != self.session
+        {
+            return Err(OwnershipError::QuorumUnavailable);
+        }
+        if self.now()? >= expires_at {
+            return Err(OwnershipError::Expired);
+        }
+        self.takeovers.remove(&key);
+        self.prepared.insert(
+            key,
+            Prepared {
+                kind: PreparationKind::Acquire,
+                ttl,
+                lease: Lease {
+                    key,
+                    epoch,
+                    expires_at,
+                },
+            },
+        );
+        self.acquire(key, ttl)
+    }
+
     pub async fn prepare_renew(
         &mut self,
         key: OwnershipKey,
@@ -627,6 +836,11 @@ impl<C: Clock> QuorumCoordinator<C> {
         epoch: OwnershipEpoch,
     ) -> Result<(), OwnershipError> {
         self.release(key, epoch)?;
+        // Releasing a quarantined reservation would let an ordinary Acquire
+        // bypass the wait while the old owner's cached lease is still live.
+        if self.takeovers.contains_key(&key) {
+            return Err(OwnershipError::QuorumUnavailable);
+        }
         let record = Self::applied(
             self.node
                 .submit(Command::Release {
