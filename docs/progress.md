@@ -110,3 +110,12 @@ Worker の双方向受信に 1 MiB、管理要求に 4095 byte（改行込み）
 - 秘密マスクを bin/*.rs、placement.rs 等に適用し回帰試験を追加。worker.rs/main.rs 側の未対応箇所は docs/security.md に行・修正案を記録（PM 後続対応）。
 - 統合時に clippy（items_after_test_module）を機械修正。main で fmt・clippy・workspace test（157件）が Windows / Rust 1.99.0 で成功。
 - 運用メモ：並列 worktree ごとの target が累計約70GBとなりディスク満杯が発生。完了済み worktree の target と古い検証用 target を削除して復旧。今後は統合後に都度削除する。
+
+## 2026-11-12：並列開発 第5弾（Codex CLI、reasoning high）
+- `docs/quorum-evaluation.md`/`experiments/quorum-spike`：openraft 0.9.26 を独立スパイクで評価（メモリ内3ノード、リーダー選出・1ノード停止継続・過半数喪失で書込み失敗・分断で少数側が epoch を進められないことを確認、初回ビルド約42秒）。結論は『条件付き継続、本番採用は保留』。Linux、永続化、認証付き通信、lease/watchdog/fencing 統合は未検証。メイン workspace には未組込み。
+- `supervisor.rs`：TaskManager/Supervisor（所有者・親子追跡、取消、タイムアウト、再起動予算・バックオフ・サーキットブレーカー、段階 drain）。注入時計で30件。実 Worker/Cog/IPC には未接続。
+- `state_store.rs`：非同期 StateStore（TTL・容量・スキーマ互換・CAS）、メモリ実装、MAC 検証付き 100 文字制限 custom_id、View/Modal 状態、drain 対応 wait。非永続。外部 DB・Subscription 配送は未実装。
+- `testkit.rs`：障害注入（遅延・切断・途中切断・満杯・帯域・seed）と模擬 REST/Interaction（429/5xx/結果不明）、自己試験31件。実 Worker での T15 統合は未実施。
+- `framework/examples`：ping・hybrid・cog_counter・cog_moderation の実行可能サンプルと統合試験17件、CI に examples ビルドを追加（GitHub Actions 実行は未確認）。ban は dry-run、on_message 相当は未対応と明記。
+- `benches/ipc_roundtrip.rs`/docs/benchmarks.md：実 Worker IPC 往復 各10,000件・失敗0、p99 は並列度1/4/16 で 126.3/389.5/588.3 µs（Windows 開発機、1ms 目標との比較は Linux で要再測定）。
+- main 統合後、fmt・clippy（警告禁止）・workspace test（269件）が Windows / Rust 1.99.0 で成功。
