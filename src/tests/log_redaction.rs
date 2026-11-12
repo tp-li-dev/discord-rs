@@ -2,7 +2,8 @@ use src::placement::{Config, PlacementError};
 use std::{
     io::{BufRead, BufReader, Write},
     net::TcpListener,
-    process::Command,
+    process::{Command, Stdio},
+    time::Duration,
 };
 
 #[test]
@@ -65,17 +66,79 @@ fn management_reply_errors_and_log_display_are_masked() {
         assert!(!text.contains("fake-header-capability"));
     }
     server.join().unwrap();
+    std::fs::remove_file(dir.join("core.json")).unwrap();
+    let fixture_source = dir.join("fixture.rs");
+    let fixture_binary = dir.join(format!("fixture{}", std::env::consts::EXE_SUFFIX));
+    std::fs::write(
+        &fixture_source,
+        "fn main() { loop { std::thread::sleep(std::time::Duration::from_secs(1)); } }",
+    )
+    .unwrap();
+    assert!(
+        Command::new("rustc")
+            .arg(&fixture_source)
+            .arg("-o")
+            .arg(&fixture_binary)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let mut core = Command::new(env!("CARGO_BIN_EXE_manage"))
+        .arg("__core")
+        .arg(&fixture_binary)
+        .env("DISCORD_CORE_DIR", &dir)
+        .env("DISCORD_CORE_PORT", port.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    for _ in 0..100 {
+        if dir.join("core.json").exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
     std::fs::write(dir.join("core.log"), "old token=fake-log-capability\n").unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_manage"))
         .arg("logs")
         .env("DISCORD_CORE_DIR", &dir)
+        .env("DISCORD_CORE_PORT", port.to_string())
         .output()
         .unwrap();
     assert!(output.status.success());
-    assert!(!String::from_utf8_lossy(&output.stdout).contains("fake-log-capability"));
-    for file in ["core.json", "core.log"] {
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("old token=[REDACTED]"));
+    assert!(!text.contains("fake-log-capability"));
+    assert!(
+        Command::new(env!("CARGO_BIN_EXE_manage"))
+            .arg("shutdown")
+            .env("DISCORD_CORE_DIR", &dir)
+            .env("DISCORD_CORE_PORT", port.to_string())
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(core.wait().unwrap().success());
+    let audit = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap();
+    let records: Vec<serde_json::Value> = audit
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        records.iter().any(|r| r["operation"] == "logs"
+            && r["role"] == "admin"
+            && r["result"] == "succeeded")
+    );
+    assert!(!audit.contains("fake-log-capability"));
+    for file in ["core.log", "audit.jsonl", "fixture.rs"] {
         std::fs::remove_file(dir.join(file)).unwrap();
     }
+    std::fs::remove_file(fixture_binary).unwrap();
+    #[cfg(windows)]
+    std::fs::remove_file(dir.join("fixture.pdb")).unwrap();
     std::fs::remove_dir(dir).unwrap();
 }
 #[test]
