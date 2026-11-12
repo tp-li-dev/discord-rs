@@ -39,6 +39,7 @@ use tokio::{
     process::{Child, Command},
 };
 
+pub mod cluster_host;
 /// Authenticated update admission and off-loop audit/artifact work.
 pub mod update_control;
 

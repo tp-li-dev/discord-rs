@@ -1,6 +1,6 @@
 # Raft による自動 failover / failback の runtime 接続
 
-2026-11-12。仕様は `docs/architecture.md` §5.3–5.4。担当範囲の実装レポートであり、本番デプロイ手順ではない。`docs/progress.md`、`docs/handoff.md`、`daemon.rs`、`bin/botd.rs`、`tls_transport.rs` は変更していない。
+2026-11-12。仕様は `docs/architecture.md` §5.3–5.4。担当範囲の実装レポートであり、本番デプロイ手順ではない。以下の runtime 段階の記録と差分案は作成時点の履歴。後続の botd 接続は末尾の「botd 実プロセスへの配線」を参照。`docs/progress.md`、`docs/handoff.md` は変更していない。
 
 ## 実装
 
@@ -14,7 +14,7 @@
 - `startup_complete_epoch` / `process_failed_epoch` / `process_exited_epoch` は旧 epoch の通知を無視する。Raft 経路では旧来の epoch なし callback を `EpochRequired` で拒否する。開始時の epoch を Starting / Active / Draining を通じて保持し、古い通知による新世代の解放を防ぐ。
 - store の `Create` / `Open` と bootstrap を呼出元が明示する。再起動時の自動再作成・再 bootstrap は行わない。bootstrap は新規 store の最小 node ID のみ許可する。shutdown は delegated process の停止証明ではないため、保持中予約を勝手に解放しない。
 
-## 使い方と未適用の daemon / botd 差分案
+## runtime 段階の daemon / botd 差分案（履歴）
 
 `LoadedClusterConfig` の `[test_cluster]` は引き続き共通の control TLS 設定・lease 設定として使用する。Raft 専用入力は別の `RaftRuntimeOptions` で渡す。実行可能な使用例は `tests/fixtures/raft_runtime_support.rs::Cluster::start` / `options`。現状の botd CLI は新 API を呼ばないため、CLI の本番経路は未接続である。
 
@@ -108,3 +108,51 @@ clippy 初回は追加コードの `nonminimal_bool` と `clone_on_copy` を検�
 - `src/tests/fixtures/raft_runtime_support.rs`（新規）
 - `src/tests/raft_lease_policy.rs`（新規）
 - `src/src/raft_quorum/RUNTIME_REPORT.md`（本書）
+
+## botd 実プロセスへの配線（2026-11-12 追記）
+
+### 実装と判断
+
+- `botd --allow-raft-quorum` で `daemon::cluster_host::ClusterHost` を選択し、`ClusterRuntime::bind_raft` を呼ぶ。既定は無効。`--mock-discord` が必須で、実 Discord・旧 `--allow-test-quorum`・Gateway switch・手動起動との併用を拒否する。Raft 失敗から旧 ACK / standalone へフォールバックしない。
+- 専用 mTLS RPC の listen と全 peer route、絶対 store path を必須にした。listen / peer は非ゼロ port の loopback IP に限定。store は既定 `Open`、新規作成は `--raft-create`、bootstrap はさらに `--raft-bootstrap` が必要。runtime は最小 node ID の新規 store にのみ bootstrap を許す。紛失・破損 store の自動再作成はしない。
+- 匿名 stdin の管理 capability と full local admin role を確認してから cluster の store / RPC を初期化する。管理 listener は従来どおり loopback と capability 認証。Raft モードでは status のみ許可し、start / stop / restart / update / rollback を拒否する。status は `OpenRaft`、`production_ready=false`、heartbeat の到達性ヒントと実 grant の区別を維持する。
+- `cluster_host.rs` が Shard ごとの起動 epoch と子ハンドルを保持する。Start / Renew は期限を確認して既存の独立 guardian へ渡す。cold standby は Gateway を起動せず、所有権取得時だけ起動する。停止・lease 喪失後の Ready / Renew は Active を復活させない。Core に Bot token を渡す経路はない。
+- guardian が Gateway を wait した後の `stopped` 通知、通知 pipe の閉鎖、所有する guardian ハンドルの正常終了・回収が揃った場合だけ、同じ epoch の `process_exited_epoch` で予約を解放する。guardian 自身の異常終了を Gateway 停止の証拠にしない。確認不能なら admission を撤回し、当該 Shard を Degraded に固定する。
+- 既存の standalone `ChildRecovery` と同じ子を二重管理しない。`RecoveryConfig` / `RestartPolicy` の既定予算・バックオフ計算を用い、異常終了後は停止確認と新しい Raft grant を通して再起動する。寿命予算、時間窓、連続起動失敗、circuit 待機を持ち、同じ epoch の失敗は重複計数しない。通常の lease 失効・handoff は失敗予算を消費しない。待機中の lease 喪失は未起動 grant を取り消す。予算枯渇は自動解除しない。
+- `daemon.rs` の変更は `pub mod cluster_host;` の1行のみ。`worker.rs` / `main.rs` / `gateway_switch.rs`、既存 daemon 構造は変更しない。新規依存、commit、本番デプロイ、実 Discord 接続は行わない。
+
+### 明示入力の例
+
+既存の配置 TOML / `[test_cluster]` と匿名 stdin bootstrap を使い、node 1 の初回作成には次の追加引数を渡す（数値は例）。
+
+```text
+--allow-raft-quorum --mock-discord 127.0.0.1:19000
+--raft-store <absolute-node-specific-store-path>
+--raft-rpc-listen 127.0.0.1:19101
+--raft-rpc-peer 2=127.0.0.1:19102 --raft-rpc-peer 3=127.0.0.1:19103
+--raft-create --raft-bootstrap
+```
+
+node 2 / 3 の新規作成では `--raft-create` のみ指定する。同じ cluster / node / store を再開するときは `--raft-create` と `--raft-bootstrap` を両方省略する。これは模擬環境の入力例であり、本番運用手順ではない。
+
+### 検証
+
+検証実行中。Windows / Rust 1.90.0、cargo は `--offline -p src`、`CARGO_NET_OFFLINE=true`、`CARGO_PROFILE_DEV_DEBUG=0`、`CARGO_INCREMENTAL=0`、`CARGO_BUILD_JOBS=2`、試験は `--test-threads=1`。対象試験と package 単位の clippy に限定し、workspace 全体試験は実行しない。
+
+### 未実装・未検証
+
+- 実ホスト間、実ネットワーク / Tailscale、Linux、OS suspend / VM pause、時計速度差、実 Discord、本番 fencing、外部副作用の exactly-once は未検証。本番 guard を解除する根拠にしない。
+- guardian 自身の強制終了は Gateway を孤児にし得る。今回の host はローカルの再起動・早期 Release を拒否するが、guardian 喪失と別ホスト故障の複合条件まで安全な自動引継ぎを保証しない。孤児の再採用・自動照合・Degraded の解除は未実装。
+- guardian の最終通知が失われた場合も解放しないため、安全側の停止が可用性を下げる場合がある。lease 失効・再選出・cold failback による停止期間はあり、無停止ではない。
+- 再起動予算は botd 内のメモリで保持し、再起動を跨ぐ永続化や全ホスト共有はしない。分散 Identify / REST 予算、membership 変更、証明書運用、電源断耐久性は今回の完成範囲に含まない。
+- 3秒検知・30秒安定の既定値は変更しない。E2E の短縮値による単発観測から本番復旧時間上限や性能保証を導かない。
+
+### この追記の変更ファイル
+
+- `src/src/bin/botd.rs`
+- `src/src/daemon.rs`（mod 宣言1行）
+- `src/src/daemon/cluster_host.rs`（新規）
+- `src/tests/raft_botd_guards.rs`（新規）
+- `src/tests/raft_botd_processes.rs`（新規）
+- `src/tests/fixtures/raft_botd_support.rs`（新規）
+- `src/src/raft_quorum/RUNTIME_REPORT.md`
