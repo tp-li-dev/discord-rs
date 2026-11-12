@@ -127,3 +127,9 @@ Worker の双方向受信に 1 MiB、管理要求に 4095 byte（改行込み）
 - 統合後の試験不安定要因を修正：fixture の rlib 選択が古い rlib で失敗（最新を選ぶよう修正）、log_redaction を RBAC 前提へ更新。
 - 現状：main で fmt・clippy（警告禁止）・workspace test が Windows / Rust 1.99.0 で成功（545件、無視1件の手動ベンチ、2回連続）。未検証: Linux、GitHub Actions、実 Discord、複数ホスト・実ネットワーク、Windows ACL、本番合意（openraft は評価のみ）。
 - 運用：Codex は Sol(high)/Terra(high)/Astra(max) を難易度で使い分け。
+
+## 2026-11-12：並列開発 第8弾（Astra max / Terra high）
+- botd E2E：明示的な模擬 Discord モード（本番既定は無効、token 不要）を追加。botd が Bot A の Shard 0/1 と Bot B の Shard 0 を別プロセスで起動し、Gateway ごとに Worker(Core) が起動、`/ping`・`!ping` 相当が同一ハンドラーを通り REST 結果が要求元 Worker に戻ること、Bot 間の token/状態/IPC 分離、一方の Gateway クラッシュ時に他 Shard 継続と botd 再起動、Shutdown 契約による graceful 停止と孤児ゼロを統合試験（18件）で確認。実 Discord は未接続。
+- `tls_transport.rs`：Tokio TCP + rustls の mTLS Transport（証明書によるノード ID 照合、平文・未許可ノード・偽 CA・巨大フレーム・slowloris の拒否、loopback 既定、秘密鍵保護）。実 TCP 上で heartbeat 途絶による failover 判定を再現。証明書失効・ローテーション、本体配線、本番 quorum/lease 統合は未実装。
+- framework コンポーネント経路：Button/Select/Modal を `custom_id` で名前空間付きハンドラーへルーティングする属性マクロ（重複検出）、2つの独立 Registry が同一ストアで処理する模擬 T16、`wait_for` の drain 時キャンセル型と永続 Subscription 型の区別。実 StateStore アダプタ・実 Worker 接続・Subscription 配送は未実装。
+- 統合後 workspace test は 605 件成功。ただし統合直後の初回実行で hot_swap_scenarios の T04 が1度失敗し、再実行（単体3回・全体1回）では成功。再ビルド直後の負荷に依存するフレークの可能性があり、安定性要再確認。

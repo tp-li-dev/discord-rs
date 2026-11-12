@@ -71,6 +71,7 @@ dependencies = [
  "bot-framework-macros",
  "inventory",
  "serde",
+ "serde_json",
  "tokio",
  "trybuild",
 ]
