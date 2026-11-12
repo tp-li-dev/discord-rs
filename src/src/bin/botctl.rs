@@ -1,8 +1,9 @@
-//! Authenticated local daemon client. Only config validation is offline.
+//! Authenticated local daemon client, with offline configuration/update planning.
 //! Bootstrap capabilities are supplied through anonymous stdin, never argv,
 //! environment variables or a persistent endpoint file.
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use src::update_rollback::{self, Action, Component};
 use src::{botref, placement::Config};
 use std::{collections::HashMap, ffi::OsString, path::PathBuf, time::Duration};
 use tokio::{
@@ -13,7 +14,7 @@ use tokio::{
 
 const REQUEST_LIMIT: usize = 4096;
 const RESPONSE_LIMIT: usize = 64 * 1024;
-const USAGE: &str = "usage: botctl ps|status [BOT]|inspect BOT|shards BOT|start BOT|stop BOT|restart BOT|operation ID --bootstrap-stdin [--json] [--timeout 30s]; botctl config validate --file F [--json]";
+const USAGE: &str = "usage: botctl ps|status [BOT]|inspect BOT|shards BOT|start BOT|stop BOT|restart BOT|operation ID --bootstrap-stdin [--json] [--timeout 30s]; botctl config validate --file F [--json]; botctl update|rollback BOT --plan manifest.json [--component core|gateway|all] [--rolling] [--dry-run | --yes --bootstrap-stdin] [--json]";
 const OFFLINE_NOTE: &str =
     "オフライン設定検証のみ。daemon・実稼働状態・認証・quorum/leaseは検証していません。";
 
@@ -25,6 +26,8 @@ struct Options {
     timeout: Duration,
     force: bool,
     yes: bool,
+    plan: Option<PathBuf>,
+    component: Component,
 }
 
 fn valid_operation_id(value: &str) -> bool {
@@ -60,6 +63,10 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
     let mut operation_id = None;
     let mut force = false;
     let mut yes = false;
+    let mut plan = None;
+    let mut component = None;
+    let mut dry_run = false;
+    let mut rolling = false;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         match arg.to_str() {
@@ -67,6 +74,23 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
             Some("--bootstrap-stdin") if !bootstrap => bootstrap = true,
             Some("--force") if !force => force = true,
             Some("--yes") if !yes => yes = true,
+            Some("--dry-run") if !dry_run => dry_run = true,
+            Some("--rolling") if !rolling => rolling = true,
+            Some("--plan") if plan.is_none() => {
+                let value = args
+                    .next()
+                    .filter(|v| !v.is_empty() && !v.to_string_lossy().starts_with('-'))
+                    .ok_or("--plan requires a path")?;
+                plan = Some(PathBuf::from(value));
+            }
+            Some("--component") if component.is_none() => {
+                component = Some(match args.next().and_then(|v| v.to_str()) {
+                    Some("core") => Component::Core,
+                    Some("gateway") => Component::Gateway,
+                    Some("all") => Component::All,
+                    _ => return Err("--component requires core, gateway or all"),
+                });
+            }
             Some("--file") if file.is_none() => {
                 let value = args
                     .next()
@@ -94,9 +118,7 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
                 }
                 operation_id = Some(value.to_owned());
             }
-            Some("update" | "rollback" | "create" | "logs" | "nodes" | "doctor" | "daemon")
-                if words.is_empty() =>
-            {
+            Some("create" | "logs" | "nodes" | "doctor" | "daemon") if words.is_empty() => {
                 return Err("未実装: この daemon 操作には対応していません");
             }
             Some(value) if !value.starts_with('-') => words.push(value),
@@ -113,6 +135,8 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
         ["start", bot] => ("start", Some((*bot).to_owned())),
         ["stop" | "shutdown", bot] => ("stop", Some((*bot).to_owned())),
         ["restart" | "reboot", bot] => ("restart", Some((*bot).to_owned())),
+        ["update", bot] => ("update", Some((*bot).to_owned())),
+        ["rollback", bot] => ("rollback", Some((*bot).to_owned())),
         ["operation" | "op", id] if operation_id.is_none() => {
             if !valid_operation_id(id) {
                 return Err("operation ID must contain 32 lowercase hexadecimal characters");
@@ -131,13 +155,37 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
     if force && !yes {
         return Err("force stop requires explicit --yes confirmation");
     }
-    if yes && !force {
+    let update = matches!(command, "update" | "rollback");
+    if yes && !force && !update {
         return Err("--yes requires --force stop");
     }
     if operation_id.is_some() && !matches!(command, "start" | "stop" | "restart" | "operation") {
         return Err("--operation-id is only supported for start, stop and restart");
     }
-    if command == "config" {
+    if !update && (plan.is_some() || component.is_some() || dry_run || rolling) {
+        return Err("update planning options require update or rollback");
+    }
+    if update {
+        if plan.is_none() {
+            return Err(
+                "未実装: daemon-derived update/rollback plans are unavailable; --plan is required",
+            );
+        }
+        if file.is_some() {
+            return Err("update/rollback uses --plan, not --file");
+        }
+        if dry_run && yes {
+            return Err("--dry-run and --yes are mutually exclusive");
+        }
+        if yes && !bootstrap {
+            return Err("update/rollback execution requires authenticated --bootstrap-stdin");
+        }
+        if !yes && bootstrap {
+            return Err(
+                "update/rollback dry-run is offline; omit --bootstrap-stdin or specify --yes",
+            );
+        }
+    } else if command == "config" {
         if file.is_none() {
             return Err("--file is required for config validate");
         }
@@ -160,6 +208,8 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
         timeout: timeout.unwrap_or(Duration::from_secs(30)),
         force,
         yes,
+        plan,
+        component: component.unwrap_or_default(),
     })
 }
 
@@ -340,6 +390,9 @@ async fn run(mut options: Options) -> Value {
         return config_validate(options.file.as_ref().expect("validated config path"))
             .unwrap_or_else(|error| json!({"ok": false, "offline": true, "error": error}));
     }
+    if matches!(options.command, "update" | "rollback") {
+        return run_update(&options).await;
+    }
     let mutation = matches!(options.command, "start" | "stop" | "restart");
     if mutation && options.operation_id.is_none() {
         options.operation_id = match new_operation_id() {
@@ -437,6 +490,74 @@ async fn run(mut options: Options) -> Value {
             };
         }
     }
+}
+
+async fn run_update(options: &Options) -> Value {
+    let started = Instant::now();
+    let deadline = started + options.timeout;
+    let path = options
+        .plan
+        .as_ref()
+        .expect("validated manifest path")
+        .clone();
+    let component = options.component;
+    let selector = options.bot.clone().expect("validated Bot selector");
+    let action = if options.command == "update" {
+        Action::Update
+    } else {
+        Action::Rollback
+    };
+    // Hashing runs outside the async runtime so --timeout bounds even large files.
+    // Cancellation may finish read-only validation in the background; it can never
+    // start a candidate or send a daemon mutation.
+    let validation = tokio::task::spawn_blocking(move || {
+        let manifest = update_rollback::load_manifest(&path)?;
+        update_rollback::build_plan(&manifest, &selector, action, component, started.elapsed())?;
+        update_rollback::verify_artifacts(
+            &manifest,
+            component,
+            path.parent().unwrap_or(std::path::Path::new(".")),
+        )?;
+        let plan = update_rollback::build_plan(
+            &manifest,
+            &selector,
+            action,
+            component,
+            started.elapsed(),
+        )?;
+        Ok::<_, &'static str>(plan)
+    });
+    let plan = match timeout_at(deadline, validation).await {
+        Ok(Ok(Ok(plan))) => plan,
+        Ok(Ok(Err(error))) => {
+            return json!({"ok":false,"offline":true,"applied":false,"error":error});
+        }
+        Ok(Err(_)) => {
+            return json!({"ok":false,"offline":true,"applied":false,"error":"update validation failed"});
+        }
+        Err(_) => {
+            return json!({"ok":false,"offline":true,"applied":false,"error":"update validation timed out; no request sent"});
+        }
+    };
+    let allowed = plan.executable();
+    let mut value = json!({"ok": allowed, "offline": true, "dry_run": !options.yes, "applied": false, "plan": plan});
+    if !allowed {
+        value["error"] =
+            json!("update/rollback plan is deferred or rejected; keep old generations active");
+        return value;
+    }
+    if !options.yes {
+        return value;
+    }
+    value["ok"] = json!(false);
+    // The assigned scope ends at the proposed control request types. Do not add
+    // even an inspect connection here. A bootstrap flag or locally supplied
+    // capability does not establish daemon authentication/authorization.
+    value["authenticated"] = json!(false);
+    value["error"] = json!(
+        "未実装: daemon update/rollback authentication and execution are not connected; no request sent"
+    );
+    value
 }
 
 #[tokio::main(flavor = "current_thread")]

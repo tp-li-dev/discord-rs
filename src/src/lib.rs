@@ -26,6 +26,7 @@ pub mod switch;
 pub mod testkit;
 pub mod tls_transport;
 pub mod update_gate;
+pub mod update_rollback;
 pub mod worker;
 
 pub type AppError = Box<dyn std::error::Error + Send + Sync>;
