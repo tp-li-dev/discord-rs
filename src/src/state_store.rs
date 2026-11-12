@@ -6,6 +6,10 @@
 //! a dedicated worker. Neither this API nor a custom_id grants Discord permissions
 //! or ownership; callers still authorize the user and fence side effects.
 use crate::protocol::BotId;
+use bot_framework::interactions::{
+    CreatedState, InteractionError, InteractionKind, InteractionStateStore, RestoreFuture,
+    RestoredState, Route, StateFuture, StoredState,
+};
 use rustls::crypto::tls13::OkmBlock;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -714,13 +718,28 @@ impl InteractionStore {
         expires_at: Timestamp,
         condition: PutCondition,
     ) -> Result<String, StateError> {
+        self.save_versioned(route, data, expires_at, condition)
+            .await
+            .map(|(wire, _)| wire)
+    }
+    /// Return the revision acknowledged by this exact write, without a second
+    /// read that could observe a concurrent update. This low-level API accepts
+    /// caller-owned routes; use the framework adapter for authenticated updates.
+    pub async fn save_versioned(
+        &self,
+        route: &CustomId,
+        data: Vec<u8>,
+        expires_at: Timestamp,
+        condition: PutCondition,
+    ) -> Result<(String, u64), StateError> {
         let wire = self.codec.encode(route)?;
         let data = serde_json::to_vec(&InteractionEnvelope {
             route: route.clone(),
             data,
         })
         .map_err(|_| StateError::Encoding)?;
-        self.store
+        let revision = self
+            .store
             .put(
                 route.key(self.codec.scope, self.codec.kind),
                 StateValue {
@@ -731,10 +750,13 @@ impl InteractionStore {
                 condition,
             )
             .await?;
-        Ok(wire)
+        Ok((wire, revision))
     }
     pub async fn load(&self, wire: &str) -> Result<Option<StateRecord>, StateError> {
         let route = self.codec.decode(wire)?;
+        self.load_route(&route).await
+    }
+    async fn load_route(&self, route: &CustomId) -> Result<Option<StateRecord>, StateError> {
         let Some(mut record) = self
             .store
             .get(&route.key(self.codec.scope, self.codec.kind), self.schema)
@@ -747,11 +769,45 @@ impl InteractionStore {
         }
         let envelope: InteractionEnvelope =
             serde_json::from_slice(&record.value.data).map_err(|_| StateError::InvalidState)?;
-        if envelope.route != route {
+        if envelope.route != *route {
             return Err(StateError::InvalidState);
         }
         record.value.data = envelope.data;
         Ok(Some(record))
+    }
+    /// Authenticate and validate the current envelope, then replace only that
+    /// revision. Missing/expired state conflicts; a stale route cannot overwrite
+    /// a newer route version that reused the same state ID.
+    pub async fn compare_and_swap(
+        &self,
+        wire: &str,
+        expected_revision: u64,
+        data: Vec<u8>,
+        expires_at: Timestamp,
+    ) -> Result<u64, StateError> {
+        let route = self.codec.decode(wire)?;
+        self.compare_and_swap_route(&route, expected_revision, data, expires_at)
+            .await
+    }
+    async fn compare_and_swap_route(
+        &self,
+        route: &CustomId,
+        expected_revision: u64,
+        data: Vec<u8>,
+        expires_at: Timestamp,
+    ) -> Result<u64, StateError> {
+        let record = self.load_route(route).await?.ok_or(StateError::Conflict)?;
+        if record.revision != expected_revision {
+            return Err(StateError::Conflict);
+        }
+        self.save_versioned(
+            route,
+            data,
+            expires_at,
+            PutCondition::IfRevision(record.revision),
+        )
+        .await
+        .map(|(_, revision)| revision)
     }
     pub async fn delete(
         &self,
@@ -759,7 +815,14 @@ impl InteractionStore {
         expected_revision: Option<u64>,
     ) -> Result<bool, StateError> {
         let route = self.codec.decode(wire)?;
-        let Some(record) = self.load(wire).await? else {
+        self.delete_route(&route, expected_revision).await
+    }
+    async fn delete_route(
+        &self,
+        route: &CustomId,
+        expected_revision: Option<u64>,
+    ) -> Result<bool, StateError> {
+        let Some(record) = self.load_route(route).await? else {
             return if expected_revision.is_some() {
                 Err(StateError::Conflict)
             } else {
@@ -777,6 +840,235 @@ impl InteractionStore {
                 Some(record.revision),
             )
             .await
+    }
+}
+
+/// Framework adapter bound at startup to one trusted Bot/Shard and namespace.
+/// Components (buttons/selects) and modals use distinct MAC domains and keys in
+/// the backend. Every read/update authenticates the ID and validates its envelope;
+/// conditional writes additionally bind the validated revision atomically.
+///
+/// Retain the backend and independent signing key across Core generations. This
+/// adapter does not improve backend durability: MemoryStateStore remains volatile.
+/// Worker transport, user authorization, admission/fencing, reply tracking and
+/// Subscription delivery are separate host responsibilities and are not connected
+/// here. It never needs a Bot token or treats a signed ID as user authorization.
+pub struct FrameworkStateStore {
+    namespace: PublicLabel,
+    components: InteractionStore,
+    modals: InteractionStore,
+}
+impl FrameworkStateStore {
+    pub fn new(
+        store: Arc<dyn StateStore>,
+        scope: StoreScope,
+        namespace: PublicLabel,
+        secret: [u8; 32],
+        supported_versions: Vec<u16>,
+        schema: SchemaVersion,
+    ) -> Result<Self, StateError> {
+        let components = InteractionStore::new(
+            store.clone(),
+            CustomIdCodec::new(scope, StateKind::View, secret, supported_versions.clone())?,
+            schema,
+        )?;
+        let modals = InteractionStore::new(
+            store,
+            CustomIdCodec::new(scope, StateKind::Modal, secret, supported_versions)?,
+            schema,
+        )?;
+        Ok(Self {
+            namespace,
+            components,
+            modals,
+        })
+    }
+
+    fn interactions(&self, kind: InteractionKind) -> &InteractionStore {
+        match kind {
+            InteractionKind::Component => &self.components,
+            InteractionKind::Modal => &self.modals,
+        }
+    }
+
+    fn authenticated_route(
+        &self,
+        kind: InteractionKind,
+        custom_id: &str,
+    ) -> Result<CustomId, InteractionError> {
+        let route = self
+            .interactions(kind)
+            .codec
+            .decode(custom_id)
+            .map_err(framework_state_error)?;
+        if route.namespace != self.namespace {
+            return Err(InteractionError::InvalidId);
+        }
+        Ok(route)
+    }
+
+    /// Insert a fresh, caller-prepared ID only if absent. Prepare random IDs
+    /// outside latency-sensitive paths; deterministic IDs are useful in tests.
+    /// Never reuse a deleted/expired ID: an old signed ID could otherwise replay.
+    /// The returned revision is from this commit, not a subsequent read.
+    pub async fn create_with_id(
+        &self,
+        kind: InteractionKind,
+        route: &Route,
+        state_id: StateId,
+        data: Vec<u8>,
+        expires_at_unix_ms: u64,
+    ) -> Result<CreatedState, InteractionError> {
+        if route.namespace != self.namespace.as_str() {
+            return Err(InteractionError::InvalidId);
+        }
+        let route = CustomId::new(
+            self.namespace.clone(),
+            PublicLabel::new(&route.name).map_err(framework_state_error)?,
+            route.version,
+            state_id,
+        )
+        .map_err(framework_state_error)?;
+        let (custom_id, revision) = self
+            .interactions(kind)
+            .save_versioned(
+                &route,
+                data,
+                Timestamp(expires_at_unix_ms),
+                PutCondition::IfAbsent,
+            )
+            .await
+            .map_err(framework_state_error)?;
+        Ok(CreatedState {
+            custom_id,
+            revision,
+            expires_at_unix_ms,
+        })
+    }
+
+    async fn load_state(
+        &self,
+        kind: InteractionKind,
+        custom_id: &str,
+    ) -> Result<StoredState, InteractionError> {
+        let route = self.authenticated_route(kind, custom_id)?;
+        let record = self
+            .interactions(kind)
+            .load_route(&route)
+            .await
+            .map_err(framework_state_error)?
+            .ok_or(InteractionError::ExpiredOrMissing)?;
+        Ok(StoredState {
+            route: Route {
+                namespace: route.namespace.as_str().to_owned(),
+                name: route.feature.as_str().to_owned(),
+                version: route.version,
+            },
+            data: record.value.data,
+            revision: record.revision,
+            expires_at_unix_ms: record
+                .value
+                .expires_at
+                .ok_or(InteractionError::InvalidState)?
+                .0,
+        })
+    }
+}
+
+impl InteractionStateStore for FrameworkStateStore {
+    fn restore<'a>(&'a self, kind: InteractionKind, custom_id: &'a str) -> RestoreFuture<'a> {
+        Box::pin(async move {
+            let state = self.load_state(kind, custom_id).await?;
+            Ok(RestoredState {
+                route: state.route,
+                data: state.data,
+            })
+        })
+    }
+
+    fn load<'a>(
+        &'a self,
+        kind: InteractionKind,
+        custom_id: &'a str,
+    ) -> StateFuture<'a, StoredState> {
+        Box::pin(self.load_state(kind, custom_id))
+    }
+
+    fn create<'a>(
+        &'a self,
+        kind: InteractionKind,
+        route: &'a Route,
+        data: Vec<u8>,
+        expires_at_unix_ms: u64,
+    ) -> StateFuture<'a, CreatedState> {
+        Box::pin(async move {
+            let state_id = StateId::random().map_err(framework_state_error)?;
+            self.create_with_id(kind, route, state_id, data, expires_at_unix_ms)
+                .await
+        })
+    }
+
+    fn compare_and_swap<'a>(
+        &'a self,
+        kind: InteractionKind,
+        custom_id: &'a str,
+        expected_revision: u64,
+        data: Vec<u8>,
+        expires_at_unix_ms: u64,
+    ) -> StateFuture<'a, u64> {
+        Box::pin(async move {
+            let route = self.authenticated_route(kind, custom_id)?;
+            self.interactions(kind)
+                .compare_and_swap_route(
+                    &route,
+                    expected_revision,
+                    data,
+                    Timestamp(expires_at_unix_ms),
+                )
+                .await
+                .map_err(framework_state_error)
+        })
+    }
+
+    fn delete<'a>(
+        &'a self,
+        kind: InteractionKind,
+        custom_id: &'a str,
+        expected_revision: u64,
+    ) -> StateFuture<'a, bool> {
+        Box::pin(async move {
+            let route = self.authenticated_route(kind, custom_id)?;
+            self.interactions(kind)
+                .delete_route(&route, Some(expected_revision))
+                .await
+                .map_err(framework_state_error)
+        })
+    }
+}
+
+fn framework_state_error(error: StateError) -> InteractionError {
+    match error {
+        StateError::InvalidLabel
+        | StateError::SensitiveLabel
+        | StateError::InvalidVersion
+        | StateError::InvalidCustomId
+        | StateError::Tampered => InteractionError::InvalidId,
+        StateError::UnsupportedVersion => InteractionError::UnsupportedVersion,
+        StateError::InvalidExpiry => InteractionError::InvalidExpiry,
+        StateError::Conflict => InteractionError::Conflict,
+        StateError::ValueTooLarge | StateError::CapacityExceeded => {
+            InteractionError::CapacityExceeded
+        }
+        StateError::IncompatibleSchema | StateError::InvalidState | StateError::Encoding => {
+            InteractionError::InvalidState
+        }
+        StateError::UnknownOutcome => InteractionError::UnknownOutcome,
+        StateError::ClockUnavailable
+        | StateError::ClockRegressed
+        | StateError::RevisionExhausted
+        | StateError::DurabilityRequired
+        | StateError::BackendUnavailable
+        | StateError::RandomUnavailable => InteractionError::StoreUnavailable,
     }
 }
 

@@ -27,11 +27,3 @@ error: interaction handler must be an async, non-generic safe function taking on
    |
 11 | fn sync(_: InteractionContext<'_>) -> BotResult<()> { Ok(()) }
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-warning: unused imports: `BotResult` and `interactions::InteractionContext`
- --> tests/ui/interactions.rs:1:39
-  |
-1 | use bot_framework::{component, modal, BotResult, interactions::InteractionContext};
-  |                                       ^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  |
-  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
