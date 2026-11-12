@@ -120,10 +120,17 @@ fn replace_scalar(json: &mut String, field: &str, replacement: &str) -> Result<(
 }
 
 fn request_type(line: &str) -> Result<&'static str> {
-    ["health", "hello", "dispatch", "snapshot", "restore"]
-        .into_iter()
-        .find(|kind| line.contains(&format!("\"type\":\"{kind}\"")))
-        .ok_or_else(|| "unsupported fixture request".into())
+    [
+        "health",
+        "hello",
+        "dispatch",
+        "snapshot",
+        "restore",
+        "restore_event_stream",
+    ]
+    .into_iter()
+    .find(|kind| line.contains(&format!("\"type\":\"{kind}\"")))
+    .ok_or_else(|| "unsupported fixture request".into())
 }
 
 fn run() -> Result<u8> {
@@ -135,6 +142,8 @@ fn run() -> Result<u8> {
     if ![
         "v1",
         "v2",
+        "count-gated",
+        "ready-gated",
         "crash-before-ready",
         "hello-version",
         "hello-capability",
@@ -157,11 +166,13 @@ fn run() -> Result<u8> {
         }
         let kind = request_type(&line)?;
         event(&executable, kind)?;
-        if initial && kind == "health" && mode == "crash-before-ready" {
+        if initial && kind == "health" && ["crash-before-ready", "ready-gated"].contains(&mode) {
             event(&executable, "health-blocked")?;
             wait_release(&executable)?;
-            event(&executable, "crashed-before-ready")?;
-            return Ok(71);
+            if mode == "crash-before-ready" {
+                event(&executable, "crashed-before-ready")?;
+                return Ok(71);
+            }
         }
         if kind == "hello" && ["hello-version", "hello-capability"].contains(&mode) {
             let identity = std::env::var("BOT_WORKER_IPC_IDENTITY")?;
@@ -182,6 +193,10 @@ fn run() -> Result<u8> {
             continue;
         }
         let slow = kind == "dispatch" && line.contains("!slow");
+        if kind == "dispatch" && mode == "count-gated" && line.contains("\"content\":\"!count\"") {
+            event(&executable, "stateful-started")?;
+            wait_release(&executable)?;
+        }
         if slow {
             event(&executable, "slow-started")?;
             wait_release(&executable)?;

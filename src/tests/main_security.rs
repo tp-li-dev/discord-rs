@@ -26,13 +26,31 @@ fn gateway() -> Command {
     command
 }
 
+fn assert_json_diagnostic(output: &Output, category: &str) {
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr.clone()).unwrap();
+    let location = stderr
+        .trim()
+        .strip_prefix(&format!(
+            "実行に失敗しました: invalid JSON (category={category}, line="
+        ))
+        .expect("JSON errors must retain their category")
+        .strip_suffix(')')
+        .expect("diagnostics must end after the source location");
+    let (line, column) = location.split_once(", column=").unwrap();
+    assert!(line.parse::<usize>().unwrap() > 0);
+    // EOF immediately after a newline legitimately reports column zero.
+    column.parse::<usize>().unwrap();
+}
+
 #[test]
-fn missing_token_fails_without_automatic_error_debug_output() {
+fn missing_token_preserves_a_safe_configuration_diagnostic() {
     let output = gateway().output().unwrap();
     assert!(!output.status.success());
     assert_eq!(
         String::from_utf8_lossy(&output.stderr).trim(),
-        "実行に失敗しました: [REDACTED]"
+        "実行に失敗しました: DISCORD_TOKEN is not configured [token_missing]"
     );
     assert!(output.stdout.is_empty());
 }
@@ -54,12 +72,28 @@ fn malformed_worker_input_cannot_leak_short_or_labelled_secrets_on_exit() {
         let frame = serde_json::json!({"type": payload});
         writeln!(child.stdin.take().unwrap(), "{frame}").unwrap();
         let output = child.wait_with_output().unwrap();
-        assert!(!output.status.success());
         assert!(!captured(&output).contains(payload));
-        assert_eq!(
-            String::from_utf8_lossy(&output.stderr).trim(),
-            "実行に失敗しました: [REDACTED]"
-        );
+        assert_json_diagnostic(&output, "Data");
+    }
+}
+
+#[test]
+fn malformed_worker_json_reports_syntax_and_eof_without_echoing_input() {
+    for (frame, category) in [
+        ("{\"type\": short-private-value}", "Syntax"),
+        ("{\"content\":\"short-private-value\",", "Eof"),
+    ] {
+        let mut child = gateway()
+            .arg("--worker")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        writeln!(child.stdin.take().unwrap(), "{frame}").unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(!captured(&output).contains("short-private-value"));
+        assert_json_diagnostic(&output, category);
     }
 }
 
@@ -103,6 +137,29 @@ fn non_unicode_token_never_reaches_the_error_output() {
     assert!(!captured(&output).contains("short-private-value"));
     assert_eq!(
         String::from_utf8_lossy(&output.stderr).trim(),
-        "実行に失敗しました: [REDACTED]"
+        "実行に失敗しました: DISCORD_TOKEN is not Unicode [token_encoding]"
+    );
+}
+
+#[test]
+fn invalid_management_bootstrap_reports_the_cause_without_payload() {
+    let mut child = gateway()
+        .arg("--local-control")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(
+        child.stdin.take().unwrap(),
+        "short-private-value token=fake-token"
+    )
+    .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr).trim(),
+        "実行に失敗しました: invalid management bootstrap [bootstrap_invalid]"
     );
 }

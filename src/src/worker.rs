@@ -1,13 +1,13 @@
 use crate::{
     AppError,
-    redact::{Secret, redact},
+    redact::redact,
     response_drain::{ResponseDrain, ResponseOperation},
 };
 use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
     process::Stdio,
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     time::Duration,
 };
 use tokio::{
@@ -22,7 +22,9 @@ const CAPABILITIES: &[&str] = &["snapshot-v3"];
 const EVENT_SEQ_CAPABILITY: &str = "event-seq-v1";
 const EVENT_REPLAY_CAPABILITY: &str = "event-replay-v1";
 const HELLO_CAPABILITY: &str = "hello-v1";
+const CONCURRENT_DRAIN_CAPABILITY: &str = "concurrent-drain-v1";
 const OPTIONAL_CAPABILITIES: &[&str] = &[
+    CONCURRENT_DRAIN_CAPABILITY,
     EVENT_SEQ_CAPABILITY,
     EVENT_REPLAY_CAPABILITY,
     "hello-v1",
@@ -59,21 +61,24 @@ impl DeploymentIdentity {
                 Some(value) if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) => {
                     value
                         .parse()
-                        .map_err(|_| "invalid deployment number".into())
+                        .map_err(|_| failure("invalid deployment number"))
                 }
-                Some(_) => Err("invalid deployment number".into()),
+                Some(_) => Err(failure("invalid deployment number")),
             }
         }
-        let bot_id = crate::protocol::BotId(number(lookup("BOT_ID")?, 0)?);
-        let id = u32::try_from(number(lookup("SHARD_ID")?, 0)?).map_err(|_| "invalid shard id")?;
-        let total = u32::try_from(number(lookup("TOTAL_SHARDS")?, 1)?)
-            .map_err(|_| "invalid shard total")?;
-        let generation = lookup("GENERATION_ID")?
+        let mut checked_lookup =
+            |name| lookup(name).map_err(|_| failure("invalid deployment environment"));
+        let bot_id = crate::protocol::BotId(number(checked_lookup("BOT_ID")?, 0)?);
+        let id = u32::try_from(number(checked_lookup("SHARD_ID")?, 0)?)
+            .map_err(|_| failure("invalid shard id"))?;
+        let total = u32::try_from(number(checked_lookup("TOTAL_SHARDS")?, 1)?)
+            .map_err(|_| failure("invalid shard total"))?;
+        let generation = checked_lookup("GENERATION_ID")?
             .map(|value| number(Some(value), 0).map(std::sync::atomic::AtomicU64::new))
             .transpose()?;
         Ok(Self {
             bot_id,
-            shard: crate::protocol::Shard::new(id, total)?,
+            shard: crate::protocol::Shard::new(id, total).map_err(failure)?,
             generation,
         })
     }
@@ -83,7 +88,7 @@ impl DeploymentIdentity {
         let generation = match &self.generation {
             Some(next) => next
                 .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-                .map_err(|_| "worker generation exhausted")?,
+                .map_err(|_| failure("worker generation exhausted"))?,
             None => getrandom::u64()?,
         };
         Ok(crate::protocol::Identity {
@@ -108,6 +113,52 @@ fn local_hello(identity: crate::protocol::Identity) -> crate::protocol::Hello {
 const STATE_VERSION: u32 = 3;
 const MAX_FRAME_BYTES: u64 = 1024 * 1024;
 const DEADLINE: Duration = Duration::from_secs(5);
+const APPLICATION_DEADLINE: Duration = Duration::from_secs(30);
+const DRAIN_DEADLINE: Duration = Duration::from_secs(60);
+
+// Only code-owned diagnostics may cross a log boundary unchanged. In particular,
+// a peer's Rejected reason, serde's input text and an IO error's custom payload
+// are never treated as trusted merely because they implement Error.
+#[derive(Debug)]
+struct WorkerFailure {
+    message: &'static str,
+    exit_code: Option<i32>,
+}
+impl std::fmt::Display for WorkerFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message)
+    }
+}
+impl std::error::Error for WorkerFailure {}
+
+fn failure(message: &'static str) -> AppError {
+    Box::new(WorkerFailure {
+        message,
+        exit_code: None,
+    })
+}
+
+/// Safe diagnostics without formatting an arbitrary error or traversing sources.
+pub fn diagnostic(error: &(dyn std::error::Error + 'static)) -> String {
+    if let Some(error) = error.downcast_ref::<WorkerFailure>() {
+        error.message.to_owned()
+    } else if let Some(error) = error.downcast_ref::<std::io::Error>() {
+        format!(
+            "IO failure (kind={:?}, os_code={:?})",
+            error.kind(),
+            error.raw_os_error()
+        )
+    } else if let Some(error) = error.downcast_ref::<serde_json::Error>() {
+        format!(
+            "invalid JSON (category={:?}, line={}, column={})",
+            error.classify(),
+            error.line(),
+            error.column()
+        )
+    } else {
+        crate::redact::MASK.to_owned()
+    }
+}
 
 // Frames are newline-delimited JSON. Limit reads before allocating untrusted input.
 async fn read_frame<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<Option<Vec<u8>>, AppError> {
@@ -120,7 +171,7 @@ async fn read_frame<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<Option<Ve
         return Ok(None);
     }
     if frame.len() as u64 > MAX_FRAME_BYTES || frame.last() != Some(&b'\n') {
-        return Err("invalid or oversized worker frame".into());
+        return Err(failure("invalid or oversized worker frame"));
     }
     Ok(Some(frame))
 }
@@ -178,6 +229,34 @@ enum Request {
         state: serde_json::Value,
     },
 }
+impl Request {
+    fn application(&self) -> bool {
+        matches!(
+            self,
+            Self::Dispatch { .. }
+                | Self::Command { .. }
+                | Self::SlashCommand { .. }
+                | Self::ReadyEvent { .. }
+                | Self::SequencedReady { .. }
+                | Self::Tick
+        )
+    }
+
+    // snapshot-v3 owns only legacy count/job state. FrameworkRuntime is explicitly
+    // generation-local. Ready also needs this barrier for its ACK/replay cursor.
+    // concurrent-drain-v1 promises that all other requests leave snapshot-v3
+    // unchanged; validate that promise on every result before accepting it.
+    fn state_barrier(&self) -> bool {
+        match self {
+            Self::Dispatch { content, .. } => {
+                let name = content.split_whitespace().next().unwrap_or("");
+                matches!(name, "!count" | "!job")
+            }
+            Self::Command { .. } | Self::SlashCommand { .. } => false,
+            _ => true,
+        }
+    }
+}
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Response {
@@ -220,13 +299,13 @@ fn validate_hello(min: Option<u32>, max: Option<u32>, required: &[String]) -> Re
     match (min, max) {
         (None, None) => {}
         (Some(min), Some(max)) if min <= PROTOCOL && PROTOCOL <= max => {}
-        _ => return Err("incompatible worker protocol range".into()),
+        _ => return Err(failure("incompatible worker protocol range")),
     }
     if required
         .iter()
         .any(|capability| !CAPABILITIES.contains(&capability.as_str()))
     {
-        return Err("unsupported required worker capability".into());
+        return Err(failure("unsupported required worker capability"));
     }
     Ok(())
 }
@@ -285,13 +364,18 @@ fn command_result(
     }
 }
 
+#[derive(Clone)]
+struct TransferState {
+    events: crate::event_seq::Sender,
+    checkpoint: Option<serde_json::Value>,
+}
+
 struct Process {
     _child: Child,
     input: ChildStdin,
     output: BufReader<ChildStdout>,
     broken: bool,
-    events: crate::event_seq::Sender,
-    checkpoint: Option<serde_json::Value>,
+    transfer: Arc<StdMutex<TransferState>>,
     build: String,
     pid: u32,
     supported_capabilities: Vec<String>,
@@ -308,18 +392,27 @@ impl Process {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .kill_on_drop(true)
-            .spawn()
-            .map_err(|_| "worker spawn failed")?;
-        let input = child.stdin.take().ok_or("missing worker stdin")?;
-        let output = BufReader::new(child.stdout.take().ok_or("missing worker stdout")?);
+            .spawn()?;
+        let input = child
+            .stdin
+            .take()
+            .ok_or_else(|| failure("missing worker stdin"))?;
+        let output = BufReader::new(
+            child
+                .stdout
+                .take()
+                .ok_or_else(|| failure("missing worker stdout"))?,
+        );
         let mut process = Self {
             _child: child,
             input,
             output,
             broken: false,
-            events: crate::event_seq::Sender::new(64, 0, MAX_FRAME_BYTES as usize, 0)
-                .map_err(|_| "invalid event buffer")?,
-            checkpoint: None,
+            transfer: Arc::new(StdMutex::new(TransferState {
+                events: crate::event_seq::Sender::new(64, 0, MAX_FRAME_BYTES as usize, 0)
+                    .map_err(|_| failure("invalid event buffer"))?,
+                checkpoint: None,
+            })),
             build: String::new(),
             pid: 0,
             supported_capabilities: Vec::new(),
@@ -335,16 +428,12 @@ impl Process {
                 pid,
             } => {
                 validate_hello(protocol_min, protocol_max, &required_capabilities)?;
-                // Old v5 peers may echo optional Hello fields without handling
-                // new wire requests. Offer replay only after explicit Ready
-                // advertisement, then still require bilateral Hello agreement.
-                if !supported_capabilities
-                    .iter()
-                    .any(|cap| cap == EVENT_REPLAY_CAPABILITY)
-                {
-                    hello
-                        .optional_capabilities
-                        .retain(|cap| cap != EVENT_REPLAY_CAPABILITY);
+                // Optional reflection by older v5 peers is not an advertisement
+                // that they implement new semantics or new wire requests.
+                for cap in [EVENT_REPLAY_CAPABILITY, CONCURRENT_DRAIN_CAPABILITY] {
+                    if !supported_capabilities.iter().any(|value| value == cap) {
+                        hello.optional_capabilities.retain(|value| value != cap);
+                    }
                 }
                 if supported_capabilities
                     .iter()
@@ -357,47 +446,76 @@ impl Process {
                         .await?
                     {
                         Response::Hello { hello: peer } => {
-                            let (_, negotiated) = hello.negotiate(&peer)?;
+                            let (_, negotiated) = hello.negotiate(&peer).map_err(failure)?;
                             process.supported_capabilities = negotiated;
                         }
-                        _ => return Err("worker hello rejected".into()),
+                        _ => return Err(failure("worker hello rejected")),
                     }
                 } else {
-                    // Preserve v5's advertised application capabilities.
                     process.supported_capabilities = supported_capabilities
                         .into_iter()
-                        .filter(|cap| cap != EVENT_SEQ_CAPABILITY)
+                        .filter(|cap| {
+                            cap != EVENT_SEQ_CAPABILITY && cap != CONCURRENT_DRAIN_CAPABILITY
+                        })
                         .collect();
                 }
                 process.build = build;
                 process.pid = pid;
+                if process.supports(CONCURRENT_DRAIN_CAPABILITY) {
+                    // Establish a confirmed initial snapshot, including custom
+                    // initial state, before admitting any application work.
+                    match process.request(&Request::Snapshot).await? {
+                        Response::Snapshot {
+                            version: STATE_VERSION,
+                            state,
+                        } => {
+                            process.transfer.lock().unwrap().checkpoint = Some(state);
+                        }
+                        _ => return Err(failure("invalid initial worker snapshot")),
+                    }
+                }
                 Ok(process)
             }
-            _ => Err("incompatible worker protocol".into()),
+            _ => Err(failure("incompatible worker protocol")),
         }
+    }
+
+    async fn exited(&mut self, after_ack: bool) -> AppError {
+        // EOF normally precedes exit notification very briefly. Bound the wait
+        // so a peer that only closes stdout cannot stall fault reporting.
+        let exit_code = timeout(Duration::from_millis(100), self._child.wait())
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .and_then(|status| status.code());
+        Box::new(WorkerFailure {
+            message: if after_ack {
+                "worker exited after ACK"
+            } else {
+                "worker exited"
+            },
+            exit_code,
+        })
     }
 
     async fn request(&mut self, request: &Request) -> Result<Response, AppError> {
         if self.broken {
-            return Err("worker is unavailable".into());
+            return Err(failure("worker is unavailable"));
         }
         let sequenced;
         let request = if let Request::ReadyEvent { bot_name } = request
-            && self
-                .supported_capabilities
-                .iter()
-                .any(|cap| cap == EVENT_SEQ_CAPABILITY)
+            && self.supports(EVENT_SEQ_CAPABILITY)
         {
             let sequence = self
+                .transfer
+                .lock()
+                .unwrap()
                 .events
                 .enqueue(
                     serde_json::to_vec(request)?,
                     crate::event_seq::Priority::Required,
                 )
-                .map_err(|rejected| {
-                    eprintln!("worker event buffer rejected: {:?}", rejected.reason);
-                    "worker event buffer full or event too large"
-                })?;
+                .map_err(|_| failure("worker event buffer full or event too large"))?;
             sequenced = Request::SequencedReady {
                 local_sequence: sequence,
                 bot_name: bot_name.clone(),
@@ -410,52 +528,74 @@ impl Process {
             Request::SequencedReady { local_sequence, .. } => Some(*local_sequence),
             _ => None,
         };
-        // Poison before the first await. If the caller cancels an in-flight
-        // exchange, leftover frames must never be read as a later response.
+        // Poison before awaiting: cancellation must never reuse a leftover frame.
         self.broken = true;
-        let result = timeout(DEADLINE, async {
+        let deadline = if request.application() {
+            APPLICATION_DEADLINE
+        } else {
+            DEADLINE
+        };
+        let result = timeout(deadline, async {
             let mut data = serde_json::to_vec(request)?;
             data.push(b'\n');
             if data.len() > MAX_FRAME_BYTES as usize {
-                return Err("worker request exceeds frame limit".into());
+                return Err(failure("worker request exceeds frame limit"));
             }
-            self.input.write_all(&data).await?;
-            self.input.flush().await?;
-            let frame = read_frame(&mut self.output).await?.ok_or("worker exited")?;
+            timeout(DEADLINE, async {
+                self.input.write_all(&data).await?;
+                self.input.flush().await
+            })
+            .await
+            .map_err(|_| failure("worker write timed out"))??;
+            let frame = if expected_ack.is_some() {
+                timeout(DEADLINE, read_frame(&mut self.output))
+                    .await
+                    .map_err(|_| failure("worker event ACK timed out"))??
+            } else {
+                read_frame(&mut self.output).await?
+            };
+            let Some(frame) = frame else {
+                return Err(self.exited(false).await);
+            };
             if let Some(expected) = expected_ack {
                 match serde_json::from_slice::<Response>(&frame)
-                    .map_err(|_| "invalid worker response")?
+                    .map_err(|_| failure("invalid worker response"))?
                 {
                     Response::EventAccepted { local_sequence } if local_sequence == expected => {
-                        self.events
+                        self.transfer
+                            .lock()
+                            .unwrap()
+                            .events
                             .ack(crate::event_seq::EventAccepted(
                                 crate::event_seq::SequenceRange {
                                     first: expected,
                                     last: expected,
                                 },
                             ))
-                            .map_err(|_| "invalid worker event ACK")?;
+                            .map_err(|_| failure("invalid worker event ACK"))?;
                     }
-                    _ => return Err("missing or invalid worker event ACK".into()),
+                    _ => return Err(failure("missing or invalid worker event ACK")),
                 }
-                let frame = read_frame(&mut self.output)
-                    .await?
-                    .ok_or("worker exited after ACK")?;
-                return Ok(serde_json::from_slice(&frame).map_err(|_| "invalid worker response")?);
+                let Some(frame) = read_frame(&mut self.output).await? else {
+                    return Err(self.exited(true).await);
+                };
+                return serde_json::from_slice(&frame)
+                    .map_err(|_| failure("invalid worker response"));
             }
-            Ok(serde_json::from_slice(&frame).map_err(|_| "invalid worker response")?)
+            serde_json::from_slice(&frame).map_err(|_| failure("invalid worker response"))
         })
         .await
-        .map_err(|_| -> AppError { "worker timed out".into() })
+        .map_err(|_| failure("worker timed out"))
         .and_then(|result| result);
         if result.is_ok() {
             self.broken = false;
         }
-        if result.is_err() && self.events.retained_len() != 0 {
+        let transfer = self.transfer.lock().unwrap();
+        if result.is_err() && transfer.events.retained_len() != 0 {
             eprintln!(
                 "worker event ACK missing: unacked={:?}, retained_bytes={}",
-                self.events.unacked_ranges(),
-                self.events.retained_bytes()
+                transfer.events.unacked_ranges(),
+                transfer.events.retained_bytes()
             );
         }
         result
@@ -467,16 +607,39 @@ impl Process {
             .any(|cap| cap == capability)
     }
 
-    /// Candidate-only transaction: keep the previous buffer until installation.
-    /// Both process locks/routing must be held by the caller throughout handoff.
-    async fn inherit_events(&mut self, previous: &Self) -> Result<(), AppError> {
+    async fn restore(&mut self, version: u32, state: serde_json::Value) -> Result<(), AppError> {
+        match self
+            .request(&Request::Restore {
+                version,
+                state: state.clone(),
+            })
+            .await?
+        {
+            Response::Restored => self.transfer.lock().unwrap().checkpoint = Some(state),
+            Response::Rejected { .. } => {
+                return Err(failure("worker state restore rejected: [REDACTED]"));
+            }
+            _ => return Err(failure("worker state restore not confirmed")),
+        }
+        Ok(())
+    }
+
+    /// Install a stable copy while the old generation's state/ACK barrier is held.
+    async fn inherit_events(
+        &mut self,
+        previous: &TransferState,
+        capabilities: &[String],
+    ) -> Result<(), AppError> {
         let compatible = self.supports(EVENT_SEQ_CAPABILITY)
-            && previous.supports(EVENT_SEQ_CAPABILITY)
             && self.supports(EVENT_REPLAY_CAPABILITY)
-            && previous.supports(EVENT_REPLAY_CAPABILITY);
+            && [EVENT_SEQ_CAPABILITY, EVENT_REPLAY_CAPABILITY]
+                .iter()
+                .all(|cap| capabilities.iter().any(|value| value == cap));
         if !compatible {
             if previous.events.retained_len() != 0 {
-                return Err("unacknowledged events require negotiated replay support".into());
+                return Err(failure(
+                    "unacknowledged events require negotiated replay support",
+                ));
             }
             return Ok(());
         }
@@ -487,15 +650,13 @@ impl Process {
             .await?
         {
             Response::EventStreamRestored => {}
-            _ => return Err("worker event stream restore rejected".into()),
+            _ => return Err(failure("worker event stream restore rejected")),
         }
-        self.events = previous.events.clone();
-        // Clone at most the configured bounded buffer, without borrowing across
-        // request() which consumes ACKs. Replay never assigns a new sequence.
-        let pending: Vec<_> = self.events.replay().cloned().collect();
+        self.transfer.lock().unwrap().events = previous.events.clone();
+        let pending: Vec<_> = previous.events.replay().cloned().collect();
         for event in pending {
             let Request::ReadyEvent { bot_name } = serde_json::from_slice(&event.payload)? else {
-                return Err("invalid retained worker event".into());
+                return Err(failure("invalid retained worker event"));
             };
             match self
                 .request(&Request::SequencedReady {
@@ -504,40 +665,85 @@ impl Process {
                 })
                 .await?
             {
-                Response::Result { state, .. } => self.checkpoint = Some(state),
-                Response::Rejected { .. } => return Err("replayed worker event rejected".into()),
-                _ => return Err("unexpected replay response".into()),
+                Response::Result { state, .. } => {
+                    self.transfer.lock().unwrap().checkpoint = Some(state)
+                }
+                Response::Rejected { .. } => return Err(failure("replayed worker event rejected")),
+                _ => return Err(failure("unexpected replay response")),
             }
         }
         Ok(())
     }
 }
 
-// A cancelled replacement must never leave admission permanently closed.
-struct ResumeResponseDrain(ResponseDrain);
-impl Drop for ResumeResponseDrain {
-    fn drop(&mut self) {
-        self.0.resume();
+// A generation stays alive through both IPC work and its external response.
+struct Generation {
+    path: PathBuf,
+    process: Mutex<Process>,
+    transfer: Arc<StdMutex<TransferState>>,
+    build: String,
+    pid: u32,
+    capabilities: Vec<String>,
+    state_barrier: Arc<RwLock<()>>,
+    work: Arc<RwLock<()>>,
+    responses: ResponseDrain,
+}
+impl Generation {
+    fn new(path: PathBuf, process: Process) -> Arc<Self> {
+        Arc::new(Self {
+            path,
+            transfer: process.transfer.clone(),
+            build: process.build.clone(),
+            pid: process.pid,
+            capabilities: process.supported_capabilities.clone(),
+            process: Mutex::new(process),
+            state_barrier: Arc::new(RwLock::new(())),
+            work: Arc::new(RwLock::new(())),
+            responses: ResponseDrain::new(1024),
+        })
+    }
+    fn needs_barrier(&self, request: &Request) -> bool {
+        request.state_barrier()
+            || !self
+                .capabilities
+                .iter()
+                .any(|cap| cap == CONCURRENT_DRAIN_CAPABILITY)
     }
 }
-
-struct Active {
-    path: PathBuf,
-    process: Arc<Mutex<Process>>,
+struct Admission {
+    generation: Arc<Generation>,
+    _work: OwnedRwLockReadGuard<()>,
+    _state: Option<OwnedRwLockReadGuard<()>>,
+}
+struct RegisteredGeneration {
+    index: usize,
+    generation: Arc<Generation>,
+    retired: bool,
+}
+#[derive(Default)]
+struct ManagementRecord {
+    file: Option<PathBuf>,
+    revision: u64,
 }
 pub struct Manager {
     deployment: DeploymentIdentity,
-    workers: Vec<RwLock<Active>>,
+    workers: Vec<RwLock<Arc<Generation>>>,
+    generations: StdMutex<Vec<RegisteredGeneration>>,
     update: Mutex<()>,
     replace_lock: Mutex<()>,
-    response_gates: Vec<Arc<RwLock<()>>>,
-    responses: Vec<ResponseDrain>,
+    management: Mutex<ManagementRecord>,
     instance_id: String,
 }
 
-/// Holds a worker generation until its external response has completed.
+/// Reserve before dispatch and keep until the external outcome is known. Use
+/// dispatch_*_with_response to bind execution to this exact generation.
+#[must_use]
 pub struct ResponseGuard {
-    _gate: OwnedRwLockReadGuard<()>,
+    generation: Arc<Generation>,
+    index: usize,
+    instance_id: String,
+    _work: OwnedRwLockReadGuard<()>,
+    dispatched: bool,
     operation: ResponseOperation,
 }
 impl ResponseGuard {
@@ -550,13 +756,12 @@ impl Manager {
     pub async fn describe_workers(&self) -> String {
         let mut lines = vec!["稼働中のWorker:".to_string()];
         for (index, worker) in self.workers.iter().enumerate() {
-            let active = worker.read().await;
-            let process = active.process.lock().await;
+            let generation = worker.read().await;
             lines.push(format!(
                 "{}: {} / PID: {}",
                 index + 1,
-                redact(&process.build),
-                process.pid
+                redact(&generation.build),
+                generation.pid
             ));
         }
         lines.join("\n")
@@ -573,15 +778,19 @@ impl Manager {
         deployment: DeploymentIdentity,
     ) -> Result<Arc<Self>, AppError> {
         if count == 0 {
-            return Err("Worker数は1以上にしてください".into());
+            return Err(failure("Worker数は1以上にしてください"));
         }
         let mut workers = Vec::with_capacity(count);
-        for _ in 0..count {
+        let mut generations = Vec::with_capacity(count);
+        for index in 0..count {
             let process = Process::start(&path, &deployment).await?;
-            workers.push(RwLock::new(Active {
-                path: path.clone(),
-                process: Arc::new(Mutex::new(process)),
-            }));
+            let generation = Generation::new(path.clone(), process);
+            generations.push(RegisteredGeneration {
+                index,
+                generation: generation.clone(),
+                retired: false,
+            });
+            workers.push(RwLock::new(generation));
         }
         let mut instance = [0u8; 16];
         getrandom::fill(&mut instance)?;
@@ -590,81 +799,169 @@ impl Manager {
             deployment,
             workers,
             instance_id,
+            generations: StdMutex::new(generations),
             update: Mutex::new(()),
             replace_lock: Mutex::new(()),
-            response_gates: (0..count).map(|_| Arc::new(RwLock::new(()))).collect(),
-            responses: (0..count).map(|_| ResponseDrain::new(1024)).collect(),
+            management: Mutex::new(ManagementRecord::default()),
         }))
     }
+
+    fn install(&self, index: usize, active: &mut Arc<Generation>, next: Arc<Generation>) {
+        // No await between closing admission, registration and routing commit.
+        active.responses.start_drain();
+        let mut generations = self.generations.lock().unwrap();
+        for entry in generations.iter_mut() {
+            if Arc::ptr_eq(&entry.generation, active) {
+                entry.retired = true;
+            }
+        }
+        generations.push(RegisteredGeneration {
+            index,
+            generation: next.clone(),
+            retired: false,
+        });
+        *active = next;
+    }
+
+    fn reap_retired(&self) {
+        self.generations.lock().unwrap().retain(|entry| {
+            if !entry.retired {
+                return true;
+            }
+            let Ok(_work) = entry.generation.work.try_write() else {
+                return true;
+            };
+            !entry.generation.responses.unknown_ids().is_empty()
+        });
+    }
+
+    async fn retire_previous(&self, index: usize) -> Result<(), AppError> {
+        let retired: Vec<_> = self
+            .generations
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry.index == index && entry.retired)
+            .map(|entry| entry.generation.clone())
+            .collect();
+        for generation in retired {
+            // This also waits for external response guards. Cancellation leaves
+            // the registered generation available for later drain/reconciliation.
+            let _work = timeout(DRAIN_DEADLINE, generation.work.write())
+                .await
+                .map_err(|_| failure("worker drain timed out; previous generation retained"))?;
+            if !generation.responses.wait_settled().await.is_empty() {
+                return Err(failure(
+                    "unresolved response outcomes prevent worker update",
+                ));
+            }
+            self.generations
+                .lock()
+                .unwrap()
+                .retain(|entry| !Arc::ptr_eq(&entry.generation, &generation));
+        }
+        Ok(())
+    }
+
     pub async fn replace(&self, path: PathBuf, force: bool) -> Result<(), AppError> {
-        // Serialize complete update attempts, but do not hold the recovery mutex while
-        // waiting for a response gate. Each worker drains independently.
         let _replacement = self.replace_lock.lock().await;
         for (index, worker) in self.workers.iter().enumerate() {
+            self.retire_previous(index).await?;
             if !force && worker.read().await.path == path {
                 continue;
             }
-            let _gate = self.response_gates[index].write().await;
-            let tracker = &self.responses[index];
-            tracker.start_drain();
-            let resume = ResumeResponseDrain(tracker.clone());
-            let unknown = tracker.wait_settled().await;
-            drop(resume);
-            if !unknown.is_empty() {
-                return Err("unresolved response outcomes prevent worker update".into());
-            }
-            let _guard = self.update.lock().await;
-            if !force && worker.read().await.path == path {
-                continue;
-            }
-            let mut process = Process::start(&path, &self.deployment).await?;
-            // Exclusive lock drains accepted requests and queues new ones during migration.
-            let mut active = worker.write().await;
-            let mut previous = active.process.lock().await;
-            let snapshot = if previous.broken {
-                // Same recovery boundary as automatic restart: only confirmed
-                // snapshots survive. Unconfirmed application effects are unknown.
-                Response::Snapshot {
-                    version: STATE_VERSION,
-                    state: previous
-                        .checkpoint
-                        .clone()
-                        .unwrap_or(serde_json::to_value(crate::cogs::State::default())?),
-                }
-            } else {
-                previous.request(&Request::Snapshot).await?
-            };
-            let (version, state) = match snapshot {
-                Response::Snapshot { version, state } => (version, state),
-                _ => return Err("旧Workerから状態を取得できません".into()),
-            };
-            match process
-                .request(&Request::Restore {
-                    version,
-                    state: state.clone(),
-                })
-                .await?
+            if self
+                .unknown_responses()
+                .1
+                .iter()
+                .any(|(slot, _)| *slot == index)
             {
-                Response::Restored => {}
-                Response::Rejected { reason } => {
-                    return Err(
-                        format!("状態の引き継ぎを拒否しました: {}", Secret::new(reason)).into(),
-                    );
-                }
-                _ => return Err("新Workerが状態の引き継ぎを確認できません".into()),
+                return Err(failure(
+                    "unresolved response outcomes prevent worker update",
+                ));
             }
-            process.checkpoint = Some(state);
-            process.inherit_events(&previous).await?;
-            drop(previous);
-            *active = Active {
-                path: path.clone(),
-                process: Arc::new(Mutex::new(process)),
+            // Readiness failures must not stop old admission.
+            let mut candidate = Process::start(&path, &self.deployment).await?;
+            let recovery = self.update.lock().await;
+            // Recovery can install a generation while the candidate is starting.
+            // Recheck under the recovery lock before allocating another retained
+            // generation or bypassing an old unknown external outcome.
+            self.reap_retired();
+            if self
+                .unknown_responses()
+                .1
+                .iter()
+                .any(|(slot, _)| *slot == index)
+            {
+                return Err(failure(
+                    "unresolved response outcomes prevent worker update",
+                ));
+            }
+            if self
+                .generations
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.index == index && entry.retired)
+            {
+                return Err(failure("previous worker generation is still draining"));
+            }
+            let previous = worker.read().await.clone();
+            let state_boundary = timeout(DRAIN_DEADLINE, previous.state_barrier.write())
+                .await
+                .map_err(|_| failure("worker state handoff timed out"))?;
+            let mut active = worker.write().await;
+            if !force && active.path == path {
+                continue;
+            }
+            if !previous.responses.unknown_ids().is_empty() {
+                return Err(failure(
+                    "unresolved response outcomes prevent worker update",
+                ));
+            }
+            let transfer = if previous
+                .capabilities
+                .iter()
+                .any(|cap| cap == CONCURRENT_DRAIN_CAPABILITY)
+            {
+                // snapshot-v3 mutations and event cursor changes are quiescent;
+                // independent in-flight handlers may continue on the old pipe.
+                previous.transfer.lock().unwrap().clone()
+            } else {
+                let mut process = previous.process.lock().await;
+                if !process.broken {
+                    match process.request(&Request::Snapshot).await? {
+                        Response::Snapshot {
+                            version: STATE_VERSION,
+                            state,
+                        } => {
+                            process.transfer.lock().unwrap().checkpoint = Some(state);
+                        }
+                        _ => return Err(failure("invalid worker snapshot")),
+                    }
+                }
+                process.transfer.lock().unwrap().clone()
             };
+            let state = transfer
+                .checkpoint
+                .clone()
+                .unwrap_or(serde_json::to_value(crate::cogs::State::default())?);
+            candidate.restore(STATE_VERSION, state).await?;
+            candidate
+                .inherit_events(&transfer, &previous.capabilities)
+                .await?;
+            self.install(index, &mut active, Generation::new(path.clone(), candidate));
+            drop(state_boundary);
+            drop(active);
+            drop(recovery);
             println!(
                 "Worker {}/{} を切り替えました",
                 index + 1,
                 self.workers.len()
             );
+            // Routing is already v2. Success means the old generation really
+            // drained; unknown outcomes retain it and are returned as an error.
+            self.retire_previous(index).await?;
         }
         Ok(())
     }
@@ -672,14 +969,18 @@ impl Manager {
     /// This API is intended for a future authenticated local management channel.
     pub fn unknown_responses(&self) -> (String, Vec<(usize, u64)>) {
         let ids = self
-            .responses
+            .generations
+            .lock()
+            .unwrap()
             .iter()
-            .enumerate()
-            .flat_map(|(worker, tracker)| {
-                tracker
+            .flat_map(|entry| {
+                entry
+                    .generation
+                    .responses
                     .unknown_ids()
                     .into_iter()
-                    .map(move |id| (worker, id))
+                    .map(|id| (entry.index, id))
+                    .collect::<Vec<_>>()
             })
             .collect();
         (self.instance_id.clone(), ids)
@@ -696,30 +997,96 @@ impl Manager {
         evidence: &str,
     ) -> Result<(), AppError> {
         if instance_id != self.instance_id {
-            return Err("response instance mismatch".into());
+            return Err(failure("response instance mismatch"));
         }
         if evidence.trim().is_empty() {
-            return Err("reconciliation evidence is required".into());
+            return Err(failure("reconciliation evidence is required"));
         }
-        let tracker = self.responses.get(worker).ok_or("invalid worker index")?;
-        if !tracker.resolve_unknown(id) {
-            return Err("unknown response does not exist".into());
+        if worker >= self.workers.len() {
+            return Err(failure("invalid worker index"));
+        }
+        if !self
+            .generations
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.index == worker && entry.generation.responses.resolve_unknown(id))
+        {
+            return Err(failure("unknown response does not exist"));
         }
         Ok(())
     }
 
     /// Acquire before dispatch, retain through the external response, and confirm
     /// only after a definite outcome. Dropping leaves an unresolved result.
+    /// Use dispatch_*_with_response for generation attribution. If routing changes
+    /// between this reservation and dispatch, it is rejected without sending work.
     pub async fn begin_response(&self, key: u64) -> Result<ResponseGuard, AppError> {
-        let index = ((key ^ (key >> 22)) % self.workers.len() as u64) as usize;
-        let gate = self.response_gates[index].clone().read_owned().await;
-        let operation = self.responses[index]
+        let index = self.worker_index(key);
+        let active = self.workers[index].read().await;
+        let generation = active.clone();
+        let work = generation.work.clone().read_owned().await;
+        let operation = generation
+            .responses
             .begin()
-            .map_err(|error| format!("response tracking unavailable: {error:?}"))?;
+            .map_err(|_| failure("response tracking unavailable"))?;
         Ok(ResponseGuard {
-            _gate: gate,
+            generation,
+            index,
+            instance_id: self.instance_id.clone(),
+            _work: work,
+            dispatched: false,
             operation,
         })
+    }
+    fn worker_index(&self, key: u64) -> usize {
+        ((key ^ (key >> 22)) % self.workers.len() as u64) as usize
+    }
+    pub async fn dispatch_key_with_response(
+        &self,
+        response: &mut ResponseGuard,
+        key: u64,
+        content: String,
+    ) -> Result<Option<String>, AppError> {
+        self.execute_with_response(response, key, Request::Dispatch { key, content })
+            .await
+    }
+    pub async fn dispatch_slash_with_response(
+        &self,
+        response: &mut ResponseGuard,
+        key: u64,
+        name: String,
+        args: Vec<(String, bot_framework::arguments::SlashValue)>,
+    ) -> Result<Option<String>, AppError> {
+        let request = if args.is_empty() {
+            Request::Command { name }
+        } else {
+            Request::SlashCommand { name, args }
+        };
+        self.execute_with_response(response, key, request).await
+    }
+    async fn execute_with_response(
+        &self,
+        response: &mut ResponseGuard,
+        key: u64,
+        request: Request,
+    ) -> Result<Option<String>, AppError> {
+        if response.instance_id != self.instance_id || response.index != self.worker_index(key) {
+            return Err(failure("response generation mismatch"));
+        }
+        if response.dispatched {
+            return Err(failure("response dispatch already used"));
+        }
+        let admission = self
+            .admit(response.index, Some(&response.generation), &request)
+            .await?;
+        response.dispatched = true;
+        let generation = admission.generation.clone();
+        let result = Self::exchange(&generation, request).await;
+        drop(admission);
+        self.recover_if_broken(response.index, generation, &result)
+            .await;
+        result
     }
     pub async fn dispatch(&self, content: String) -> Result<Option<String>, AppError> {
         self.dispatch_key(0, content).await
@@ -778,97 +1145,210 @@ impl Manager {
                         eprintln!(
                             "Worker {} の仕事を進められません: {}",
                             index + 1,
-                            Secret::new(error)
+                            diagnostic(error.as_ref())
                         );
                     }
                 }
             });
         }
     }
-    async fn execute(&self, index: usize, request: Request) -> Result<Option<String>, AppError> {
-        let worker = &self.workers[index];
-        let active = worker.read().await;
-        let process = active.process.clone();
-        let mut guard = process.lock().await;
-        if matches!(request, Request::Command { .. })
-            && !guard
-                .supported_capabilities
-                .iter()
-                .any(|cap| cap == "command-dispatch-v1")
-        {
-            return Err("worker does not support command dispatch".into());
-        }
-        if matches!(request, Request::SlashCommand { .. })
-            && !guard
-                .supported_capabilities
-                .iter()
-                .any(|cap| cap == "slash-arguments-v1")
-        {
-            return Err("worker does not support slash arguments".into());
-        }
-        if matches!(request, Request::ReadyEvent { .. })
-            && !guard
-                .supported_capabilities
-                .iter()
-                .any(|cap| cap == "ready-event-v1")
-        {
-            return Err("worker does not support ready events".into());
-        }
-        let result = guard.request(&request).await;
-        if let Ok(Response::Result { state, .. }) = &result {
-            guard.checkpoint = Some(state.clone());
-        }
-        drop(guard);
-        drop(active);
-        let result = match result {
-            Ok(Response::Rejected { reason }) => {
-                return Err(format!("worker rejected request: {}", Secret::new(reason)).into());
-            }
-            Ok(Response::Result { content, .. }) => Ok(content),
-            Ok(_) => Err("unexpected worker response".into()),
-            Err(error) => Err(error),
-        };
-        if result.is_err() {
-            let _guard = self.update.lock().await;
-            let mut active = worker.write().await;
-            if Arc::ptr_eq(&active.process, &process) {
-                let path = active.path.clone();
-                let previous = active.process.lock().await;
-                match Process::start(&path, &self.deployment).await {
-                    Ok(mut new_process) => {
-                        if let Some(state) = previous.checkpoint.clone() {
-                            match new_process
-                                .request(&Request::Restore {
-                                    version: STATE_VERSION,
-                                    state: state.clone(),
-                                })
-                                .await
-                            {
-                                Ok(Response::Restored) => new_process.checkpoint = Some(state),
-                                _ => {
-                                    eprintln!("Workerの状態を復旧できません");
-                                    return result;
-                                }
-                            }
-                        }
-                        if let Err(error) = new_process.inherit_events(&previous).await {
-                            eprintln!("Workerのイベントを復旧できません: {}", Secret::new(error));
-                            return result;
-                        }
-                        drop(previous);
-                        *active = Active {
-                            path,
-                            process: Arc::new(Mutex::new(new_process)),
-                        };
-                        eprintln!("Workerを再起動しました");
-                    }
-                    Err(error) => eprintln!("Workerの再起動に失敗しました: {}", Secret::new(error)),
+    async fn admit(
+        &self,
+        index: usize,
+        expected: Option<&Arc<Generation>>,
+        request: &Request,
+    ) -> Result<Admission, AppError> {
+        timeout(APPLICATION_DEADLINE, async {
+            loop {
+                let active = self.workers[index].read().await;
+                let generation = active.clone();
+                if expected.is_some_and(|expected| !Arc::ptr_eq(expected, &generation)) {
+                    return Err(failure("response generation is no longer active"));
                 }
+                let state = if generation.needs_barrier(request) {
+                    match generation.state_barrier.clone().try_read_owned() {
+                        Ok(guard) => Some(guard),
+                        Err(_) => {
+                            // Never await a state boundary while holding routing.
+                            // Retry admission on the current generation after the
+                            // pending switch, rather than queueing stale work.
+                            drop(active);
+                            drop(generation.state_barrier.read().await);
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
+                let work = generation.work.clone().read_owned().await;
+                return Ok(Admission {
+                    generation,
+                    _work: work,
+                    _state: state,
+                });
             }
-        }
+        })
+        .await
+        .map_err(|_| failure("worker admission timed out"))?
+    }
+
+    async fn execute(&self, index: usize, request: Request) -> Result<Option<String>, AppError> {
+        let admission = self.admit(index, None, &request).await?;
+        let generation = admission.generation.clone();
+        let result = Self::exchange(&generation, request).await;
+        drop(admission);
+        self.recover_if_broken(index, generation, &result).await;
         result
     }
+
+    async fn exchange(
+        generation: &Generation,
+        request: Request,
+    ) -> Result<Option<String>, AppError> {
+        // Per-generation IPC remains ordered; old and new have independent pipes.
+        let mut process = timeout(APPLICATION_DEADLINE, generation.process.lock())
+            .await
+            .map_err(|_| failure("worker admission timed out"))?;
+        let capability = match request {
+            Request::Command { .. } => Some("command-dispatch-v1"),
+            Request::SlashCommand { .. } => Some("slash-arguments-v1"),
+            Request::ReadyEvent { .. } => Some("ready-event-v1"),
+            _ => None,
+        };
+        if capability.is_some_and(|cap| !process.supports(cap)) {
+            return Err(failure("worker does not support requested capability"));
+        }
+        let result = process.request(&request).await;
+        match result {
+            Ok(Response::Result { content, state }) => {
+                let mut transfer = process.transfer.lock().unwrap();
+                if !generation.needs_barrier(&request)
+                    && transfer.checkpoint.as_ref() != Some(&state)
+                {
+                    drop(transfer);
+                    process.broken = true;
+                    return Err(failure("worker violated concurrent drain state contract"));
+                }
+                transfer.checkpoint = Some(state);
+                Ok(content)
+            }
+            Ok(Response::Rejected { reason }) => Err(failure(match reason.as_str() {
+                "command handler failed" => "worker rejected request: command handler failed",
+                "managed command failed" => "worker rejected request: managed command failed",
+                "state or response exceeds worker frame limit" => {
+                    "worker rejected request: state or response exceeds worker frame limit"
+                }
+                _ => "worker rejected request: [REDACTED]",
+            })),
+            Ok(_) => {
+                process.broken = true;
+                Err(failure("unexpected worker response"))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn recover_if_broken(
+        &self,
+        index: usize,
+        generation: Arc<Generation>,
+        result: &Result<Option<String>, AppError>,
+    ) {
+        let Err(error) = result else {
+            return;
+        };
+        if !generation.process.lock().await.broken {
+            return;
+        }
+        let _recovery = self.update.lock().await;
+        let mut active = self.workers[index].write().await;
+        self.reap_retired();
+        let recovery = if Arc::ptr_eq(&active, &generation) {
+            let transfer = generation.transfer.lock().unwrap().clone();
+            let restart = async {
+                if self
+                    .generations
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|entry| entry.index == index && entry.retired)
+                {
+                    return Err(failure("previous worker generation is still draining"));
+                }
+                let mut candidate = Process::start(&generation.path, &self.deployment).await?;
+                if let Some(state) = transfer.checkpoint.clone() {
+                    candidate.restore(STATE_VERSION, state).await?;
+                }
+                candidate
+                    .inherit_events(&transfer, &generation.capabilities)
+                    .await?;
+                Ok::<_, AppError>(candidate)
+            }
+            .await;
+            match restart {
+                Ok(candidate) => {
+                    self.install(
+                        index,
+                        &mut active,
+                        Generation::new(generation.path.clone(), candidate),
+                    );
+                    eprintln!("Workerを再起動しました");
+                    "restarted"
+                }
+                Err(restart_error) => {
+                    eprintln!(
+                        "Workerの再起動に失敗しました: {}",
+                        diagnostic(restart_error.as_ref())
+                    );
+                    "failed"
+                }
+            }
+        } else {
+            "superseded"
+        };
+        drop(active);
+        self.reap_retired();
+        self.record_failure(
+            &generation.path,
+            error.as_ref(),
+            "runtime",
+            Some((index, generation.pid, recovery)),
+        )
+        .await;
+    }
+
+    async fn record_failure(
+        &self,
+        path: &Path,
+        error: &(dyn std::error::Error + Send + Sync + 'static),
+        phase: &str,
+        runtime: Option<(usize, u32, &str)>,
+    ) {
+        let safe_error = diagnostic(error);
+        eprintln!("Worker failure ({phase}): {safe_error}");
+        let mut record = self.management.lock().await;
+        record.revision = record.revision.wrapping_add(1);
+        let Some(file) = &record.file else {
+            return;
+        };
+        // path is an exact-match management control field, never a log message.
+        let mut detail = serde_json::json!({"path": path.to_string_lossy(), "error": safe_error, "phase": phase});
+        if let Some(error) = error.downcast_ref::<WorkerFailure>() {
+            detail["exit_code"] = serde_json::json!(error.exit_code);
+        }
+        if let Some((index, pid, recovery)) = runtime {
+            detail["worker"] = serde_json::json!(index);
+            detail["pid"] = serde_json::json!(pid);
+            detail["outcome"] = serde_json::json!("unknown");
+            detail["recovery"] = serde_json::json!(recovery);
+        }
+        if let Err(error) = tokio::fs::write(error_file(file), detail.to_string()).await {
+            eprintln!("更新エラーを記録できません: {}", diagnostic(&error));
+        }
+    }
+
     pub async fn watch(self: Arc<Self>, file: PathBuf) {
+        self.management.lock().await.file = Some(file.clone());
         loop {
             tokio::time::sleep(Duration::from_secs(2)).await;
             match tokio::fs::read_to_string(&file).await {
@@ -878,39 +1358,43 @@ impl Manager {
                         eprintln!("Workerのパスは絶対パスにしてください");
                         continue;
                     }
-                    match self.replace(path.clone(), false).await {
+                    let revision = self.management.lock().await.revision;
+                    let mut changed = false;
+                    for worker in &self.workers {
+                        changed |= worker.read().await.path != path;
+                    }
+                    let result = if changed {
+                        self.replace(path.clone(), false).await
+                    } else {
+                        self.reap_retired();
+                        Ok(())
+                    };
+                    match result {
                         Ok(()) => {
+                            let record = self.management.lock().await;
                             if let Err(error) = tokio::fs::write(
                                 status_file(&file),
                                 path.to_string_lossy().as_bytes(),
                             )
                             .await
                             {
-                                eprintln!("Workerの状態を記録できません: {}", Secret::new(error));
+                                eprintln!("Workerの状態を記録できません: {}", diagnostic(&error));
                             }
-                            let _ = tokio::fs::remove_file(error_file(&file)).await;
+                            // A no-op poll is not a successful recovery/update.
+                            // Never erase a newer runtime fault racing this update.
+                            if changed && record.revision == revision {
+                                let _ = tokio::fs::remove_file(error_file(&file)).await;
+                            }
                         }
                         Err(error) => {
-                            let safe_error =
-                                redact(&format!("worker update failed: {}", Secret::new(error)));
-                            eprintln!("Workerの更新に失敗しました: {safe_error}");
-                            // path is an exact-match control field used by reload,
-                            // never a diagnostic; preserve its wire compatibility.
-                            let detail = serde_json::json!({"path": path.to_string_lossy(), "error": safe_error});
-                            if let Err(write_error) =
-                                tokio::fs::write(error_file(&file), detail.to_string()).await
-                            {
-                                eprintln!(
-                                    "更新エラーを記録できません: {}",
-                                    Secret::new(write_error)
-                                );
-                            }
+                            self.record_failure(&path, error.as_ref(), "update", None)
+                                .await
                         }
                     }
                 }
                 Ok(_) => eprintln!("Worker指定ファイルが空です"),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => eprintln!("Worker指定ファイルを読めません: {}", Secret::new(error)),
+                Err(error) => eprintln!("Worker指定ファイルを読めません: {}", diagnostic(&error)),
             }
         }
     }
@@ -943,12 +1427,12 @@ pub async fn run() -> Result<(), AppError> {
                 bot_name,
             } => {
                 if !sequenced_events {
-                    return Err("event sequencing was not negotiated".into());
+                    return Err(failure("event sequencing was not negotiated"));
                 }
                 // Serial execution slot: admit at most one event before processing.
                 receiver
                     .accept(local_sequence, true)
-                    .map_err(|_| "worker event gap or duplicate")?;
+                    .map_err(|_| failure("worker event gap or duplicate"))?;
                 event_stream_initialized = true;
                 let mut ack = serde_json::to_vec(&Response::EventAccepted { local_sequence })?;
                 ack.push(b'\n');
@@ -998,6 +1482,7 @@ pub async fn run() -> Result<(), AppError> {
                 protocol_max: Some(PROTOCOL),
                 required_capabilities: CAPABILITIES.iter().map(|s| (*s).to_owned()).collect(),
                 supported_capabilities: vec![
+                    CONCURRENT_DRAIN_CAPABILITY.into(),
                     EVENT_SEQ_CAPABILITY.into(),
                     EVENT_REPLAY_CAPABILITY.into(),
                     HELLO_CAPABILITY.into(),
@@ -1117,22 +1602,11 @@ mod frame_tests {
         state.counts.insert(1, 4);
         let previous = state.clone();
         state.counts.insert(1, 5);
-        let result = command_result(&mut state, previous, Err("secret error".into())).unwrap();
+        let result = command_result(&mut state, previous, Err(failure("secret error"))).unwrap();
         assert_eq!(state.counts.get(&1), Some(&4));
         assert!(
             matches!(result, Response::Rejected { reason } if reason == "command handler failed")
         );
-    }
-
-    #[test]
-    fn cancelled_response_drain_reopens_admission() {
-        let tracker = ResponseDrain::new(1);
-        tracker.start_drain();
-        {
-            let _resume = ResumeResponseDrain(tracker.clone());
-            assert!(tracker.begin().is_err());
-        }
-        tracker.begin().unwrap().confirm();
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use src::{AppError, redact::Secret, worker};
-use std::{env, ffi::OsStr, future::IntoFuture, process::ExitCode, sync::Arc};
+use std::{env, error::Error, ffi::OsStr, fmt, future::IntoFuture, process::ExitCode, sync::Arc};
 use tokio::sync::Semaphore;
 use twilight_gateway::{
     ConfigBuilder, Event, EventTypeFlags, Intents, Shard, ShardId, StreamExt as _,
@@ -63,33 +63,84 @@ where
 async fn single_shard_queue<F>(
     total_shards: u32,
     metadata: F,
-) -> Result<InMemoryQueue, &'static str>
+) -> Result<InMemoryQueue, StartupFailure>
 where
     F: std::future::Future<Output = Result<(u32, SessionStartLimit), ()>>,
 {
     let (recommended, limits) = tokio::time::timeout(std::time::Duration::from_secs(10), metadata)
         .await
-        .map_err(|_| "gateway metadata timed out")?
-        .map_err(|_| "gateway metadata unavailable")?;
+        .map_err(|_| StartupFailure::MetadataTimeout)?
+        .map_err(|_| StartupFailure::MetadataUnavailable)?;
     if recommended > total_shards {
-        return Err("configured shard count is below Discord recommendation");
+        return Err(StartupFailure::InsufficientShards);
     }
     let mut registry = src::identify::IdentifyRegistry::default();
     // A private key for the only bot in this process, not a Discord bot ID.
-    registry.register(std::num::NonZeroU64::MIN, &limits)
+    registry
+        .register(std::num::NonZeroU64::MIN, &limits)
+        .map_err(|_| StartupFailure::InvalidIdentifyLimits)
+}
+
+// Only typed diagnostics are public. These variants carry no environment values,
+// protocol input, HTTP bodies or credential-bearing paths.
+#[derive(Debug)]
+enum StartupFailure {
+    MissingToken,
+    NonUnicodeToken,
+    InvalidBootstrap,
+    MetadataTimeout,
+    MetadataUnavailable,
+    InsufficientShards,
+    InvalidIdentifyLimits,
+}
+
+impl fmt::Display for StartupFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::MissingToken => "DISCORD_TOKEN is not configured [token_missing]",
+            Self::NonUnicodeToken => "DISCORD_TOKEN is not Unicode [token_encoding]",
+            Self::InvalidBootstrap => "invalid management bootstrap [bootstrap_invalid]",
+            Self::MetadataTimeout => "gateway metadata timed out [metadata_timeout]",
+            Self::MetadataUnavailable => "gateway metadata unavailable [metadata_unavailable]",
+            Self::InsufficientShards => {
+                "configured shard count is below Discord recommendation [shards_insufficient]"
+            }
+            Self::InvalidIdentifyLimits => "invalid session start limits [identify_limits_invalid]",
+        })
+    }
+}
+
+impl Error for StartupFailure {}
+
+fn gateway_failure_code(kind: &twilight_gateway::error::ReceiveMessageErrorType) -> &'static str {
+    use twilight_gateway::error::ReceiveMessageErrorType;
+    match kind {
+        ReceiveMessageErrorType::Deserializing { .. } => "gateway_deserialization",
+        ReceiveMessageErrorType::Reconnect => "gateway_reconnect",
+        ReceiveMessageErrorType::Compression => "gateway_compression",
+        _ => "gateway_receive",
+    }
 }
 
 // External error text may contain short unlabelled credentials that heuristic
-// redaction cannot recognize. Never format that text at this output boundary.
-fn failure_message<T>(context: &'static str, error: T) -> String {
-    format!("{context}: {}", Secret::new(error))
+// redaction cannot recognize. Never format unknown Display, Debug or sources.
+fn failure_message(context: &'static str, error: &(dyn Error + 'static)) -> String {
+    let diagnostic = if let Some(error) = error.downcast_ref::<StartupFailure>() {
+        error.to_string()
+    } else if let Some(error) = error.downcast_ref::<twilight_gateway::error::ReceiveMessageError>()
+    {
+        format!("{}: [REDACTED]", gateway_failure_code(error.kind()))
+    } else {
+        worker::diagnostic(error)
+    };
+    format!("{context}: {diagnostic}")
 }
 
 fn token_from_env(value: Result<String, env::VarError>) -> Result<Secret<String>, AppError> {
     match value {
         Ok(value) => Ok(Secret::new(value)),
-        Err(env::VarError::NotPresent) => Err("DISCORD_TOKEN is not configured".into()),
-        Err(env::VarError::NotUnicode(_)) => Err("DISCORD_TOKEN is not Unicode".into()),
+        Err(env::VarError::NotPresent) => Err(StartupFailure::MissingToken.into()),
+        Err(env::VarError::NotUnicode(_)) => Err(StartupFailure::NonUnicodeToken.into()),
     }
 }
 
@@ -98,7 +149,7 @@ async fn main() -> ExitCode {
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("{}", failure_message("実行に失敗しました", error));
+            eprintln!("{}", failure_message("実行に失敗しました", error.as_ref()));
             ExitCode::FAILURE
         }
     }
@@ -112,7 +163,7 @@ async fn run() -> Result<(), AppError> {
         Some(
             src::local_control::read_bootstrap()
                 .await
-                .map_err(|_| "invalid management bootstrap")?,
+                .map_err(|_| StartupFailure::InvalidBootstrap)?,
         )
     } else {
         None
@@ -162,7 +213,7 @@ async fn run() -> Result<(), AppError> {
                     if let Err(error) = manager.dispatch_ready(bot_name).await {
                         eprintln!(
                             "{}",
-                            failure_message("Ready イベントを処理できません", error)
+                            failure_message("Ready イベントを処理できません", error.as_ref())
                         );
                     }
                 });
@@ -190,16 +241,23 @@ async fn run() -> Result<(), AppError> {
                         }
                         return;
                     }
-                    let response_guard =
+                    let mut response_guard =
                         match manager.begin_response(message.channel_id.get()).await {
                             Ok(guard) => guard,
                             Err(error) => {
-                                eprintln!("{}", failure_message("応答追跡を開始できません", error));
+                                eprintln!(
+                                    "{}",
+                                    failure_message("応答追跡を開始できません", error.as_ref())
+                                );
                                 return;
                             }
                         };
                     match manager
-                        .dispatch_key(message.channel_id.get(), message.content.clone())
+                        .dispatch_key_with_response(
+                            &mut response_guard,
+                            message.channel_id.get(),
+                            message.content.clone(),
+                        )
                         .await
                     {
                         Ok(Some(content)) => {
@@ -219,7 +277,7 @@ async fn run() -> Result<(), AppError> {
                         Ok(None) => response_guard.confirm(),
                         Err(error) => {
                             response_guard.confirm();
-                            eprintln!("{}", failure_message("Worker error", error));
+                            eprintln!("{}", failure_message("Worker error", error.as_ref()));
                         }
                     }
                 });
@@ -246,10 +304,13 @@ async fn run() -> Result<(), AppError> {
                 };
                 tokio::spawn(async move {
                     let _permit = permit;
-                    let response_guard = match manager.begin_response(key).await {
+                    let mut response_guard = match manager.begin_response(key).await {
                         Ok(guard) => guard,
                         Err(error) => {
-                            eprintln!("{}", failure_message("応答追跡を開始できません", error));
+                            eprintln!(
+                                "{}",
+                                failure_message("応答追跡を開始できません", error.as_ref())
+                            );
                             return;
                         }
                     };
@@ -261,6 +322,7 @@ async fn run() -> Result<(), AppError> {
                     );
                     let ack_http = http.clone();
                     let update_http = http.clone();
+                    let dispatch_guard = &mut response_guard;
                     let outcome = src::interaction_flow::run(
                         identity,
                         std::time::Duration::from_secs(2),
@@ -277,7 +339,10 @@ async fn run() -> Result<(), AppError> {
                                 .is_ok()
                         },
                         move || async move {
-                            match manager.dispatch_slash(key, input, args).await {
+                            match manager
+                                .dispatch_slash_with_response(dispatch_guard, key, input, args)
+                                .await
+                            {
                                 Ok(Some(message)) => message,
                                 Ok(None) => "コマンドの応答がありません".to_owned(),
                                 Err(_) => "コマンドを実行できませんでした".to_owned(),
@@ -300,7 +365,7 @@ async fn run() -> Result<(), AppError> {
                     }
                 });
             }
-            Err(error) => eprintln!("{}", failure_message("Gateway error", error)),
+            Err(error) => eprintln!("{}", failure_message("Gateway error", &error)),
             _ => {}
         }
     }
@@ -324,6 +389,11 @@ mod tests {
                 panic!("the log boundary must not inspect external Debug")
             }
         }
+        impl Error for UntrustedError {
+            fn source(&self) -> Option<&(dyn Error + 'static)> {
+                panic!("the log boundary must not inspect unknown sources")
+            }
+        }
         for context in [
             "実行に失敗しました",
             "Ready イベントを処理できません",
@@ -332,11 +402,13 @@ mod tests {
             "Gateway error",
         ] {
             assert_eq!(
-                failure_message(context, UntrustedError),
+                failure_message(context, &UntrustedError),
                 format!("{context}: [REDACTED]")
             );
-            assert!(
-                !failure_message(context, "short-private-value").contains("short-private-value")
+            let untrusted: AppError = "short-private-value".into();
+            assert_eq!(
+                failure_message(context, untrusted.as_ref()),
+                format!("{context}: [REDACTED]")
             );
         }
     }
@@ -350,12 +422,32 @@ mod tests {
             token_from_env(Err(env::VarError::NotPresent))
                 .unwrap_err()
                 .to_string(),
-            "DISCORD_TOKEN is not configured"
+            "DISCORD_TOKEN is not configured [token_missing]"
         );
         let error = token_from_env(Err(env::VarError::NotUnicode("short-private-value".into())))
             .unwrap_err();
-        assert_eq!(error.to_string(), "DISCORD_TOKEN is not Unicode");
+        assert_eq!(
+            error.to_string(),
+            "DISCORD_TOKEN is not Unicode [token_encoding]"
+        );
         assert!(!format!("{error:?}").contains("short-private-value"));
+    }
+
+    #[test]
+    fn gateway_diagnostics_exclude_untrusted_event_body() {
+        use twilight_gateway::error::ReceiveMessageErrorType;
+        let kind = ReceiveMessageErrorType::Deserializing {
+            event: "short-private-value token=fake-token".into(),
+        };
+        assert_eq!(gateway_failure_code(&kind), "gateway_deserialization");
+        assert_eq!(
+            gateway_failure_code(&ReceiveMessageErrorType::Reconnect),
+            "gateway_reconnect"
+        );
+        assert_eq!(
+            gateway_failure_code(&ReceiveMessageErrorType::Compression),
+            "gateway_compression"
+        );
     }
 
     #[tokio::test]
@@ -414,19 +506,20 @@ mod tests {
             reset_after: 10_000,
             total: 1,
         };
-        assert!(single_shard_queue(1, async { Err(()) }).await.is_err());
-        assert!(
-            single_shard_queue(1, async { Ok((2, valid.clone())) })
-                .await
-                .is_err()
-        );
+        assert!(matches!(
+            single_shard_queue(1, async { Err(()) }).await,
+            Err(StartupFailure::MetadataUnavailable)
+        ));
+        assert!(matches!(
+            single_shard_queue(1, async { Ok((2, valid.clone())) }).await,
+            Err(StartupFailure::InsufficientShards)
+        ));
         let mut invalid = valid.clone();
         invalid.max_concurrency = 0;
-        assert!(
-            single_shard_queue(1, async { Ok((1, invalid)) })
-                .await
-                .is_err()
-        );
+        assert!(matches!(
+            single_shard_queue(1, async { Ok((1, invalid)) }).await,
+            Err(StartupFailure::InvalidIdentifyLimits)
+        ));
         assert!(
             single_shard_queue(1, async { Ok((1, valid.clone())) })
                 .await
