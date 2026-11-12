@@ -1,5 +1,50 @@
 use src::worker::Manager;
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
+
+const WAIT_BUDGET: Duration = Duration::from_secs(30);
+
+fn directory(label: &str) -> PathBuf {
+    let executable = std::env::current_exe().unwrap();
+    let root = executable
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("update-tests");
+    std::fs::create_dir_all(&root).unwrap();
+    loop {
+        let path = root.join(format!(
+            "{label}-{}-{:016x}",
+            std::process::id(),
+            getrandom::u64().unwrap()
+        ));
+        match std::fs::create_dir(&path) {
+            Ok(()) => return path,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => panic!("create update scenario directory: {error}"),
+        }
+    }
+}
+
+async fn cleanup(directory: &Path) {
+    // The directory was exclusively created by this test. Windows can keep an
+    // executable locked briefly after child exit; wait for removal, not a sleep.
+    tokio::time::timeout(WAIT_BUDGET, async {
+        loop {
+            match std::fs::remove_dir_all(directory) {
+                Ok(()) => return,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+                Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
+            }
+        }
+    })
+    .await
+    .expect("update scenario directory remained locked after child shutdown");
+}
 
 #[tokio::test]
 async fn scheduler_advances_jobs_automatically() {
@@ -8,21 +53,35 @@ async fn scheduler_advances_jobs_automatically() {
         .unwrap();
     manager.start_jobs();
     manager.dispatch("!job start".into()).await.unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
-    let status = manager
-        .dispatch("!job status".into())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(status.starts_with("仕事実行中: 1ステップ"), "{status}");
+    tokio::time::timeout(WAIT_BUDGET, async {
+        loop {
+            let status = manager
+                .dispatch("!job status".into())
+                .await
+                .unwrap()
+                .unwrap();
+            let step = status
+                .strip_prefix("仕事実行中: ")
+                .and_then(|value| value.split_once("ステップ"))
+                .map(|(step, _)| step.parse::<u64>().unwrap())
+                .expect("job must remain running while the scheduler advances it");
+            // Scheduling may be delayed, or may advance multiple times before
+            // we run again. The contract is automatic progress, not exactly one
+            // tick in a wall-clock window.
+            if step >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("automatic job scheduler did not make progress");
+    manager.shutdown().await.unwrap();
 }
 
 #[tokio::test]
 async fn failed_candidate_records_its_error_and_keeps_serving() {
-    let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target-codex-verify")
-        .join(format!("worker-failure-{}", std::process::id()));
-    std::fs::create_dir_all(&directory).unwrap();
+    let directory = directory("worker-failure");
     let file = directory.join("worker-path.txt");
     let missing = directory.join("does-not-exist.exe");
     std::fs::write(&file, missing.to_string_lossy().as_bytes()).unwrap();
@@ -31,14 +90,20 @@ async fn failed_candidate_records_its_error_and_keeps_serving() {
         .unwrap();
     let task = tokio::spawn(manager.clone().watch(file.clone()));
     let error_path = src::worker::error_file(&file);
-    for _ in 0..50 {
-        if error_path.exists() {
-            break;
+    let value: serde_json::Value = tokio::time::timeout(WAIT_BUDGET, async {
+        loop {
+            // The watcher creates/truncates before writing JSON. Existence
+            // alone does not mean the record is complete yet.
+            if let Ok(bytes) = std::fs::read(&error_path)
+                && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
+            {
+                break value;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    let value: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(error_path).unwrap()).unwrap();
+    })
+    .await
+    .expect("candidate failure was not recorded as complete JSON");
     assert_eq!(value["path"].as_str(), missing.to_str());
     assert!(!value["error"].as_str().unwrap().is_empty());
     assert_eq!(
@@ -46,17 +111,17 @@ async fn failed_candidate_records_its_error_and_keeps_serving() {
         Some("Pong! 🦀")
     );
     task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    manager.shutdown().await.unwrap();
     drop(manager);
-    std::fs::remove_dir_all(directory).unwrap();
+    cleanup(&directory).await;
 }
 
 #[tokio::test]
 async fn switches_real_workers_and_retains_old_worker_on_failure() {
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_src"));
-    let directory =
-        std::env::temp_dir().join(format!("discord-rs-update-test-{}", std::process::id()));
-    std::fs::create_dir_all(&directory).unwrap();
-    let second = directory.join("worker-v2.exe");
+    let directory = directory("worker-switch");
+    let second = directory.join(format!("worker-v2{}", std::env::consts::EXE_SUFFIX));
     std::fs::copy(&binary, &second).unwrap();
     let manager = Manager::start(binary).await.unwrap();
     assert_eq!(
@@ -248,13 +313,7 @@ async fn switches_real_workers_and_retains_old_worker_on_failure() {
         Some("Pong! 🦀")
     );
     assert_eq!(manager.dispatch("hello".into()).await.unwrap(), None);
+    manager.shutdown().await.unwrap();
     drop(manager);
-    // On Windows the process may take a moment to exit after kill_on_drop.
-    for _ in 0..20 {
-        if std::fs::remove_dir_all(&directory).is_ok() {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    panic!("could not remove test directory");
+    cleanup(&directory).await;
 }

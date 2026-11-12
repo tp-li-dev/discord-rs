@@ -1,10 +1,23 @@
 use src::worker::Manager;
 use std::{path::PathBuf, time::Duration};
 
+const DEADLINE: Duration = Duration::from_secs(30);
+
+async fn wait_for_switch(manager: &Manager, before: &str) {
+    tokio::time::timeout(DEADLINE, async {
+        while manager.describe_workers().await == before {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("candidate did not become active while the old response remained pending");
+}
+
 #[tokio::test]
 async fn update_waits_for_external_response() {
     let path = PathBuf::from(env!("CARGO_BIN_EXE_src"));
     let manager = Manager::start_pool(path.clone(), 1).await.unwrap();
+    let before = manager.describe_workers().await;
     let guard = manager.begin_response(0).await.unwrap();
     assert_eq!(
         manager.dispatch("!ping".into()).await.unwrap().as_deref(),
@@ -14,10 +27,12 @@ async fn update_waits_for_external_response() {
         let manager = manager.clone();
         async move { manager.replace(path, true).await }
     });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Observe the actual generation transition before checking drain. A fixed
+    // sleep could pass with an update task that had not even been scheduled.
+    wait_for_switch(&manager, &before).await;
     assert!(!update.is_finished());
     guard.confirm();
-    tokio::time::timeout(Duration::from_secs(5), update)
+    tokio::time::timeout(DEADLINE, update)
         .await
         .unwrap()
         .unwrap()
@@ -45,14 +60,15 @@ async fn unknown_response_prevents_switch_but_does_not_stop_old_worker() {
 async fn other_workers_stay_available_while_one_worker_drains() {
     let path = PathBuf::from(env!("CARGO_BIN_EXE_src"));
     let manager = Manager::start_pool(path.clone(), 2).await.unwrap();
+    let before = manager.describe_workers().await;
     let first = manager.begin_response(0).await.unwrap();
     let update = tokio::spawn({
         let manager = manager.clone();
         async move { manager.replace(path, true).await }
     });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_for_switch(&manager, &before).await;
     assert!(!update.is_finished());
-    let other = tokio::time::timeout(Duration::from_secs(1), manager.begin_response(1))
+    let other = tokio::time::timeout(DEADLINE, manager.begin_response(1))
         .await
         .unwrap()
         .unwrap();
@@ -66,7 +82,7 @@ async fn other_workers_stay_available_while_one_worker_drains() {
     );
     other.confirm();
     first.confirm();
-    tokio::time::timeout(Duration::from_secs(5), update)
+    tokio::time::timeout(DEADLINE, update)
         .await
         .unwrap()
         .unwrap()

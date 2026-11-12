@@ -13,7 +13,9 @@ fn marker(suffix: &str) -> std::io::Result<PathBuf> {
 async fn five_second(ctx: Context<'_>) -> BotResult<()> {
     std::fs::write(marker(".started")?, b"started")?;
     let gate = marker(".release")?;
-    tokio::time::timeout(Duration::from_secs(15), async {
+    // Leave scheduling headroom beyond the harness's 15s activation watchdog,
+    // and keep gate + real work below the production 30s application deadline.
+    tokio::time::timeout(Duration::from_secs(20), async {
         while !gate.exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }

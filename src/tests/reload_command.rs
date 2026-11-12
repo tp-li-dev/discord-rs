@@ -1,12 +1,35 @@
 use src::worker::Manager;
 use std::{path::PathBuf, time::Duration};
 
+const BUILD_BUDGET: Duration = Duration::from_secs(600);
+const CLEANUP_BUDGET: Duration = Duration::from_secs(30);
+
+fn directory() -> PathBuf {
+    let executable = std::env::current_exe().unwrap();
+    let root = executable
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("reload-command-tests");
+    std::fs::create_dir_all(&root).unwrap();
+    loop {
+        let path = root.join(format!(
+            "reload-{}-{:016x}",
+            std::process::id(),
+            getrandom::u64().unwrap()
+        ));
+        match std::fs::create_dir(&path) {
+            Ok(()) => return path,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => panic!("create reload scenario directory: {error}"),
+        }
+    }
+}
+
 #[tokio::test]
 async fn reload_command_builds_and_switches_a_live_manager() {
-    let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target-codex-verify")
-        .join(format!("discord-reload-command-{}", std::process::id()));
-    std::fs::create_dir_all(&directory).unwrap();
+    let directory = directory();
     let file = directory.join("worker-path.txt");
     let manager = Manager::start(PathBuf::from(env!("CARGO_BIN_EXE_src")))
         .await
@@ -18,14 +41,20 @@ async fn reload_command_builds_and_switches_a_live_manager() {
     }
     let watcher = tokio::spawn(manager.clone().watch(file.clone()));
     let output = tokio::time::timeout(
-        Duration::from_secs(240),
+        // This includes a potentially cold release build under CPU load. It is
+        // a watchdog, not the runtime's hot-swap latency requirement.
+        BUILD_BUDGET,
         tokio::process::Command::new(env!("CARGO_BIN_EXE_reload"))
             .arg("general")
             .env("DISCORD_WORKER_FILE", &file)
+            .env("CARGO_NET_OFFLINE", "true")
+            .env("CARGO_TERM_COLOR", "never")
+            .env_remove("DISCORD_TOKEN")
+            .kill_on_drop(true)
             .output(),
     )
     .await
-    .unwrap()
+    .expect("reload build/switch exceeded its 600-second cold-build watchdog")
     .unwrap();
     assert!(
         output.status.success(),
@@ -79,12 +108,28 @@ async fn reload_command_builds_and_switches_a_live_manager() {
     );
     let worker = PathBuf::from(std::fs::read_to_string(&file).unwrap());
     watcher.abort();
+    assert!(watcher.await.unwrap_err().is_cancelled());
+    manager.shutdown().await.unwrap();
     drop(manager);
-    for _ in 0..40 {
-        if std::fs::remove_file(&worker).is_ok() {
-            break;
+    let workers = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("workers");
+    assert_eq!(worker.parent(), Some(workers.as_path()));
+    tokio::time::timeout(CLEANUP_BUDGET, async {
+        loop {
+            match std::fs::remove_file(&worker) {
+                Ok(()) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
+            }
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    std::fs::remove_dir_all(directory).unwrap();
+        // Only this test's exclusively created directory is removed.
+        loop {
+            match std::fs::remove_dir_all(&directory) {
+                Ok(()) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
+            }
+        }
+    })
+    .await
+    .expect("reload artifacts remained locked after watcher and worker shutdown");
 }

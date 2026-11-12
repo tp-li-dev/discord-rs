@@ -16,10 +16,10 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
-    time::{sleep, timeout},
+    time::timeout,
 };
 
-const DEADLINE: Duration = Duration::from_secs(3);
+const DEADLINE: Duration = Duration::from_secs(30);
 const REST: &[u8] =
     b"POST /api/v10/channels/1/messages HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}";
 const INTERACTION: &[u8] = b"POST /api/v10/interactions/1/fixture/callback HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\n\r\n{\"type\":5}";
@@ -281,25 +281,19 @@ async fn latency_wait_survives_cancellation_without_resampling() {
     )
     .unwrap();
     let mut byte = [0; 1];
-    assert!(
-        timeout(Duration::from_millis(5), stream.read(&mut byte))
-            .await
-            .is_err()
-    );
+    // Poll and cancel directly. Waiting for a shorter timer allows scheduler
+    // stalls to expire both timers before Tokio can inspect either one.
+    assert!(poll_once(stream.read(&mut byte)).is_pending());
     let first = stream.stats();
     assert_eq!(first.read_delay_samples, 1);
-    assert!(
-        timeout(Duration::from_millis(5), stream.read(&mut byte))
-            .await
-            .is_err()
-    );
+    let next = poll_once(stream.read(&mut byte));
     assert_eq!(stream.stats().read_delay_samples, 1);
     assert_eq!(stream.stats().read_jitter_nanos, first.read_jitter_nanos);
-    sleep(Duration::from_millis(160)).await;
-    assert!(matches!(
-        poll_once(stream.read(&mut byte)),
-        Poll::Ready(Ok(1))
-    ));
+    let read = match next {
+        Poll::Ready(read) => read,
+        Poll::Pending => timeout(DEADLINE, stream.read(&mut byte)).await.unwrap(),
+    };
+    assert_eq!(read.unwrap(), 1);
     assert_eq!(byte, [b'x']);
     assert_eq!(stream.stats().read_delay_samples, 1);
 }
@@ -372,13 +366,8 @@ async fn bandwidth_caps_burst_then_paces_subsequent_writes() {
     )
     .unwrap();
     assert_eq!(stream.write(b"abcdef").await.unwrap(), 2);
-    assert!(
-        timeout(Duration::from_millis(10), stream.write(b"cdef"))
-            .await
-            .is_err()
-    );
+    assert!(poll_once(stream.write(b"cdef")).is_pending());
     assert_eq!(stream.stats().write_bytes, 2);
-    sleep(Duration::from_millis(150)).await;
     assert_eq!(
         timeout(DEADLINE, stream.write(b"cdef"))
             .await
@@ -407,13 +396,14 @@ async fn bandwidth_caps_and_paces_reads_too() {
     let mut bytes = [0; 8];
     assert_eq!(stream.read(&mut bytes).await.unwrap(), 2);
     assert_eq!(&bytes[..2], b"ab");
-    assert!(
-        timeout(Duration::from_millis(10), stream.read(&mut bytes))
+    assert!(poll_once(stream.read(&mut bytes)).is_pending());
+    assert_eq!(
+        timeout(DEADLINE, stream.read(&mut bytes))
             .await
-            .is_err()
+            .unwrap()
+            .unwrap(),
+        2
     );
-    sleep(Duration::from_millis(150)).await;
-    assert_eq!(stream.read(&mut bytes).await.unwrap(), 2);
     assert_eq!(&bytes[..2], b"cd");
 }
 
@@ -503,11 +493,11 @@ async fn mock_delay_allows_client_timeout_after_request_was_applied() {
     let mock =
         MockDiscord::new([MockReply::interaction_ack().with_delay(Duration::from_millis(150))]);
     let (mut client, server) = tokio::io::duplex(8192);
-    let task = tokio::spawn({
-        let mock = mock.clone();
-        async move { mock.serve(server).await }
-    });
+    let mut serve = Box::pin(mock.serve(server));
     client.write_all(INTERACTION).await.unwrap();
+    // Enter the real delay, then hold the server future until the client has
+    // cancelled its first read. CPU load cannot race the two timer deadlines.
+    assert!(poll_once(serve.as_mut()).is_pending());
     let mut response = Vec::new();
     assert!(
         timeout(Duration::from_millis(20), client.read_to_end(&mut response))
@@ -518,12 +508,14 @@ async fn mock_delay_allows_client_timeout_after_request_was_applied() {
     assert_eq!(mock.stats().requests, 1);
     assert_eq!(mock.stats().applied, 1);
     assert_eq!(mock.stats().replies_sent, 0);
-    timeout(DEADLINE, client.read_to_end(&mut response))
-        .await
-        .unwrap()
-        .unwrap();
+    let (served, read) = timeout(DEADLINE, async {
+        tokio::join!(serve, client.read_to_end(&mut response))
+    })
+    .await
+    .unwrap();
+    served.unwrap();
+    read.unwrap();
     assert!(response_parts(&response).0.starts_with("HTTP/1.1 204 "));
-    task.await.unwrap().unwrap();
     assert_eq!(mock.stats().replies_sent, 1);
 }
 
@@ -831,26 +823,22 @@ async fn scripts_follow_complete_request_order_and_ignore_incomplete_earlier_req
 #[tokio::test]
 async fn tcp_concurrency_limit_retains_only_the_configured_active_sessions() {
     let mock = MockDiscord::with_limits(
-        [
-            MockReply::interaction_ack().with_delay(Duration::from_millis(180)),
-            MockReply::interaction_ack(),
-        ],
+        [MockReply::interaction_ack(), MockReply::interaction_ack()],
         MockLimits {
             max_connections: 1,
+            request_timeout: DEADLINE,
             ..Default::default()
         },
     )
     .unwrap();
     let server = mock.spawn_tcp().await.unwrap();
     let mut first = tokio::net::TcpStream::connect(server.addr()).await.unwrap();
-    first.write_all(INTERACTION).await.unwrap();
-    timeout(DEADLINE, async {
-        while mock.stats().requests != 1 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
+    // Keep the first session occupied with an incomplete request. Releasing its
+    // final byte is the synchronization barrier, independent of a response delay.
+    first
+        .write_all(&INTERACTION[..INTERACTION.len() - 1])
+        .await
+        .unwrap();
     let mut next = tokio::net::TcpStream::connect(server.addr()).await.unwrap();
     next.write_all(INTERACTION).await.unwrap();
     let mut second = Vec::new();
@@ -859,7 +847,11 @@ async fn tcp_concurrency_limit_retains_only_the_configured_active_sessions() {
             .await
             .is_err()
     );
-    assert_eq!(mock.stats().requests, 1);
+    assert_eq!(mock.stats().requests, 0);
+    first
+        .write_all(&INTERACTION[INTERACTION.len() - 1..])
+        .await
+        .unwrap();
     let mut response = Vec::new();
     timeout(DEADLINE, first.read_to_end(&mut response))
         .await
