@@ -24,6 +24,10 @@ resolver = "3"
 [dev-dependencies]
 rmp-serde = "1"
 
+[[bin]]
+name = "botctl"
+path = "src/bin/botctl.rs"
+
 [[bench]]
 name = "ipc_codec"
 harness = false
