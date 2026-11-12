@@ -146,3 +146,11 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 
 ## 引き継ぎ
 別環境への移行用に、方針・PM/Codex 並列の進め方・運用上の注意・残課題を [handoff.md](handoff.md) にまとめた（2026-11-12）。
+
+## 2026-11-12：別環境（Rust 1.90.0 / Windows）での再検証と互換修正
+- 新環境のツールチェインは Rust 1.90.0。`atomic_try_update`（`AtomicU64::try_update`）が未安定でビルド不可だったため、安定版の `fetch_update` に置換（`framework/examples/counter/mod.rs`、`src/worker.rs`）。
+- clippy `nonminimal_bool` 3件（`src/daemon.rs` 2、`src/main.rs` 1）を同値の書き換えで修正。fmt・clippy（警告禁止）は成功。
+- `cargo test --workspace --no-fail-fast`：642 成功、5 失敗、1 無視。
+  - `compile_fail::command_diagnostics`：trybuild の期待出力（警告文言）が Rust 1.99 前提で、1.90 の出力と不一致。実装の不具合ではなく、スナップショットのツールチェイン依存。1.99 では成功の記録があるため期待値は変更していない。
+  - `botctl_daemon` の4件：全体並列実行時のみ失敗。単独実行（同ファイル、2回連続）では 11 件すべて成功。負荷依存のフレークと推定、原因は未特定（要調査）。
+- 未検証は従来どおり（Linux、GitHub Actions、実 Discord、複数ホスト）。

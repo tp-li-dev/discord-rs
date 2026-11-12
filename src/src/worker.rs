@@ -92,7 +92,7 @@ impl DeploymentIdentity {
         use std::sync::atomic::Ordering;
         let generation = match &self.generation {
             Some(next) => next
-                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
                 .map_err(|_| failure("worker generation exhausted"))?,
             None => getrandom::u64()?,
         };

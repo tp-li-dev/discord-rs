@@ -1536,8 +1536,8 @@ pub mod control {
             assert!(!invalid.valid());
             assert_eq!(plane.request(&invalid)["error"], "invalid control request");
             assert!(
-                !serde_json::from_str::<CommandRequest>(r#"{"command":"ps","unexpected":true}"#)
-                    .is_ok()
+                serde_json::from_str::<CommandRequest>(r#"{"command":"ps","unexpected":true}"#)
+                    .is_err()
             );
         }
 
@@ -2243,7 +2243,7 @@ impl<C: Clock> Daemon<C> {
                 || entry.restart_held
                 || entry.child.is_some()
                 || !entry.snapshot.desired_running
-                || !entry.retry_at.is_some_and(|at| now >= at)
+                || entry.retry_at.is_none_or(|at| now < at)
             {
                 continue;
             }

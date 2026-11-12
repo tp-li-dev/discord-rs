@@ -216,10 +216,10 @@ impl GatewayOptions {
             // Deployment namespaces are strings while today's Core protocol is
             // u64. Reject aliases such as "001" and "1", rather than letting two
             // distinct Bot paths acquire the same handshake identity.
-            if !bot_id
+            if bot_id
                 .parse::<u64>()
                 .ok()
-                .is_some_and(|id| id.to_string() == bot_id)
+                .is_none_or(|id| id.to_string() != bot_id)
             {
                 return Err(StartupFailure::InvalidArguments);
             }

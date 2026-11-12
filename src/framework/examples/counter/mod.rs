@@ -29,7 +29,7 @@ impl CounterState {
 
     fn increment(&self) -> BotResult<u64> {
         self.value
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 value.checked_add(1)
             })
             .map(|previous| previous + 1)
