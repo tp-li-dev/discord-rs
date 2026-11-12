@@ -1,26 +1,27 @@
-//! Local, read-only daemon control. Bootstrap capability arrives on anonymous stdin.
+//! Local authenticated daemon control. Bootstrap capability arrives on anonymous stdin.
 //! The TCP listener is always loopback; it is not a remote management endpoint.
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use src::daemon::control::{CommandRequest, ControlPlane, NOTE};
 use std::{ffi::OsString, io, path::PathBuf, time::Duration};
 use subtle::ConstantTimeEq;
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     net::TcpListener,
-    sync::watch,
+    sync::{mpsc, oneshot},
+    task::JoinSet,
 };
 
 const REQUEST_LIMIT: u64 = 4096;
 const RESPONSE_LIMIT: usize = 64 * 1024;
 const DEADLINE: Duration = Duration::from_secs(3);
-const USAGE: &str =
-    "usage: botd --file F --runtime-root ABS --gateway-program ABS --bootstrap-stdin";
-const NOTE: &str = "Process status only; Discord readiness, ownership and leases are not verified.";
+const USAGE: &str = "usage: botd --file F --runtime-root ABS --gateway-program ABS --bootstrap-stdin [--no-autostart]";
 
 struct Options {
     file: PathBuf,
     runtime_root: PathBuf,
     gateway_program: PathBuf,
+    no_autostart: bool,
 }
 
 fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'static str> {
@@ -29,6 +30,7 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
     let mut runtime_root = None;
     let mut gateway_program = None;
     let mut bootstrap = false;
+    let mut no_autostart = false;
     while let Some(arg) = args.next() {
         let target = match arg.to_str() {
             Some("--file") if file.is_none() => &mut file,
@@ -36,6 +38,10 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
             Some("--gateway-program") if gateway_program.is_none() => &mut gateway_program,
             Some("--bootstrap-stdin") if !bootstrap => {
                 bootstrap = true;
+                continue;
+            }
+            Some("--no-autostart") if !no_autostart => {
+                no_autostart = true;
                 continue;
             }
             _ => return Err(USAGE),
@@ -50,6 +56,7 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
         file: file.ok_or(USAGE)?,
         runtime_root: runtime_root.ok_or(USAGE)?,
         gateway_program: gateway_program.ok_or(USAGE)?,
+        no_autostart,
     };
     if !bootstrap {
         return Err("anonymous stdin bootstrap is required");
@@ -72,6 +79,19 @@ struct Bootstrap {
 struct StatusRequest {
     secret: [u8; 32],
     command: String,
+    #[serde(default)]
+    bot: Option<String>,
+    #[serde(default)]
+    operation_id: Option<String>,
+    #[serde(default)]
+    force: bool,
+    #[serde(default)]
+    yes: bool,
+}
+
+struct Envelope {
+    request: CommandRequest,
+    response: oneshot::Sender<Value>,
 }
 
 async fn read_frame<R: AsyncRead + Unpin>(reader: R) -> io::Result<Vec<u8>> {
@@ -109,22 +129,48 @@ async fn read_bootstrap<R: AsyncRead + Unpin>(reader: R) -> io::Result<Bootstrap
 async fn serve_status<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
     secret: &[u8; 32],
-    snapshots: &watch::Receiver<Value>,
+    commands: &mpsc::Sender<Envelope>,
 ) -> io::Result<()> {
     tokio::time::timeout(DEADLINE, async {
         let frame = read_frame(&mut stream).await?;
         let request: StatusRequest = serde_json::from_slice(&frame)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid status request"))?;
-        if !bool::from(request.secret.ct_eq(secret)) || request.command != "status" {
+        if !bool::from(request.secret.ct_eq(secret)) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "status request denied",
             ));
         }
-        // Clone only after authentication and drop the watch borrow before await.
-        let status = snapshots.borrow().clone();
-        let mut response =
-            serde_json::to_vec(&json!({"ok": true, "status": status, "note": NOTE}))?;
+        let command = CommandRequest {
+            command: request.command,
+            bot: request.bot,
+            operation_id: request.operation_id,
+            force: request.force,
+            yes: request.yes,
+        };
+        if !command.valid() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "control request denied",
+            ));
+        }
+        // Only the daemon owner admits/executes commands. A disconnected client
+        // never cancels an already admitted operation or forces a child to exit.
+        let (response, receiver) = oneshot::channel();
+        let value = if commands
+            .try_send(Envelope {
+                request: command,
+                response,
+            })
+            .is_ok()
+        {
+            receiver
+                .await
+                .map_err(|_| io::Error::other("daemon control unavailable"))?
+        } else {
+            json!({"ok": false, "offline": false, "error": "daemon control busy", "note": NOTE})
+        };
+        let mut response = serde_json::to_vec(&value)?;
         response.push(b'\n');
         if response.len() > RESPONSE_LIMIT {
             return Err(io::Error::new(
@@ -142,16 +188,19 @@ async fn serve_status<S: AsyncRead + AsyncWrite + Unpin>(
 async fn status_server(
     listener: TcpListener,
     secret: [u8; 32],
-    snapshots: watch::Receiver<Value>,
+    commands: mpsc::Sender<Envelope>,
 ) -> io::Result<()> {
+    let mut sessions = JoinSet::new();
     loop {
-        let (stream, peer) = listener.accept().await?;
-        if !peer.ip().is_loopback() {
-            continue;
+        tokio::select! {
+            accepted = listener.accept(), if sessions.len() < 32 => {
+                let (stream, peer) = accepted?;
+                if !peer.ip().is_loopback() { continue; }
+                let commands = commands.clone();
+                sessions.spawn(async move { let _ = serve_status(stream, &secret, &commands).await; });
+            }
+            _ = sessions.join_next(), if !sessions.is_empty() => {}
         }
-        // One bounded session at a time, with no unbounded task or socket queue.
-        // This task never owns the daemon: a slow client cannot stop monitoring.
-        let _ = serve_status(stream, &secret, &snapshots).await;
     }
 }
 
@@ -186,10 +235,10 @@ async fn run() -> Result<(), &'static str> {
     let credentials = EnvironmentCredentials;
     // Partial startup failures remain visible through snapshots. Dropping this
     // daemon, including any error below, deliberately does not force-kill children.
-    let startup_ok = daemon.start_all(&credentials).is_ok();
-    let status = |daemon: &Daemon, monitor_ok| json!({"processes": daemon.snapshots(), "monitor_ok": monitor_ok});
-    let (sender, receiver) = watch::channel(status(&daemon, startup_ok));
-    let mut server = tokio::spawn(status_server(listener, bootstrap.secret, receiver));
+    let startup_ok = options.no_autostart || daemon.start_all(&credentials).is_ok();
+    let mut control = ControlPlane::new(daemon, config, startup_ok);
+    let (sender, mut receiver) = mpsc::channel::<Envelope>(64);
+    let mut server = tokio::spawn(status_server(listener, bootstrap.secret, sender));
     let mut announcement = serde_json::to_vec(&json!({
         "port": port, "local_only": true, "startup_ok": startup_ok,
     }))
@@ -200,7 +249,7 @@ async fn run() -> Result<(), &'static str> {
         server.abort();
         return Err("cannot announce local daemon control");
     }
-    let mut interval = tokio::time::interval(Duration::from_millis(100));
+    let mut interval = tokio::time::interval(Duration::from_millis(25));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let result = loop {
         tokio::select! {
@@ -208,8 +257,12 @@ async fn run() -> Result<(), &'static str> {
                 break signal.map_err(|_| "cannot receive daemon shutdown signal");
             }
             _ = interval.tick() => {
-                let monitor_ok = daemon.poll(&credentials).is_ok();
-                sender.send_replace(status(&daemon, monitor_ok));
+                control.tick(&credentials).await;
+            }
+            Some(envelope) = receiver.recv() => {
+                if !envelope.response.is_closed() {
+                    let _ = envelope.response.send(control.request(&envelope.request));
+                }
             }
             _ = &mut server => break Err("local daemon control stopped"),
         }
@@ -279,19 +332,32 @@ mod tests {
 
     async fn status_session(request: &[u8], status: Value) -> (io::Result<()>, Vec<u8>) {
         let (mut client, server) = duplex(128 * 1024);
-        let (_sender, receiver) = watch::channel(status);
-        let task = tokio::spawn(async move { serve_status(server, &[7; 32], &receiver).await });
+        let (sender, mut receiver) = mpsc::channel::<Envelope>(1);
+        let backend = tokio::spawn(async move {
+            if let Some(envelope) = receiver.recv().await {
+                let _ = envelope
+                    .response
+                    .send(json!({"ok": true, "status": status, "note": NOTE}));
+            }
+        });
+        let task = tokio::spawn(async move { serve_status(server, &[7; 32], &sender).await });
         client.write_all(request).await.unwrap();
         client.shutdown().await.unwrap();
         let mut response = Vec::new();
         client.read_to_end(&mut response).await.unwrap();
-        (task.await.unwrap(), response)
+        let result = task.await.unwrap();
+        backend.await.unwrap();
+        (result, response)
     }
 
     fn request(secret: [u8; 32], command: &str) -> Vec<u8> {
         let mut frame = serde_json::to_vec(&StatusRequest {
             secret,
             command: command.into(),
+            bot: None,
+            operation_id: None,
+            force: false,
+            yes: false,
         })
         .unwrap();
         frame.push(b'\n');
@@ -336,6 +402,10 @@ mod tests {
         let mut value = serde_json::to_value(StatusRequest {
             secret: [7; 32],
             command: "status".into(),
+            bot: None,
+            operation_id: None,
+            force: false,
+            yes: false,
         })
         .unwrap();
         value["extra"] = json!(true);
@@ -360,19 +430,21 @@ mod tests {
     #[tokio::test]
     async fn idle_control_client_has_a_deadline() {
         let (_client, server) = duplex(128);
-        let (_sender, receiver) = watch::channel(json!([]));
-        let result = serve_status(server, &[7; 32], &receiver).await;
+        let (sender, _receiver) = mpsc::channel(1);
+        let result = serve_status(server, &[7; 32], &sender).await;
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
     }
 
     #[tokio::test]
-    async fn status_uses_latest_snapshot_after_client_waits() {
+    async fn status_is_dispatched_only_after_authentication() {
         let (mut client, server) = duplex(8192);
-        let (sender, receiver) = watch::channel(json!({"processes": [], "monitor_ok": true}));
-        let task = tokio::spawn(async move { serve_status(server, &[7; 32], &receiver).await });
-        // Monitoring can publish while the server is waiting for a request.
-        sender.send_replace(json!({"processes": [{"state": "Failed"}], "monitor_ok": false}));
+        let (sender, mut receiver) = mpsc::channel::<Envelope>(1);
+        let task = tokio::spawn(async move { serve_status(server, &[7; 32], &sender).await });
+        assert!(receiver.try_recv().is_err());
         client.write_all(&request([7; 32], "status")).await.unwrap();
+        let envelope = receiver.recv().await.unwrap();
+        assert_eq!(envelope.request.command, "status");
+        envelope.response.send(json!({"ok": true, "status": {"processes": [{"state": "Failed"}], "monitor_ok": false}})).unwrap();
         let mut response = Vec::new();
         client.read_to_end(&mut response).await.unwrap();
         task.await.unwrap().unwrap();

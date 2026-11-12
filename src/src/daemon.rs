@@ -1,8 +1,9 @@
 //! Local supervision of one Gateway execution unit per configured Bot/Shard.
 //!
-//! This skeleton launches only `ShardRuntimeSpec::gateway`; Core lifecycle and
-//! authenticated Gateway shutdown/Ready/lease/Identify admission are separate
-//! integration work. Running means an OS child exists, not Discord readiness.
+//! This launcher starts only `ShardRuntimeSpec::gateway`; Core lifecycle and
+//! Gateway Ready/lease/Identify admission are separate integration work.
+//! Running means an OS child exists, not Discord readiness. Cooperative shutdown
+//! uses the owned child's anonymous stdin; the artifact must implement it.
 //! No distributed placement, failover or ownership grant is implemented here.
 //!
 //! Drive `poll` regularly. Dropping this owner never kills children. A persistent
@@ -28,12 +29,779 @@ use std::{
     process::Stdio,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::process::{Child, Command};
+use tokio::{
+    io::AsyncWriteExt,
+    process::{Child, Command},
+};
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ShardKey {
     pub bot_id: String,
     pub shard_id: u32,
+}
+
+/// Local administration state. Authentication and bounded framing belong to the
+/// listener; only authenticated commands may be passed to this module.
+pub mod control {
+    use super::*;
+    use crate::{botref, placement::BotPlacement};
+    use serde_json::{Value, json};
+    use std::time::Instant;
+
+    pub const NOTE: &str = "Local process status only; Discord readiness, Core drain, ownership and leases are not verified.";
+    pub const OPERATION_LIMIT: usize = 1024;
+    pub const OPERATION_SHARD_LIMIT: usize = 64;
+    pub const OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+
+    #[derive(Clone, Default, Deserialize, Serialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct CommandRequest {
+        pub command: String,
+        #[serde(default)]
+        pub bot: Option<String>,
+        #[serde(default)]
+        pub operation_id: Option<String>,
+        #[serde(default)]
+        pub force: bool,
+        #[serde(default)]
+        pub yes: bool,
+    }
+
+    impl CommandRequest {
+        pub fn valid(&self) -> bool {
+            let selector = self
+                .bot
+                .as_ref()
+                .is_some_and(|v| !v.is_empty() && v.len() <= 256);
+            let id = self.operation_id.as_ref().is_some_and(|v| {
+                v.len() == 32
+                    && v.bytes()
+                        .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+            });
+            match self.command.as_str() {
+                "ps" => {
+                    self.bot.is_none() && self.operation_id.is_none() && !self.force && !self.yes
+                }
+                "status" => {
+                    (self.bot.is_none() || selector)
+                        && self.operation_id.is_none()
+                        && !self.force
+                        && !self.yes
+                }
+                "inspect" | "shards" => {
+                    selector && self.operation_id.is_none() && !self.force && !self.yes
+                }
+                "operation" => self.bot.is_none() && id && !self.force && !self.yes,
+                "start" | "restart" => selector && id && !self.force && !self.yes,
+                // Missing confirmation is diagnosed by the authenticated handler.
+                "stop" => selector && id && (!self.yes || self.force),
+                _ => false,
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, Serialize)]
+    #[serde(rename_all = "lowercase")]
+    pub enum OperationState {
+        Running,
+        Succeeded,
+        Failed,
+    }
+
+    #[derive(Clone, Serialize)]
+    pub struct OperationShard {
+        #[serde(flatten)]
+        pub process: ProcessSnapshot,
+        pub error: Option<DaemonError>,
+    }
+
+    #[derive(Clone, Serialize)]
+    pub struct OperationSnapshot {
+        pub operation_id: String,
+        pub command: String,
+        pub bot_id: String,
+        pub state: OperationState,
+        pub elapsed_ms: u128,
+        pub shards: Vec<OperationShard>,
+        pub failed_shards: Vec<ShardKey>,
+    }
+
+    #[derive(PartialEq, Eq)]
+    enum Phase {
+        Starting,
+        Stopping,
+    }
+
+    struct Operation {
+        id: String,
+        command: String,
+        bot_id: String,
+        force: bool,
+        targets: Vec<ShardKey>,
+        phase: Phase,
+        next: usize,
+        started: Instant,
+        waiting: HashSet<ShardKey>,
+        generations: BTreeMap<ShardKey, LaunchGeneration>,
+        errors: BTreeMap<ShardKey, DaemonError>,
+        finished: Option<OperationSnapshot>,
+    }
+
+    /// One owner serializes admissions; independent Bot operations advance on
+    /// ticks while clients may read status. History never evicts accepted IDs:
+    /// at capacity new operations fail before any side effect. It is not durable.
+    pub struct ControlPlane {
+        daemon: Daemon,
+        config: Config,
+        operations: BTreeMap<String, Operation>,
+        monitor_ok: bool,
+        last_advanced: String,
+    }
+
+    impl ControlPlane {
+        pub fn new(daemon: Daemon, config: Config, monitor_ok: bool) -> Self {
+            Self {
+                daemon,
+                config,
+                operations: BTreeMap::new(),
+                monitor_ok,
+                last_advanced: String::new(),
+            }
+        }
+
+        fn error(error: &str) -> Value {
+            json!({"ok": false, "offline": false, "error": error, "note": NOTE})
+        }
+
+        fn bot_view(&self, bot: &BotPlacement) -> Value {
+            let processes: Vec<_> = self
+                .daemon
+                .snapshots()
+                .into_iter()
+                .filter(|s| s.key.bot_id == bot.bot_id)
+                .collect();
+            let state = if processes.is_empty() {
+                "not_local"
+            } else if processes
+                .iter()
+                .any(|s| matches!(s.state, ProcessState::Failed { .. }))
+            {
+                "failed"
+            } else if processes
+                .iter()
+                .all(|s| matches!(s.state, ProcessState::Running))
+            {
+                "running"
+            } else if processes
+                .iter()
+                .all(|s| matches!(s.state, ProcessState::Exited { .. }))
+            {
+                "stopped"
+            } else {
+                "mixed"
+            };
+            json!({"name": bot.name, "bot_id": bot.bot_id, "total_shards": bot.total_shards,
+                "status": state, "processes": processes})
+        }
+
+        fn snapshot(&self, op: &Operation) -> OperationSnapshot {
+            if let Some(snapshot) = &op.finished {
+                return snapshot.clone();
+            }
+            let shards = self
+                .daemon
+                .snapshots()
+                .into_iter()
+                .filter(|s| op.targets.contains(&s.key))
+                .map(|process| OperationShard {
+                    error: op.errors.get(&process.key).copied(),
+                    process,
+                })
+                .collect();
+            OperationSnapshot {
+                operation_id: op.id.clone(),
+                command: op.command.clone(),
+                bot_id: op.bot_id.clone(),
+                state: OperationState::Running,
+                elapsed_ms: op.started.elapsed().as_millis(),
+                shards,
+                failed_shards: op.errors.keys().cloned().collect(),
+            }
+        }
+
+        fn operation_view(&self, op: &Operation) -> Value {
+            let snapshot = self.snapshot(op);
+            json!({"ok": snapshot.state != OperationState::Failed, "offline": false, "operation": snapshot, "note": NOTE})
+        }
+
+        fn finish(&mut self, op: &mut Operation) {
+            let mut snapshot = self.snapshot(op);
+            snapshot.state = if op.errors.is_empty() {
+                OperationState::Succeeded
+            } else {
+                OperationState::Failed
+            };
+            op.finished = Some(snapshot);
+            for key in &op.targets {
+                self.daemon.hold_restart(key, false);
+            }
+        }
+
+        /// No mutation is performed on a malformed request, unknown/ambiguous
+        /// selector, conflicting ID, full journal or unconfirmed force request.
+        pub fn request(&mut self, request: &CommandRequest) -> Value {
+            if !request.valid() {
+                return Self::error("invalid control request");
+            }
+            if request.command == "operation" {
+                return self
+                    .operations
+                    .get(request.operation_id.as_ref().expect("validated ID"))
+                    .map(|op| self.operation_view(op))
+                    .unwrap_or_else(|| {
+                        Self::error("operation not found in this daemon incarnation")
+                    });
+            }
+            let selected = match request.bot.as_deref() {
+                Some(selector) => match botref::resolve(&self.config.bots, selector) {
+                    Ok(bot) => Some(bot.clone()),
+                    Err(botref::BotRefError::NotFound) => return Self::error("bot not found"),
+                    Err(botref::BotRefError::Ambiguous { .. }) => {
+                        return Self::error("ambiguous bot reference");
+                    }
+                    Err(_) => return Self::error("invalid bot configuration"),
+                },
+                None => None,
+            };
+            match request.command.as_str() {
+                "ps" | "status" | "inspect" => {
+                    let processes: Vec<_> = self
+                        .daemon
+                        .snapshots()
+                        .into_iter()
+                        .filter(|s| selected.as_ref().is_none_or(|b| b.bot_id == s.key.bot_id))
+                        .collect();
+                    let mut value = json!({"ok": true, "offline": false, "note": NOTE,
+                        "status": {"processes": processes, "monitor_ok": self.monitor_ok}});
+                    if let Some(bot) = selected {
+                        value["bot"] = self.bot_view(&bot);
+                    } else {
+                        value["bots"] = self.config.bots.iter().map(|b| self.bot_view(b)).collect();
+                    }
+                    value
+                }
+                "shards" => {
+                    let bot = selected.expect("validated selector");
+                    let snapshots = self.daemon.snapshots();
+                    let shards: Vec<_> = bot.shard_placement.iter().map(|p| {
+                        let process = snapshots.iter().find(|s| s.key.bot_id == bot.bot_id && s.key.shard_id == p.shard_id);
+                        json!({"shard_id": p.shard_id, "total_shards": bot.total_shards, "primary": p.primary,
+                            "local": p.primary == self.config.node.id, "process": process})
+                    }).collect();
+                    json!({"ok": true, "offline": false, "note": NOTE, "bot_id": bot.bot_id, "name": bot.name, "shards": shards})
+                }
+                _ => self.admit(request, selected.expect("validated selector").bot_id),
+            }
+        }
+
+        fn admit(&mut self, request: &CommandRequest, bot_id: String) -> Value {
+            if request.force && !request.yes {
+                return Self::error("force stop requires --yes");
+            }
+            let id = request.operation_id.as_ref().expect("validated ID");
+            if let Some(old) = self.operations.get(id) {
+                if old.command != request.command
+                    || old.bot_id != bot_id
+                    || old.force != request.force
+                {
+                    return Self::error("operation ID conflicts with an earlier request");
+                }
+                return self.operation_view(old);
+            }
+            if self.operations.len() >= OPERATION_LIMIT {
+                return Self::error("operation history is full");
+            }
+            let targets: Vec<_> = self
+                .daemon
+                .snapshots()
+                .into_iter()
+                .filter(|s| s.key.bot_id == bot_id)
+                .map(|s| s.key)
+                .collect();
+            if targets.is_empty() {
+                return Self::error("bot has no local shards");
+            }
+            if targets.len() > OPERATION_SHARD_LIMIT {
+                return Self::error("operation exceeds local shard limit (64)");
+            }
+            let active: Vec<_> = self
+                .operations
+                .iter()
+                .filter(|(_, op)| op.bot_id == bot_id && op.finished.is_none())
+                .map(|(id, _)| id.clone())
+                .collect();
+            if !active.is_empty() && !request.force {
+                return Self::error("bot already has an operation in progress");
+            }
+            // Explicit force stop supersedes an earlier drain/restart. The old
+            // operation can never resume and launch a new generation afterwards.
+            for id in active {
+                let mut old = self.operations.remove(&id).expect("active operation");
+                for key in &old.targets {
+                    old.errors
+                        .insert(key.clone(), DaemonError::OperationSuperseded);
+                }
+                self.finish(&mut old);
+                self.operations.insert(id, old);
+            }
+            let waiting = if request.command == "start" {
+                HashSet::new()
+            } else {
+                // An abnormal exit between admission and the first tick must
+                // not be mistaken for an already-stopped, successful drain.
+                targets
+                    .iter()
+                    .filter(|key| self.daemon.has_child(key))
+                    .cloned()
+                    .collect()
+            };
+            let op = Operation {
+                id: id.clone(),
+                command: request.command.clone(),
+                bot_id,
+                force: request.force,
+                targets,
+                phase: if request.command == "start" {
+                    Phase::Starting
+                } else {
+                    Phase::Stopping
+                },
+                next: 0,
+                started: Instant::now(),
+                waiting,
+                generations: BTreeMap::new(),
+                errors: BTreeMap::new(),
+                finished: None,
+            };
+            for key in &op.targets {
+                self.daemon.hold_restart(key, true);
+            }
+            let response = self.operation_view(&op);
+            self.operations.insert(id.clone(), op);
+            response
+        }
+
+        /// Observe actual exits before advancing operations. One command per
+        /// Bot per tick bounds cooperative writes and keeps reads responsive.
+        pub async fn tick(&mut self, credentials: &impl CredentialSource) {
+            self.monitor_ok = self.daemon.poll(credentials).is_ok();
+            let mut ids: Vec<_> = self
+                .operations
+                .iter()
+                .filter(|(_, op)| op.finished.is_none())
+                .map(|(id, _)| id.clone())
+                .collect();
+            // Limit cumulative slow pipe writes across Bots as well as the
+            // individual write. Rotate the cursor so a busy Bot cannot starve
+            // later IDs, status requests, supervision or daemon shutdown.
+            let offset = ids.partition_point(|id| id <= &self.last_advanced);
+            ids.rotate_left(offset);
+            let tick_started = Instant::now();
+            for id in ids.into_iter().take(16) {
+                let mut op = self.operations.remove(&id).expect("operation exists");
+                self.advance(&mut op, credentials).await;
+                self.last_advanced.clone_from(&id);
+                self.operations.insert(id, op);
+                if tick_started.elapsed() >= Duration::from_millis(10) {
+                    break;
+                }
+            }
+        }
+
+        async fn advance(&mut self, op: &mut Operation, credentials: &impl CredentialSource) {
+            if op.started.elapsed() >= OPERATION_TIMEOUT {
+                for (index, key) in op.targets.iter().enumerate() {
+                    if op.waiting.contains(key)
+                        || !op.generations.contains_key(key) && op.phase == Phase::Starting
+                        || index >= op.next
+                    {
+                        op.errors
+                            .entry(key.clone())
+                            .or_insert(DaemonError::StopTimedOut);
+                    }
+                }
+                if op.errors.is_empty() {
+                    op.errors
+                        .insert(op.targets[0].clone(), DaemonError::StopTimedOut);
+                }
+                // Cancel retries of launches owned by this operation, never
+                // kill or alter an unattempted shard on timeout.
+                for key in op.generations.keys() {
+                    let _ = self.daemon.stop(key, StopMode::WaitForExit);
+                }
+                self.finish(op);
+                return;
+            }
+            if op.next < op.targets.len() {
+                let key = &op.targets[op.next];
+                op.next += 1;
+                let result = if op.phase == Phase::Starting {
+                    self.daemon.start(key, credentials)
+                } else {
+                    if self.daemon.has_child(key) {
+                        op.waiting.insert(key.clone());
+                    }
+                    if op.force {
+                        self.daemon.stop(key, StopMode::Force)
+                    } else {
+                        self.daemon.graceful_stop(key).await
+                    }
+                };
+                match result {
+                    Err(error) => {
+                        op.errors.insert(key.clone(), error);
+                        // A failed manual start must not secretly succeed later
+                        // through an automatically scheduled restart.
+                        if op.phase == Phase::Starting && error != DaemonError::InvalidState {
+                            let _ = self.daemon.stop(key, StopMode::WaitForExit);
+                        }
+                    }
+                    Ok(()) if op.phase == Phase::Starting => {
+                        if let Some(identity) = self
+                            .daemon
+                            .snapshots()
+                            .into_iter()
+                            .find(|s| &s.key == key)
+                            .and_then(|s| s.identity)
+                        {
+                            op.generations.insert(key.clone(), identity.generation);
+                        }
+                    }
+                    Ok(()) => {}
+                }
+                // Even successful spawn needs at least one subsequent poll.
+                return;
+            }
+            let snapshots = self.daemon.snapshots();
+            if op.phase == Phase::Stopping {
+                for snapshot in &snapshots {
+                    if op.waiting.contains(&snapshot.key) && !self.daemon.has_child(&snapshot.key) {
+                        op.waiting.remove(&snapshot.key);
+                        if !op.force
+                            && !matches!(snapshot.state, ProcessState::Exited { code: Some(0) })
+                        {
+                            op.errors
+                                .entry(snapshot.key.clone())
+                                .or_insert(DaemonError::ChildExited);
+                        }
+                    }
+                }
+                if !op.waiting.is_empty() {
+                    return;
+                }
+                if op.command == "restart" && op.errors.is_empty() {
+                    op.phase = Phase::Starting;
+                    op.next = 0;
+                    return;
+                }
+            } else {
+                for snapshot in snapshots
+                    .into_iter()
+                    .filter(|s| op.targets.contains(&s.key))
+                {
+                    if op.errors.contains_key(&snapshot.key) {
+                        continue;
+                    }
+                    let expected = op.generations.get(&snapshot.key);
+                    let running = matches!(snapshot.state, ProcessState::Running)
+                        && self.daemon.has_child(&snapshot.key)
+                        && snapshot.identity.as_ref().map(|i| &i.generation) == expected;
+                    if !running {
+                        op.errors
+                            .insert(snapshot.key.clone(), DaemonError::ChildExited);
+                        let _ = self.daemon.stop(&snapshot.key, StopMode::WaitForExit);
+                    }
+                }
+            }
+            self.finish(op);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn plane(bot_count: usize, shard_count: u32) -> ControlPlane {
+            let mut text =
+                "[cluster]\nid='local'\nmode='standalone'\n[node]\nid='one'\n".to_string();
+            for bot in 0..bot_count {
+                text.push_str(&format!("[[bots]]\nname='bot{bot}'\nbot_id='id-{bot}'\napplication_id='{bot}'\ntoken_env='TOKEN_{bot}'\ntotal_shards={shard_count}\n"));
+                for shard in 0..shard_count {
+                    text.push_str(&format!(
+                        "[[bots.shard_placement]]\nshard_id={shard}\nprimary='one'\n"
+                    ));
+                }
+            }
+            let config: Config = toml::from_str(&text).unwrap();
+            let mut daemon = Daemon::from_config(
+                &config,
+                &HashMap::new(),
+                &std::env::current_dir()
+                    .unwrap()
+                    .join("target")
+                    .join("daemon-control-tests")
+                    .join(format!(
+                        "{}-{:016x}",
+                        std::process::id(),
+                        getrandom::u64().unwrap()
+                    )),
+                RestartPolicy::default(),
+            )
+            .unwrap();
+            daemon
+                .set_gateway_program(&std::env::current_exe().unwrap())
+                .unwrap();
+            ControlPlane::new(daemon, config, true)
+        }
+
+        fn request(command: &str, bot: usize, id: usize) -> CommandRequest {
+            CommandRequest {
+                command: command.into(),
+                bot: Some(format!("bot{bot}")),
+                operation_id: Some(format!("{id:032x}")),
+                ..Default::default()
+            }
+        }
+
+        fn query(id: usize) -> CommandRequest {
+            CommandRequest {
+                command: "operation".into(),
+                operation_id: Some(format!("{id:032x}")),
+                ..Default::default()
+            }
+        }
+
+        fn no_credentials(_: &str) -> Option<OsString> {
+            panic!("read credentials without a launch");
+        }
+
+        #[test]
+        fn exit_before_shutdown_child() {
+            if std::env::var_os("BOTCTL_TEST_EXIT_BEFORE_SHUTDOWN").is_some() {
+                std::process::exit(27);
+            }
+        }
+
+        #[tokio::test]
+        async fn abnormal_exit_after_admission_cannot_be_reported_as_a_successful_restart() {
+            let mut plane = plane(1, 1);
+            let key = ShardKey {
+                bot_id: "id-0".into(),
+                shard_id: 0,
+            };
+            let entry = plane.daemon.entries.get_mut(&key).unwrap();
+            entry.spec.gateway.args = [
+                "--exact",
+                "daemon::control::tests::exit_before_shutdown_child",
+            ]
+            .map(OsString::from)
+            .to_vec();
+            entry
+                .spec
+                .gateway
+                .environment
+                .variables
+                .insert("BOTCTL_TEST_EXIT_BEFORE_SHUTDOWN".into(), "1".into());
+            plane
+                .daemon
+                .start(&key, &|_: &str| Some(OsString::from("dummy")))
+                .unwrap();
+            let generation = plane.daemon.snapshots()[0]
+                .identity
+                .as_ref()
+                .unwrap()
+                .generation
+                .clone();
+            assert_eq!(plane.request(&request("restart", 0, 1))["ok"], true);
+            // Reap in the OS adapter without updating the daemon entry, placing
+            // the crash deterministically between admission and the first tick.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while plane
+                    .daemon
+                    .entries
+                    .get_mut(&key)
+                    .unwrap()
+                    .child
+                    .as_mut()
+                    .unwrap()
+                    .try_wait()
+                    .unwrap()
+                    .is_none()
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            plane.tick(&no_credentials).await;
+            plane.tick(&no_credentials).await;
+            let result = plane.request(&query(1));
+            assert_eq!(result["operation"]["state"], "failed");
+            assert_eq!(result["operation"]["shards"][0]["error"], "ChildExited");
+            assert!(!plane.daemon.has_child(&key));
+            assert_eq!(
+                plane.daemon.snapshots()[0]
+                    .identity
+                    .as_ref()
+                    .unwrap()
+                    .generation,
+                generation
+            );
+        }
+
+        #[tokio::test]
+        async fn history_capacity_rejects_new_actions_but_keeps_requery_and_deduplication() {
+            let mut plane = plane(1, 1);
+            for id in 0..OPERATION_LIMIT {
+                assert_eq!(plane.request(&request("stop", 0, id))["ok"], true);
+                plane.tick(&no_credentials).await;
+                plane.tick(&no_credentials).await;
+                assert_eq!(plane.request(&query(id))["operation"]["state"], "succeeded");
+            }
+            assert_eq!(
+                plane.request(&request("start", 0, OPERATION_LIMIT))["error"],
+                "operation history is full"
+            );
+            assert_eq!(plane.operations.len(), OPERATION_LIMIT);
+            let original = plane.request(&query(0));
+            assert_eq!(plane.request(&request("stop", 0, 0)), original);
+            assert_eq!(plane.request(&request("start", 0, 0))["ok"], false);
+            assert!(
+                plane
+                    .daemon
+                    .snapshots()
+                    .iter()
+                    .all(|s| s.identity.is_none() && !s.desired_running)
+            );
+        }
+
+        #[tokio::test]
+        async fn failed_manual_launch_cancels_automatic_retry_and_terminal_results_are_frozen() {
+            let mut plane = plane(1, 1);
+            plane.request(&request("stop", 0, 1));
+            plane.tick(&no_credentials).await;
+            plane.tick(&no_credentials).await;
+            let stopped = plane.request(&query(1));
+            plane.request(&request("start", 0, 2));
+            plane.tick(&|_: &str| None).await;
+            plane.tick(&no_credentials).await;
+            let failure = plane.request(&query(2));
+            assert_eq!(failure["ok"], false);
+            assert_eq!(
+                failure["operation"]["shards"][0]["error"],
+                "MissingCredential"
+            );
+            let state = plane.daemon.snapshots().remove(0);
+            assert!(!state.desired_running);
+            assert!(state.retry_at_ms.is_none());
+            assert!(state.identity.is_none());
+            assert_eq!(plane.request(&query(1)), stopped);
+        }
+
+        #[tokio::test]
+        async fn expired_start_does_not_change_a_preexisting_retry_or_an_unattempted_shard() {
+            let mut plane = plane(1, 2);
+            let key = ShardKey {
+                bot_id: "id-0".into(),
+                shard_id: 0,
+            };
+            let entry = plane.daemon.entries.get_mut(&key).unwrap();
+            entry.snapshot.desired_running = true;
+            entry.retry_at = Some(Duration::from_secs(300));
+            entry.snapshot.retry_at_ms = Some(300_000);
+            plane.request(&request("start", 0, 1));
+            plane.tick(&no_credentials).await;
+            plane
+                .operations
+                .get_mut(&format!("{:032x}", 1))
+                .unwrap()
+                .started = Instant::now() - Duration::from_secs(31);
+            plane.tick(&no_credentials).await;
+            let failure = plane.request(&query(1));
+            assert_eq!(failure["operation"]["state"], "failed");
+            assert_eq!(failure["operation"]["shards"][0]["error"], "InvalidState");
+            assert_eq!(failure["operation"]["shards"][1]["error"], "StopTimedOut");
+            let existing = plane.daemon.entries.get(&key).unwrap();
+            assert!(existing.snapshot.desired_running);
+            assert_eq!(existing.retry_at, Some(Duration::from_secs(300)));
+            assert!(!existing.restart_held);
+            assert!(
+                plane
+                    .daemon
+                    .entries
+                    .values()
+                    .all(|e| !e.started && e.child.is_none())
+            );
+        }
+
+        #[tokio::test]
+        async fn tick_budget_rotates_across_bots_and_terminal_history_does_not_starve_them() {
+            let mut plane = plane(33, 1);
+            for id in 0..33 {
+                assert_eq!(plane.request(&request("stop", id, id))["ok"], true);
+            }
+            plane.tick(&no_credentials).await;
+            assert!(plane.operations.values().filter(|op| op.next != 0).count() <= 16);
+            for _ in 0..100 {
+                plane.tick(&no_credentials).await;
+            }
+            assert!(plane.operations.values().all(|op| op.finished.is_some()));
+            for id in 0..33 {
+                assert_eq!(plane.request(&query(id))["operation"]["state"], "succeeded");
+            }
+        }
+
+        #[test]
+        fn admission_limits_and_unconfirmed_force_do_not_mutate_any_shard() {
+            let mut plane = plane(1, OPERATION_SHARD_LIMIT as u32 + 1);
+            assert_eq!(plane.request(&request("start", 0, 1))["ok"], false);
+            let mut force = request("stop", 0, 2);
+            force.force = true;
+            assert_eq!(plane.request(&force)["error"], "force stop requires --yes");
+            assert!(plane.operations.is_empty());
+            assert!(
+                plane
+                    .daemon
+                    .entries
+                    .values()
+                    .all(|e| !e.restart_held && !e.started)
+            );
+            let mut invalid = request("start", 0, 1);
+            invalid.operation_id = Some("untrusted invalid identifier".into());
+            assert!(!invalid.valid());
+            assert_eq!(plane.request(&invalid)["error"], "invalid control request");
+            assert!(
+                !serde_json::from_str::<CommandRequest>(r#"{"command":"ps","unexpected":true}"#)
+                    .is_ok()
+            );
+        }
+
+        #[test]
+        fn selected_status_and_inspect_contain_only_the_resolved_bot() {
+            let mut plane = plane(2, 1);
+            for command in ["status", "inspect"] {
+                let request = CommandRequest {
+                    command: command.into(),
+                    bot: Some("bot1".into()),
+                    ..Default::default()
+                };
+                let response = plane.request(&request);
+                assert_eq!(response["bot"]["bot_id"], "id-1");
+                assert_eq!(response["status"]["processes"].as_array().unwrap().len(), 1);
+                assert_eq!(response["status"]["processes"][0]["key"]["bot_id"], "id-1");
+            }
+        }
+    }
 }
 
 /// Random daemon incarnation plus a checked, monotonically increasing sequence.
@@ -123,6 +891,8 @@ pub enum DaemonError {
     ChildExited,
     MonitorFailed,
     StopFailed,
+    StopTimedOut,
+    OperationSuperseded,
     ClockRegressed,
     TimeOverflow,
     GenerationExhausted,
@@ -180,8 +950,8 @@ impl CredentialSource for EnvironmentCredentials {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopMode {
-    /// Suppress retries and wait for exit requested through the Gateway's own
-    /// control channel. This skeleton does not implement that shutdown protocol.
+    /// Suppress retries without sending a shutdown request. Use `graceful_stop`
+    /// to request cooperative exit through the owned child's anonymous stdin.
     WaitForExit,
     /// Explicit force only: kill the owned Child handle, never a saved PID.
     Force,
@@ -196,6 +966,8 @@ struct Entry {
     failures: u32,
     reservation: Option<PathBuf>,
     started: bool,
+    graceful_stop: Option<Result<(), DaemonError>>,
+    restart_held: bool,
 }
 
 pub struct Daemon<C = MonotonicClock> {
@@ -367,6 +1139,8 @@ impl<C: Clock> Daemon<C> {
                         failures: 0,
                         reservation: None,
                         started: false,
+                        graceful_stop: None,
+                        restart_held: false,
                     },
                 )
             })
@@ -518,7 +1292,7 @@ impl<C: Clock> Daemon<C> {
             .env_clear()
             .envs(&spec.environment.variables)
             .env(name, credential)
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(false);
@@ -538,6 +1312,7 @@ impl<C: Clock> Daemon<C> {
         };
         let pid = child.id().expect("newly spawned child has a process id");
         entry.child = Some(child);
+        entry.graceful_stop = None;
         entry.snapshot.identity = Some(ProcessIdentity {
             key: entry.snapshot.key.clone(),
             pid,
@@ -659,6 +1434,7 @@ impl<C: Clock> Daemon<C> {
                 }
             }
             if self.clock_failed
+                || entry.restart_held
                 || entry.child.is_some()
                 || !entry.snapshot.desired_running
                 || !entry.retry_at.is_some_and(|at| now >= at)
@@ -724,5 +1500,48 @@ impl<C: Clock> Daemon<C> {
             Self::release_reservation(entry)?;
         }
         Ok(())
+    }
+
+    /// A retained Child also covers an unknown liveness result from try_wait.
+    /// Never authorize a replacement based on a stale snapshot or saved PID.
+    pub fn has_child(&self, key: &ShardKey) -> bool {
+        self.entries
+            .get(key)
+            .is_some_and(|entry| entry.child.is_some())
+    }
+
+    fn hold_restart(&mut self, key: &ShardKey, held: bool) {
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.restart_held = held;
+        }
+    }
+
+    /// Request cooperative shutdown through the launch-scoped anonymous pipe.
+    /// The child must drain, then exit with code zero. A successful write is NOT
+    /// a successful stop: callers must poll/reap the child. EOF is not shutdown.
+    /// No credentials, paths or process identifiers are sent on this channel.
+    /// Cancellation or a failed/partial write never causes an automatic resend.
+    pub async fn graceful_stop(&mut self, key: &ShardKey) -> Result<(), DaemonError> {
+        self.stop(key, StopMode::WaitForExit)?;
+        let entry = self.entries.get_mut(key).ok_or(DaemonError::UnknownShard)?;
+        let Some(child) = entry.child.as_mut() else {
+            return Ok(());
+        };
+        if let Some(result) = entry.graceful_stop {
+            return result;
+        }
+        entry.graceful_stop = Some(Err(DaemonError::StopFailed));
+        let pipe = child.stdin.as_mut().ok_or(DaemonError::StopFailed)?;
+        let result = tokio::time::timeout(Duration::from_millis(100), async {
+            pipe.write_all(b"{\"command\":\"shutdown\"}\n").await?;
+            pipe.flush().await
+        })
+        .await;
+        if matches!(result, Ok(Ok(()))) {
+            entry.graceful_stop = Some(Ok(()));
+            Ok(())
+        } else {
+            Err(DaemonError::StopFailed)
+        }
     }
 }
