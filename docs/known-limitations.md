@@ -16,12 +16,12 @@
 
 ## Worker更新・配送・外部副作用
 
-- Worker単位の受付ゲート・応答待ち・snapshot引き継ぎはあるが、仕様のShard Core世代交代や旧新並行drainを完成したものではない。別Workerは動作できるが、対象Workerの新規処理は待つ。複数Workerの途中失敗は新旧混在となり、全体rollbackはない。
+- Worker単位の受付ゲート・応答待ち・snapshot引き継ぎはあるが、仕様のShard Core世代交代や旧新並行drainを完成したものではない。別Workerは動作できるが、対象Workerの新規処理は待つ。複数Workerの途中失敗は新旧混在となり、全体rollbackはない。[hot_swap_scenarios.rs](../src/tests/hot_swap_scenarios.rs) のT04再現試験は、旧dispatchのread lockが切替を待たせることと、IPC期限5秒が5秒応答待ちをtimeoutさせることを確認する `#[ignore]` 試験。実Workerへのrelayで遅延を注入しており、本物の5秒アプリハンドラー、Shard単位の並行drain、旧CoreへのREST結果帰属は未検証。
 - 外部応答timeout・失敗・取消は結果不明になり得る。該当Workerの更新を拒否する追跡と読み取り専用 `manage list-unknown` はある。照合根拠を指定するManager APIはあるが、解除CLI・根拠の検証・永続監査・ページ化は未実装。追跡は再起動で消える。
 - メッセージ送信/編集に10秒、Interaction初回ACKに2秒のtimeoutを置くが、実Discordの3秒期限遵守、429/5xx、再接続・遅延・取消競合は未検証。ACK結果不明ならコマンドを実行・再送しない。飽和時にはInteractionをACKできずDiscord側で失敗表示となり得る。
 - Gatewayの同時処理上限は64。Worker要求はWorkerごとに直列、待機・処理には期限がある。過負荷のメッセージは破棄され得る。永続スプール、全DispatchのACK/再配送・欠落検出、セッション横断の重複排除は未実装。限定的なat-least-onceも全経路の保証ではない。
 - **exactly-once、完全無欠落、グローバル順序、障害を含む無停止は保証しない。** HTTP成功後の応答喪失は、外部副作用を取り消せない。任意の通知・DB更新にはアプリ側の冪等性と照合が必要。
-- reloadの確認timeout後も要求が残り、後から更新され得る。Workerクラッシュ時は最後に親が受け取ったsnapshotから復旧を試みるだけで、未確認処理の結果は不明。親/ホスト停止でメモリ状態を失う。
+- reloadの確認timeout後も要求が残り、後から更新され得る。Workerクラッシュ時は最後に親が受け取ったsnapshotから復旧を試みるだけで、未確認処理の結果は不明。親/ホスト停止でメモリ状態を失う。上記シナリオ試験で、Ready前クラッシュ時の旧PID・状態維持（T05）、正常Ready後の未知Helloバージョン範囲／必須capability拒否と旧版維持・後続正常更新（T19）、切替後の応答喪失時に失敗要求を再送せず新版を最後の確認済みsnapshotから再起動しstderrに記録すること（T06）をWindowsで確認。旧版への切戻しではない。切替後クラッシュの管理用 `.status.error` 記録はなく、この観測性不足の再現試験も `#[ignore]` で残す（当該ファイル形式は§6の明示要件ではない）。Linux・実Discord・外部副作用・自発クラッシュの常時監視は未検証。
 
 ## API・状態・IPC
 
