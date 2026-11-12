@@ -510,6 +510,7 @@ pub struct ShardMetrics {
     pub http_5xx: Counter,
     pub interaction_initial_response_deadline_exceeded: Counter,
     pub active_changes: Counter,
+    pub(crate) feed: RwLock<crate::metrics_feed::FeedSnapshot>,
 }
 
 impl ShardMetrics {
@@ -532,6 +533,7 @@ impl ShardMetrics {
             http_5xx: Counter::new(),
             interaction_initial_response_deadline_exceeded: Counter::new(),
             active_changes: Counter::new(),
+            feed: RwLock::new(crate::metrics_feed::FeedSnapshot::default()),
         }
     }
     pub fn labels(&self) -> &MetricLabels {
@@ -718,6 +720,11 @@ impl MetricsRegistry {
         for handle in self.handles() {
             let (status, histogram) = handle.snapshot_with_histogram();
             render_series(&mut families, &status, &histogram);
+            crate::metrics_feed::render(
+                &mut families,
+                &status.labels,
+                &handle.feed.read().unwrap_or_else(|e| e.into_inner()),
+            );
         }
         let mut out = String::new();
         for (name, kind, help) in FAMILIES {
@@ -736,6 +743,47 @@ impl Default for MetricsRegistry {
 }
 
 const FAMILIES: &[(&str, &str, &str)] = &[
+    (
+        "met_feed_dropped_total",
+        "counter",
+        "Observations dropped by the feed channel.",
+    ),
+    (
+        "met_feed_failover_state",
+        "gauge",
+        "Observed failover state code; advisory only.",
+    ),
+    (
+        "met_feed_switch_phase",
+        "gauge",
+        "Observed Core switch phase code.",
+    ),
+    (
+        "met_feed_switch_generation",
+        "gauge",
+        "Observed active Core generation.",
+    ),
+    ("met_feed_event_retained", "gauge", "Retained event count."),
+    (
+        "met_feed_event_retained_bytes",
+        "gauge",
+        "Retained event payload bytes.",
+    ),
+    (
+        "met_feed_rest_wait_seconds",
+        "gauge",
+        "Last observed REST budget wait.",
+    ),
+    (
+        "met_feed_identify_wait_seconds",
+        "gauge",
+        "Last completed Identify queue wait.",
+    ),
+    (
+        "met_feed_drain_seconds",
+        "gauge",
+        "Last completed drain duration.",
+    ),
     (
         "met_events_total",
         "counter",
