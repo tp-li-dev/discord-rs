@@ -265,6 +265,24 @@ fn windows_unicode_spaces_and_shell_metacharacters_are_literal() {
 
 #[cfg(windows)]
 #[test]
+fn windows_unicode_profile_style_parent_and_filename_are_literal() {
+    let fixture = Fixture::new();
+    let parent = fixture.path("runneradmin 日本語 ' $() ; [profile]");
+    fs::create_dir(&parent).unwrap();
+    let path = parent.join("秘密 🔒 ' $() ; [secret].txt");
+    let file = create_secret_file(&path, b"public fixture")
+        .unwrap_or_else(|error| panic!("Unicode parent ACL preparation failed: {error}"));
+    assert_private(&path, &file);
+    drop(file);
+    let mut file = open_secret_file(&path)
+        .unwrap_or_else(|error| panic!("Unicode parent ACL verification failed: {error}"));
+    assert_eq!(contents(&mut file), b"public fixture");
+    // Verification must not leave ACL metadata files next to the secret.
+    assert_eq!(fs::read_dir(&parent).unwrap().count(), 1);
+}
+
+#[cfg(windows)]
+#[test]
 fn windows_unsupported_names_do_not_create_files() {
     let fixture = Fixture::new();
     for path in [
