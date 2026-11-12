@@ -7,13 +7,16 @@ use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
     process::Stdio,
-    sync::{Arc, Mutex as StdMutex},
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, ChildStdout, Command},
-    sync::{Mutex, OwnedRwLockReadGuard, RwLock},
+    sync::{Mutex, Notify, OwnedRwLockReadGuard, RwLock},
     time::timeout,
 };
 
@@ -23,7 +26,9 @@ const EVENT_SEQ_CAPABILITY: &str = "event-seq-v1";
 const EVENT_REPLAY_CAPABILITY: &str = "event-replay-v1";
 const HELLO_CAPABILITY: &str = "hello-v1";
 const CONCURRENT_DRAIN_CAPABILITY: &str = "concurrent-drain-v1";
+const API_RESULT_CAPABILITY: &str = "api-result-v1";
 const OPTIONAL_CAPABILITIES: &[&str] = &[
+    API_RESULT_CAPABILITY,
     CONCURRENT_DRAIN_CAPABILITY,
     EVENT_SEQ_CAPABILITY,
     EVENT_REPLAY_CAPABILITY,
@@ -201,6 +206,14 @@ enum Request {
         hello: crate::protocol::Hello,
     },
     Health,
+    ResponseDispatch {
+        operation_id: u64,
+        request: Box<Request>,
+    },
+    ApiResult {
+        operation_id: u64,
+        outcome: ApiOutcome,
+    },
     Dispatch {
         key: u64,
         content: String,
@@ -231,6 +244,9 @@ enum Request {
 }
 impl Request {
     fn application(&self) -> bool {
+        if let Self::ResponseDispatch { request, .. } = self {
+            return request.application();
+        }
         matches!(
             self,
             Self::Dispatch { .. }
@@ -248,6 +264,7 @@ impl Request {
     // unchanged; validate that promise on every result before accepting it.
     fn state_barrier(&self) -> bool {
         match self {
+            Self::ResponseDispatch { request, .. } => request.state_barrier(),
             Self::Dispatch { content, .. } => {
                 let name = content.split_whitespace().next().unwrap_or("");
                 matches!(name, "!count" | "!job")
@@ -260,6 +277,12 @@ impl Request {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Response {
+    ApiResultAccepted {
+        operation_id: u64,
+        outcome: ApiOutcome,
+        identity: crate::protocol::Identity,
+        pid: u32,
+    },
     EventStreamRestored,
     EventAccepted {
         local_sequence: u64,
@@ -277,6 +300,8 @@ enum Response {
         required_capabilities: Vec<String>,
         #[serde(default)]
         supported_capabilities: Vec<String>,
+        #[serde(default)]
+        credential_free: bool,
         build: String,
         pid: u32,
     },
@@ -292,6 +317,33 @@ enum Response {
     Rejected {
         reason: String,
     },
+}
+
+/// Sanitized transport result only: credentials and HTTP bodies never enter Core.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ApiOutcome {
+    Confirmed { status: u16 },
+    Unknown,
+}
+
+/// A receipt received on the same pipe that executed the response-bearing command.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiReceipt {
+    pub operation_id: u64,
+    pub worker_index: usize,
+    pub pid: u32,
+    pub identity: crate::protocol::Identity,
+    pub outcome: ApiOutcome,
+}
+
+/// Identity is absent for legacy peers which did not complete bidirectional Hello.
+#[derive(Clone, Debug, Serialize)]
+pub struct WorkerIdentity {
+    pub index: usize,
+    pub pid: u32,
+    pub identity: Option<crate::protocol::Identity>,
+    pub credential_free: bool,
 }
 
 // Legacy protocol 5 workers omit the range. Partial ranges are malformed.
@@ -372,19 +424,36 @@ struct TransferState {
 
 struct Process {
     _child: Child,
-    input: ChildStdin,
+    input: Option<ChildStdin>,
     output: BufReader<ChildStdout>,
     broken: bool,
     transfer: Arc<StdMutex<TransferState>>,
     build: String,
     pid: u32,
     supported_capabilities: Vec<String>,
+    identity: Option<crate::protocol::Identity>,
+    credential_free: bool,
 }
+
+#[derive(Clone, Copy, Default)]
+struct LaunchPolicy {
+    isolated: bool,
+    require_gateway_capabilities: bool,
+}
+
 impl Process {
-    async fn start(path: &Path, deployment: &DeploymentIdentity) -> Result<Self, AppError> {
+    async fn start(
+        path: &Path,
+        deployment: &DeploymentIdentity,
+        policy: LaunchPolicy,
+    ) -> Result<Self, AppError> {
         let identity = deployment.next_identity()?;
         let mut hello = local_hello(identity.clone());
-        let mut child = Command::new(path)
+        let mut command = Command::new(path);
+        if policy.isolated {
+            command.env_clear();
+        }
+        let mut child = command
             .arg("--worker")
             .env(IDENTITY_ENV, serde_json::to_string(&identity)?)
             .env_remove("DISCORD_TOKEN")
@@ -405,7 +474,7 @@ impl Process {
         );
         let mut process = Self {
             _child: child,
-            input,
+            input: Some(input),
             output,
             broken: false,
             transfer: Arc::new(StdMutex::new(TransferState {
@@ -416,6 +485,8 @@ impl Process {
             build: String::new(),
             pid: 0,
             supported_capabilities: Vec::new(),
+            identity: None,
+            credential_free: false,
         };
         match process.request(&Request::Health).await? {
             Response::Ready {
@@ -424,13 +495,18 @@ impl Process {
                 protocol_max,
                 required_capabilities,
                 supported_capabilities,
+                credential_free,
                 build,
                 pid,
             } => {
                 validate_hello(protocol_min, protocol_max, &required_capabilities)?;
                 // Optional reflection by older v5 peers is not an advertisement
                 // that they implement new semantics or new wire requests.
-                for cap in [EVENT_REPLAY_CAPABILITY, CONCURRENT_DRAIN_CAPABILITY] {
+                for cap in [
+                    EVENT_REPLAY_CAPABILITY,
+                    CONCURRENT_DRAIN_CAPABILITY,
+                    API_RESULT_CAPABILITY,
+                ] {
                     if !supported_capabilities.iter().any(|value| value == cap) {
                         hello.optional_capabilities.retain(|value| value != cap);
                     }
@@ -448,6 +524,8 @@ impl Process {
                         Response::Hello { hello: peer } => {
                             let (_, negotiated) = hello.negotiate(&peer).map_err(failure)?;
                             process.supported_capabilities = negotiated;
+                            process.identity = Some(peer.identity);
+                            process.credential_free = credential_free;
                         }
                         _ => return Err(failure("worker hello rejected")),
                     }
@@ -455,12 +533,29 @@ impl Process {
                     process.supported_capabilities = supported_capabilities
                         .into_iter()
                         .filter(|cap| {
-                            cap != EVENT_SEQ_CAPABILITY && cap != CONCURRENT_DRAIN_CAPABILITY
+                            cap != EVENT_SEQ_CAPABILITY
+                                && cap != CONCURRENT_DRAIN_CAPABILITY
+                                && cap != API_RESULT_CAPABILITY
                         })
                         .collect();
                 }
                 process.build = build;
                 process.pid = pid;
+                if policy.require_gateway_capabilities
+                    && [
+                        API_RESULT_CAPABILITY,
+                        "command-dispatch-v1",
+                        "slash-arguments-v1",
+                        "ready-event-v1",
+                    ]
+                    .iter()
+                    .any(|cap| !process.supports(cap))
+                {
+                    return Err(failure("worker lacks required Gateway capabilities"));
+                }
+                if process.supports(API_RESULT_CAPABILITY) && process._child.id() != Some(pid) {
+                    return Err(failure("worker API result process identity mismatch"));
+                }
                 if process.supports(CONCURRENT_DRAIN_CAPABILITY) {
                     // Establish a confirmed initial snapshot, including custom
                     // initial state, before admitting any application work.
@@ -542,8 +637,11 @@ impl Process {
                 return Err(failure("worker request exceeds frame limit"));
             }
             timeout(DEADLINE, async {
-                self.input.write_all(&data).await?;
-                self.input.flush().await
+                let input = self.input.as_mut().ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::BrokenPipe, "worker input is closed")
+                })?;
+                input.write_all(&data).await?;
+                input.flush().await
             })
             .await
             .map_err(|_| failure("worker write timed out"))??;
@@ -684,6 +782,8 @@ struct Generation {
     build: String,
     pid: u32,
     capabilities: Vec<String>,
+    identity: Option<crate::protocol::Identity>,
+    credential_free: bool,
     state_barrier: Arc<RwLock<()>>,
     work: Arc<RwLock<()>>,
     responses: ResponseDrain,
@@ -696,6 +796,8 @@ impl Generation {
             build: process.build.clone(),
             pid: process.pid,
             capabilities: process.supported_capabilities.clone(),
+            identity: process.identity.clone(),
+            credential_free: process.credential_free,
             process: Mutex::new(process),
             state_barrier: Arc::new(RwLock::new(())),
             work: Arc::new(RwLock::new(())),
@@ -727,6 +829,9 @@ struct ManagementRecord {
 }
 pub struct Manager {
     deployment: DeploymentIdentity,
+    launch_policy: LaunchPolicy,
+    stopping: AtomicBool,
+    stopped: Notify,
     workers: Vec<RwLock<Arc<Generation>>>,
     generations: StdMutex<Vec<RegisteredGeneration>>,
     update: Mutex<()>,
@@ -744,15 +849,33 @@ pub struct ResponseGuard {
     instance_id: String,
     _work: OwnedRwLockReadGuard<()>,
     dispatched: bool,
+    deliver_result: bool,
+    expects_result: bool,
     operation: ResponseOperation,
 }
 impl ResponseGuard {
+    /// Confirm local bookkeeping. For result-delivery reservations this is only
+    /// valid when no response was produced: use Manager::finish_response for
+    /// Some(content), including failures/unknown outcomes after HTTP dispatch.
     pub fn confirm(self) {
         self.operation.confirm();
     }
 }
 
 impl Manager {
+    pub async fn worker_identities(&self) -> Vec<WorkerIdentity> {
+        let mut identities = Vec::with_capacity(self.workers.len());
+        for (index, worker) in self.workers.iter().enumerate() {
+            let generation = worker.read().await;
+            identities.push(WorkerIdentity {
+                index,
+                pid: generation.pid,
+                identity: generation.identity.clone(),
+                credential_free: generation.credential_free,
+            });
+        }
+        identities
+    }
     pub async fn describe_workers(&self) -> String {
         let mut lines = vec!["稼働中のWorker:".to_string()];
         for (index, worker) in self.workers.iter().enumerate() {
@@ -777,13 +900,61 @@ impl Manager {
         count: usize,
         deployment: DeploymentIdentity,
     ) -> Result<Arc<Self>, AppError> {
+        Self::start_configured_pool(path, count, deployment, LaunchPolicy::default()).await
+    }
+
+    /// Managed Gateway launch: Core receives only its negotiated IPC identity.
+    /// Preserve the policy through recovery and replacement, not just startup.
+    pub async fn start_pool_isolated(
+        path: PathBuf,
+        count: usize,
+        deployment: DeploymentIdentity,
+    ) -> Result<Arc<Self>, AppError> {
+        Self::start_configured_pool(
+            path,
+            count,
+            deployment,
+            LaunchPolicy {
+                isolated: true,
+                require_gateway_capabilities: false,
+            },
+        )
+        .await
+    }
+
+    /// Gateway contract: reject startup, replacement and recovery candidates
+    /// before admission unless they can execute commands and return REST results.
+    /// Generic Manager constructors retain legacy v5 compatibility.
+    pub async fn start_gateway_pool(
+        path: PathBuf,
+        count: usize,
+        deployment: DeploymentIdentity,
+    ) -> Result<Arc<Self>, AppError> {
+        Self::start_configured_pool(
+            path,
+            count,
+            deployment,
+            LaunchPolicy {
+                isolated: true,
+                require_gateway_capabilities: true,
+            },
+        )
+        .await
+    }
+
+    async fn start_configured_pool(
+        path: PathBuf,
+        count: usize,
+        deployment: DeploymentIdentity,
+        launch_policy: LaunchPolicy,
+    ) -> Result<Arc<Self>, AppError> {
         if count == 0 {
             return Err(failure("Worker数は1以上にしてください"));
         }
         let mut workers = Vec::with_capacity(count);
         let mut generations = Vec::with_capacity(count);
         for index in 0..count {
-            let process = Process::start(&path, &deployment).await?;
+            let process = Process::start(&path, &deployment, launch_policy).await?;
             let generation = Generation::new(path.clone(), process);
             generations.push(RegisteredGeneration {
                 index,
@@ -797,6 +968,9 @@ impl Manager {
         let instance_id = instance.iter().map(|byte| format!("{byte:02x}")).collect();
         Ok(Arc::new(Self {
             deployment,
+            launch_policy,
+            stopping: AtomicBool::new(false),
+            stopped: Notify::new(),
             workers,
             instance_id,
             generations: StdMutex::new(generations),
@@ -865,7 +1039,9 @@ impl Manager {
 
     pub async fn replace(&self, path: PathBuf, force: bool) -> Result<(), AppError> {
         let _replacement = self.replace_lock.lock().await;
+        self.require_running()?;
         for (index, worker) in self.workers.iter().enumerate() {
+            self.require_running()?;
             self.retire_previous(index).await?;
             if !force && worker.read().await.path == path {
                 continue;
@@ -881,8 +1057,9 @@ impl Manager {
                 ));
             }
             // Readiness failures must not stop old admission.
-            let mut candidate = Process::start(&path, &self.deployment).await?;
+            let mut candidate = Process::start(&path, &self.deployment, self.launch_policy).await?;
             let recovery = self.update.lock().await;
+            self.require_running()?;
             // Recovery can install a generation while the candidate is starting.
             // Recheck under the recovery lock before allocating another retained
             // generation or bypassing an old unknown external outcome.
@@ -1022,10 +1199,34 @@ impl Manager {
     /// Use dispatch_*_with_response for generation attribution. If routing changes
     /// between this reservation and dispatch, it is rejected without sending work.
     pub async fn begin_response(&self, key: u64) -> Result<ResponseGuard, AppError> {
+        self.reserve_response(key, false).await
+    }
+
+    /// Reserve a response whose sanitized REST result must return over Worker IPC.
+    /// A supported peer is required before any command or external effect starts.
+    pub async fn begin_response_delivery(&self, key: u64) -> Result<ResponseGuard, AppError> {
+        self.reserve_response(key, true).await
+    }
+
+    async fn reserve_response(
+        &self,
+        key: u64,
+        deliver_result: bool,
+    ) -> Result<ResponseGuard, AppError> {
+        self.require_running()?;
         let index = self.worker_index(key);
         let active = self.workers[index].read().await;
         let generation = active.clone();
         let work = generation.work.clone().read_owned().await;
+        self.require_running()?;
+        if deliver_result
+            && !generation
+                .capabilities
+                .iter()
+                .any(|cap| cap == API_RESULT_CAPABILITY)
+        {
+            return Err(failure("worker does not support API result delivery"));
+        }
         let operation = generation
             .responses
             .begin()
@@ -1036,6 +1237,8 @@ impl Manager {
             instance_id: self.instance_id.clone(),
             _work: work,
             dispatched: false,
+            deliver_result,
+            expects_result: false,
             operation,
         })
     }
@@ -1082,11 +1285,144 @@ impl Manager {
             .await?;
         response.dispatched = true;
         let generation = admission.generation.clone();
+        let request = if response.deliver_result {
+            Request::ResponseDispatch {
+                operation_id: response.operation.id(),
+                request: Box::new(request),
+            }
+        } else {
+            request
+        };
         let result = Self::exchange(&generation, request).await;
+        response.expects_result = matches!(&result, Ok(Some(_)));
         drop(admission);
         self.recover_if_broken(response.index, generation, &result)
             .await;
         result
+    }
+
+    /// Deliver once to the issuing generation, including after routing switched.
+    /// An ACK mismatch, missing ACK or cancellation leaves an unknown operation;
+    /// no current-generation fallback or HTTP retry is attempted.
+    pub async fn finish_response(
+        &self,
+        response: ResponseGuard,
+        outcome: ApiOutcome,
+    ) -> Result<ApiReceipt, AppError> {
+        if response.instance_id != self.instance_id
+            || !response.deliver_result
+            || !response.expects_result
+        {
+            return Err(failure(
+                "response result does not match a dispatched operation",
+            ));
+        }
+        if matches!(outcome, ApiOutcome::Confirmed { status } if !(200..=599).contains(&status)) {
+            return Err(failure("invalid API result status"));
+        }
+        let expected_identity = response
+            .generation
+            .identity
+            .as_ref()
+            .ok_or_else(|| failure("API result delivery requires negotiated identity"))?;
+        let mut process = timeout(APPLICATION_DEADLINE, response.generation.process.lock())
+            .await
+            .map_err(|_| failure("worker API result admission timed out"))?;
+        let operation_id = response.operation.id();
+        let receipt = match process
+            .request(&Request::ApiResult {
+                operation_id,
+                outcome,
+            })
+            .await?
+        {
+            Response::ApiResultAccepted {
+                operation_id: received,
+                outcome: received_outcome,
+                identity,
+                pid,
+            } if received == operation_id
+                && received_outcome == outcome
+                && &identity == expected_identity
+                && pid == response.generation.pid =>
+            {
+                ApiReceipt {
+                    operation_id,
+                    worker_index: response.index,
+                    pid,
+                    identity,
+                    outcome,
+                }
+            }
+            _ => {
+                process.broken = true;
+                return Err(failure("worker API result acknowledgement mismatch"));
+            }
+        };
+        drop(process);
+        if matches!(outcome, ApiOutcome::Confirmed { .. }) {
+            response.confirm();
+        }
+        Ok(receipt)
+    }
+
+    fn require_running(&self) -> Result<(), AppError> {
+        if self.stopping.load(Ordering::Acquire) {
+            Err(failure("worker manager is shutting down"))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Stop admission, wait for owned work/results, close Core stdin and reap it.
+    /// EOF is the existing Worker drain contract. Unknown outcomes are never
+    /// reported as a successful graceful shutdown; the caller chooses escalation.
+    pub async fn shutdown(&self) -> Result<Vec<u32>, AppError> {
+        self.stopping.store(true, Ordering::Release);
+        self.stopped.notify_waiters();
+        timeout(DRAIN_DEADLINE, async {
+            let _replacement = self.replace_lock.lock().await;
+            let _recovery = self.update.lock().await;
+            let generations: Vec<_> = self
+                .generations
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|entry| entry.generation.clone())
+                .collect();
+            for generation in &generations {
+                generation.responses.start_drain();
+            }
+            let mut work = Vec::with_capacity(generations.len());
+            let mut unknown = false;
+            for generation in &generations {
+                work.push(generation.work.clone().write_owned().await);
+                unknown |= !generation.responses.wait_settled().await.is_empty();
+            }
+            // Close every pipe before waiting for any child to exit.
+            for generation in &generations {
+                generation.process.lock().await.input.take();
+            }
+            let mut pids = Vec::with_capacity(generations.len());
+            let mut failed = false;
+            for generation in &generations {
+                let mut process = generation.process.lock().await;
+                failed |= !process._child.wait().await?.success();
+                process.broken = true;
+                pids.push(process.pid);
+            }
+            if unknown {
+                Err(failure(
+                    "unresolved response outcomes prevent graceful shutdown",
+                ))
+            } else if failed {
+                Err(failure("worker exited unsuccessfully during shutdown"))
+            } else {
+                Ok(pids)
+            }
+        })
+        .await
+        .map_err(|_| failure("worker shutdown timed out"))?
     }
     pub async fn dispatch(&self, content: String) -> Result<Option<String>, AppError> {
         self.dispatch_key(0, content).await
@@ -1140,7 +1476,14 @@ impl Manager {
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 interval.tick().await;
                 loop {
-                    interval.tick().await;
+                    let stopped = manager.stopped.notified();
+                    if manager.stopping.load(Ordering::Acquire) {
+                        break;
+                    }
+                    tokio::select! {
+                        _ = stopped => break,
+                        _ = interval.tick() => {}
+                    }
                     if let Err(error) = manager.execute(index, Request::Tick).await {
                         eprintln!(
                             "Worker {} の仕事を進められません: {}",
@@ -1160,6 +1503,7 @@ impl Manager {
     ) -> Result<Admission, AppError> {
         timeout(APPLICATION_DEADLINE, async {
             loop {
+                self.require_running()?;
                 let active = self.workers[index].read().await;
                 let generation = active.clone();
                 if expected.is_some_and(|expected| !Arc::ptr_eq(expected, &generation)) {
@@ -1181,6 +1525,7 @@ impl Manager {
                     None
                 };
                 let work = generation.work.clone().read_owned().await;
+                self.require_running()?;
                 return Ok(Admission {
                     generation,
                     _work: work,
@@ -1209,7 +1554,16 @@ impl Manager {
         let mut process = timeout(APPLICATION_DEADLINE, generation.process.lock())
             .await
             .map_err(|_| failure("worker admission timed out"))?;
-        let capability = match request {
+        let command = match &request {
+            Request::ResponseDispatch { request, .. } => request.as_ref(),
+            request => request,
+        };
+        if matches!(&request, Request::ResponseDispatch { .. })
+            && !process.supports(API_RESULT_CAPABILITY)
+        {
+            return Err(failure("worker does not support API result delivery"));
+        }
+        let capability = match command {
             Request::Command { .. } => Some("command-dispatch-v1"),
             Request::SlashCommand { .. } => Some("slash-arguments-v1"),
             Request::ReadyEvent { .. } => Some("ready-event-v1"),
@@ -1261,6 +1615,9 @@ impl Manager {
             return;
         }
         let _recovery = self.update.lock().await;
+        if self.stopping.load(Ordering::Acquire) {
+            return;
+        }
         let mut active = self.workers[index].write().await;
         self.reap_retired();
         let recovery = if Arc::ptr_eq(&active, &generation) {
@@ -1275,7 +1632,9 @@ impl Manager {
                 {
                     return Err(failure("previous worker generation is still draining"));
                 }
-                let mut candidate = Process::start(&generation.path, &self.deployment).await?;
+                let mut candidate =
+                    Process::start(&generation.path, &self.deployment, self.launch_policy).await?;
+                self.require_running()?;
                 if let Some(state) = transfer.checkpoint.clone() {
                     candidate.restore(STATE_VERSION, state).await?;
                 }
@@ -1350,7 +1709,14 @@ impl Manager {
     pub async fn watch(self: Arc<Self>, file: PathBuf) {
         self.management.lock().await.file = Some(file.clone());
         loop {
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            let stopped = self.stopped.notified();
+            if self.stopping.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::select! {
+                _ = stopped => break,
+                _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+            }
             match tokio::fs::read_to_string(&file).await {
                 Ok(value) if !value.trim().is_empty() => {
                     let path = PathBuf::from(value.trim());
@@ -1418,10 +1784,34 @@ pub async fn run() -> Result<(), AppError> {
     )?;
     let mut sequenced_events = false;
     let mut replay_events = false;
+    let mut api_results = false;
+    let mut pending_results = std::collections::HashSet::new();
     let mut event_stream_initialized = false;
     let mut receiver = crate::event_seq::Receiver::new(0);
     while let Some(frame) = read_frame(&mut input).await? {
-        let request = match serde_json::from_slice(&frame)? {
+        let request = serde_json::from_slice(&frame)?;
+        let (request, operation) = match request {
+            Request::ResponseDispatch {
+                operation_id,
+                request,
+            } => {
+                if !api_results
+                    || pending_results.len() >= 1024
+                    || pending_results.contains(&operation_id)
+                    || !matches!(
+                        &*request,
+                        Request::Dispatch { .. }
+                            | Request::Command { .. }
+                            | Request::SlashCommand { .. }
+                    )
+                {
+                    return Err(failure("invalid response-bearing dispatch"));
+                }
+                (*request, Some(operation_id))
+            }
+            request => (request, None),
+        };
+        let request = match request {
             Request::SequencedReady {
                 local_sequence,
                 bot_name,
@@ -1443,6 +1833,29 @@ pub async fn run() -> Result<(), AppError> {
             request => request,
         };
         let response = match request {
+            Request::ResponseDispatch { .. } => unreachable!(),
+            Request::ApiResult {
+                operation_id,
+                outcome,
+            } => {
+                if !api_results
+                    || matches!(outcome, ApiOutcome::Confirmed { status } if !(200..=599).contains(&status))
+                    || !pending_results.remove(&operation_id)
+                {
+                    Response::Rejected {
+                        reason: "unmatched API result".into(),
+                    }
+                } else {
+                    Response::ApiResultAccepted {
+                        operation_id,
+                        outcome,
+                        identity: identity
+                            .clone()
+                            .ok_or_else(|| failure("missing worker identity"))?,
+                        pid: std::process::id(),
+                    }
+                }
+            }
             Request::SequencedReady { .. } => unreachable!(),
             Request::RestoreEventStream { next_sequence } => {
                 if replay_events && sequenced_events && !event_stream_initialized {
@@ -1465,6 +1878,8 @@ pub async fn run() -> Result<(), AppError> {
                             replay_events = capabilities
                                 .iter()
                                 .any(|cap| cap == EVENT_REPLAY_CAPABILITY);
+                            api_results =
+                                capabilities.iter().any(|cap| cap == API_RESULT_CAPABILITY);
                             Response::Hello { hello }
                         }
                         Err(reason) => Response::Rejected {
@@ -1482,6 +1897,7 @@ pub async fn run() -> Result<(), AppError> {
                 protocol_max: Some(PROTOCOL),
                 required_capabilities: CAPABILITIES.iter().map(|s| (*s).to_owned()).collect(),
                 supported_capabilities: vec![
+                    API_RESULT_CAPABILITY.into(),
                     CONCURRENT_DRAIN_CAPABILITY.into(),
                     EVENT_SEQ_CAPABILITY.into(),
                     EVENT_REPLAY_CAPABILITY.into(),
@@ -1490,6 +1906,12 @@ pub async fn run() -> Result<(), AppError> {
                     "ready-event-v1".into(),
                     "slash-arguments-v1".into(),
                 ],
+                // No values are inspected, serialized or logged. Windows may
+                // supply SystemRoot even to a process launched with env_clear.
+                credential_free: std::env::vars_os().all(|(name, _)| {
+                    name == IDENTITY_ENV
+                        || (cfg!(windows) && name.eq_ignore_ascii_case("SystemRoot"))
+                }),
                 build: crate::cogs::build_id().to_owned(),
                 pid: std::process::id(),
             },
@@ -1554,6 +1976,17 @@ pub async fn run() -> Result<(), AppError> {
                 }
             }
         };
+        if let Some(operation_id) = operation
+            && matches!(
+                &response,
+                Response::Result {
+                    content: Some(_),
+                    ..
+                }
+            )
+        {
+            pending_results.insert(operation_id);
+        }
         let mut data = serde_json::to_vec(&response)?;
         data.push(b'\n');
         output.write_all(&data).await?;
@@ -1562,7 +1995,11 @@ pub async fn run() -> Result<(), AppError> {
     tasks.begin_drain();
     tasks.wait_drained().await?;
     output.flush().await?;
-    Ok(())
+    if pending_results.is_empty() {
+        Ok(())
+    } else {
+        Err(failure("worker exited with unresolved API results"))
+    }
 }
 
 async fn handle_command(
@@ -1647,6 +2084,7 @@ mod frame_tests {
                 "ready-event-v1".into(),
                 "slash-arguments-v1".into(),
             ],
+            credential_free: false,
             build: "new".into(),
             pid: 7,
         })

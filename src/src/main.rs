@@ -1,6 +1,25 @@
+use serde::Deserialize;
+use serde_json::{Value, json};
 use src::{AppError, redact::Secret, worker};
-use std::{env, error::Error, ffi::OsStr, fmt, future::IntoFuture, process::ExitCode, sync::Arc};
-use tokio::sync::Semaphore;
+use std::{
+    collections::BTreeMap,
+    env,
+    error::Error,
+    ffi::{OsStr, OsString},
+    fmt,
+    future::IntoFuture,
+    net::SocketAddr,
+    path::{Component, PathBuf},
+    process::ExitCode,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+use tokio::{
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
+    net::TcpStream,
+    sync::{Semaphore, oneshot},
+    task::JoinSet,
+};
 use twilight_gateway::{
     ConfigBuilder, Event, EventTypeFlags, Intents, Shard, ShardId, StreamExt as _,
 };
@@ -92,6 +111,10 @@ enum StartupFailure {
     MetadataUnavailable,
     InsufficientShards,
     InvalidIdentifyLimits,
+    InvalidArguments,
+    InvalidMockFrame,
+    MockUnavailable,
+    ShutdownFailed,
 }
 
 impl fmt::Display for StartupFailure {
@@ -106,6 +129,10 @@ impl fmt::Display for StartupFailure {
                 "configured shard count is below Discord recommendation [shards_insufficient]"
             }
             Self::InvalidIdentifyLimits => "invalid session start limits [identify_limits_invalid]",
+            Self::InvalidArguments => "invalid gateway launch arguments [launch_invalid]",
+            Self::InvalidMockFrame => "invalid mock input [mock_input_invalid]",
+            Self::MockUnavailable => "mock transport unavailable [mock_unavailable]",
+            Self::ShutdownFailed => "gateway drain did not complete [shutdown_incomplete]",
         })
     }
 }
@@ -144,6 +171,514 @@ fn token_from_env(value: Result<String, env::VarError>) -> Result<Secret<String>
     }
 }
 
+#[derive(Default)]
+struct GatewayOptions {
+    launch: BTreeMap<String, OsString>,
+    mock_discord: Option<SocketAddr>,
+    local_control: bool,
+}
+
+impl GatewayOptions {
+    fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Self, StartupFailure> {
+        let mut options = Self::default();
+        let mut args = args.into_iter();
+        while let Some(flag) = args.next() {
+            let flag = flag.to_str().ok_or(StartupFailure::InvalidArguments)?;
+            match flag {
+                "--local-control" if !options.local_control => options.local_control = true,
+                "--mock-discord" if options.mock_discord.is_none() => {
+                    let addr = args.next().ok_or(StartupFailure::InvalidArguments)?;
+                    let addr = addr
+                        .to_str()
+                        .and_then(|v| v.parse::<SocketAddr>().ok())
+                        .filter(|addr| addr.ip().is_loopback() && addr.port() != 0)
+                        .ok_or(StartupFailure::InvalidArguments)?;
+                    options.mock_discord = Some(addr);
+                }
+                "--bot-id" | "--shard-id" | "--total-shards" | "--ipc-path" | "--state-path"
+                | "--management-path" | "--token-env" => {
+                    let value = args.next().ok_or(StartupFailure::InvalidArguments)?;
+                    if options.launch.insert(flag.to_owned(), value).is_some() {
+                        return Err(StartupFailure::InvalidArguments);
+                    }
+                }
+                _ => return Err(StartupFailure::InvalidArguments),
+            }
+        }
+        if (!options.launch.is_empty() && options.launch.len() != 7)
+            || (options.local_control
+                && (!options.launch.is_empty() || options.mock_discord.is_some()))
+        {
+            return Err(StartupFailure::InvalidArguments);
+        }
+        if let Some(bot_id) = options.launch.get("--bot-id") {
+            let bot_id = bot_id.to_str().ok_or(StartupFailure::InvalidArguments)?;
+            // Deployment namespaces are strings while today's Core protocol is
+            // u64. Reject aliases such as "001" and "1", rather than letting two
+            // distinct Bot paths acquire the same handshake identity.
+            if !bot_id
+                .parse::<u64>()
+                .ok()
+                .is_some_and(|id| id.to_string() == bot_id)
+            {
+                return Err(StartupFailure::InvalidArguments);
+            }
+        }
+        for flag in ["--ipc-path", "--state-path", "--management-path"] {
+            if let Some(value) = options.launch.get(flag) {
+                let path = PathBuf::from(value);
+                if !path.is_absolute() || path.components().any(|p| p == Component::ParentDir) {
+                    return Err(StartupFailure::InvalidArguments);
+                }
+            }
+        }
+        if let Some(value) = options.launch.get("--token-env") {
+            let value = value.to_str().ok_or(StartupFailure::InvalidArguments)?;
+            let mut bytes = value.bytes();
+            if !bytes
+                .next()
+                .is_some_and(|b| b == b'_' || b.is_ascii_alphabetic())
+                || !bytes.all(|b| b == b'_' || b.is_ascii_alphanumeric())
+            {
+                return Err(StartupFailure::InvalidArguments);
+            }
+        }
+        Ok(options)
+    }
+
+    fn deployment(&self) -> Result<worker::DeploymentIdentity, AppError> {
+        worker::DeploymentIdentity::parse(|name| {
+            let environment = match env::var(name) {
+                Ok(value) => Some(value),
+                Err(env::VarError::NotPresent) => None,
+                Err(_) => return Err("invalid deployment environment"),
+            };
+            let flag = match name {
+                "BOT_ID" => "--bot-id",
+                "SHARD_ID" => "--shard-id",
+                "TOTAL_SHARDS" => "--total-shards",
+                _ => return Ok(environment),
+            };
+            match self.launch.get(flag) {
+                Some(value) => {
+                    let value = value.to_str().ok_or("invalid deployment argument")?;
+                    if environment.as_deref().is_some_and(|v| v != value) {
+                        return Err("conflicting deployment identity");
+                    }
+                    Ok(Some(value.to_owned()))
+                }
+                None => Ok(environment),
+            }
+        })
+    }
+
+    fn token_env(&self) -> &OsStr {
+        self.launch
+            .get("--token-env")
+            .map(OsString::as_os_str)
+            .unwrap_or_else(|| OsStr::new("DISCORD_TOKEN"))
+    }
+
+    fn path(&self, flag: &str) -> Option<PathBuf> {
+        self.launch.get(flag).map(PathBuf::from)
+    }
+}
+
+// A detached OS reader avoids Tokio's uncancellable stdin blocking task keeping
+// the runtime alive after another shutdown source fires. The anonymous pipe is
+// owned by the launcher; EOF/malformed input is never an instruction to stop.
+fn shutdown_input(enabled: bool) -> oneshot::Receiver<()> {
+    let (sender, receiver) = oneshot::channel();
+    if enabled {
+        std::thread::spawn(move || {
+            use src::shard_runtime::{GATEWAY_CONTROL_FRAME_LIMIT, GatewayControl};
+            use std::io::{BufRead, Read};
+            let mut frame = Vec::new();
+            let read = std::io::BufReader::new(std::io::stdin())
+                .take(GATEWAY_CONTROL_FRAME_LIMIT as u64 + 1)
+                .read_until(b'\n', &mut frame);
+            if read.is_ok()
+                && frame.len() <= GATEWAY_CONTROL_FRAME_LIMIT
+                && frame.last() == Some(&b'\n')
+                && matches!(
+                    serde_json::from_slice(&frame),
+                    Ok(GatewayControl::Shutdown {})
+                )
+            {
+                let _ = sender.send(());
+            }
+        });
+    }
+    receiver
+}
+
+async fn shutdown_requested(receiver: oneshot::Receiver<()>) {
+    let control = async {
+        if receiver.await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::select! {
+        _ = control => {},
+        signal = tokio::signal::ctrl_c() => {
+            if signal.is_err() { std::future::pending::<()>().await; }
+        }
+    }
+}
+
+const MOCK_FRAME_LIMIT: u64 = 64 * 1024;
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum MockInput {
+    Prefix {
+        id: u64,
+        key: u64,
+        content: String,
+        rest_addr: SocketAddr,
+    },
+    Slash {
+        id: u64,
+        key: u64,
+        name: String,
+        rest_addr: SocketAddr,
+    },
+    Status {
+        id: u64,
+    },
+    Crash {
+        id: u64,
+    },
+}
+
+async fn mock_frame(
+    reader: &mut (impl AsyncBufRead + Unpin),
+) -> Result<Option<MockInput>, AppError> {
+    // Idle collectors do not time out. Once a frame starts, it must finish within
+    // five seconds, and neither the request nor any parse error is logged.
+    let mut first = [0; 1];
+    if reader.read(&mut first).await? == 0 {
+        return Ok(None);
+    }
+    let mut frame = vec![first[0]];
+    if first[0] != b'\n' {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            reader.take(MOCK_FRAME_LIMIT).read_until(b'\n', &mut frame),
+        )
+        .await
+        .map_err(|_| StartupFailure::InvalidMockFrame)??;
+    }
+    if frame.len() as u64 > MOCK_FRAME_LIMIT || frame.last() != Some(&b'\n') {
+        return Err(StartupFailure::InvalidMockFrame.into());
+    }
+    serde_json::from_slice(&frame)
+        .map(Some)
+        .map_err(|_| StartupFailure::InvalidMockFrame.into())
+}
+
+async fn mock_write(writer: &mut (impl AsyncWrite + Unpin), value: &Value) -> Result<(), AppError> {
+    let mut frame = serde_json::to_vec(value)?;
+    frame.push(b'\n');
+    if frame.len() as u64 > MOCK_FRAME_LIMIT {
+        return Err(StartupFailure::InvalidMockFrame.into());
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        writer.write_all(&frame).await?;
+        writer.flush().await
+    })
+    .await
+    .map_err(|_| StartupFailure::MockUnavailable)??;
+    Ok(())
+}
+
+// This deliberately small adapter only speaks to testkit's bounded, close-after-
+// response loopback HTTP server. No Discord token or Authorization header exists.
+// It is never used for production HTTP, redirects, TLS, retries or rate limits.
+async fn mock_http(addr: SocketAddr, method: &str, path: &str, body: Value) -> Option<u16> {
+    if !addr.ip().is_loopback() || addr.port() == 0 {
+        return None;
+    }
+    let request = async {
+        let body = serde_json::to_vec(&body).ok()?;
+        let mut stream = TcpStream::connect(addr).await.ok()?;
+        let head = format!(
+            "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(head.as_bytes()).await.ok()?;
+        stream.write_all(&body).await.ok()?;
+        let mut bytes = Vec::new();
+        stream
+            .take(MOCK_FRAME_LIMIT + 1)
+            .read_to_end(&mut bytes)
+            .await
+            .ok()?;
+        if bytes.len() as u64 > MOCK_FRAME_LIMIT {
+            return None;
+        }
+        let boundary = bytes.windows(4).position(|b| b == b"\r\n\r\n")?;
+        let head = std::str::from_utf8(&bytes[..boundary]).ok()?;
+        let mut lines = head.split("\r\n");
+        let mut status = lines.next()?.split(' ');
+        if status.next()? != "HTTP/1.1" {
+            return None;
+        }
+        let status: u16 = status.next()?.parse().ok()?;
+        if !(200..=599).contains(&status) {
+            return None;
+        }
+        let mut length = None;
+        for line in lines {
+            let (name, value) = line.split_once(':')?;
+            if name.eq_ignore_ascii_case("transfer-encoding") {
+                return None;
+            }
+            if name.eq_ignore_ascii_case("content-length") {
+                if length.is_some() {
+                    return None;
+                }
+                length = Some(value.trim().parse::<usize>().ok()?);
+            }
+        }
+        if length? != bytes.len() - boundary - 4 {
+            return None;
+        }
+        Some(status)
+    };
+    tokio::time::timeout(Duration::from_secs(2), request)
+        .await
+        .ok()
+        .flatten()
+}
+
+#[derive(Default)]
+struct ResponseProgress {
+    content: Option<String>,
+    dispatched: bool,
+    status: Option<u16>,
+}
+
+fn api_outcome(status: Option<u16>) -> worker::ApiOutcome {
+    status.map_or(worker::ApiOutcome::Unknown, |status| {
+        worker::ApiOutcome::Confirmed { status }
+    })
+}
+
+async fn mock_command(manager: Arc<worker::Manager>, input: MockInput) -> Result<Value, AppError> {
+    let (id, key, rest_addr) = match &input {
+        MockInput::Prefix {
+            id, key, rest_addr, ..
+        }
+        | MockInput::Slash {
+            id, key, rest_addr, ..
+        } => (*id, *key, *rest_addr),
+        _ => return Err(StartupFailure::InvalidMockFrame.into()),
+    };
+    if !rest_addr.ip().is_loopback() || rest_addr.port() == 0 {
+        return Err(StartupFailure::InvalidMockFrame.into());
+    }
+    let mut guard = manager.begin_response_delivery(key).await?;
+    let (content, outcome, receipt) = match input {
+        MockInput::Prefix { content, .. } => {
+            match manager
+                .dispatch_key_with_response(&mut guard, key, content)
+                .await
+            {
+                Ok(Some(content)) => {
+                    let status = mock_http(
+                        rest_addr,
+                        "POST",
+                        &format!("/channels/{key}/messages"),
+                        json!({"content":content}),
+                    )
+                    .await;
+                    let outcome = match status {
+                        Some(200..=299) => "completed",
+                        Some(_) => "failed",
+                        None => "unknown",
+                    };
+                    let receipt = manager.finish_response(guard, api_outcome(status)).await?;
+                    (Some(content), outcome, Some(receipt))
+                }
+                Ok(None) => {
+                    guard.confirm();
+                    (None, "no_reply", None)
+                }
+                Err(_) => {
+                    // No REST request was sent. An IPC error does not establish
+                    // whether the command handler had already run in Core.
+                    guard.confirm();
+                    (None, "dispatch_failed", None)
+                }
+            }
+        }
+        MockInput::Slash { name, .. } => {
+            let Some((name, args)) = slash_input(&name, CommandType::ChatInput, &[]) else {
+                guard.confirm();
+                return Ok(json!({"type":"result", "id":id, "content":null,
+                    "outcome":"not_dispatched", "receipt":null, "unknown_responses":manager.unknown_responses().1.len()}));
+            };
+            let progress = Arc::new(Mutex::new(ResponseProgress::default()));
+            let dispatch_progress = progress.clone();
+            let update_progress = progress.clone();
+            let dispatch_manager = manager.clone();
+            let dispatch_guard = &mut guard;
+            let outcome = src::interaction_flow::run(
+                id,
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+                move |id| async move {
+                    mock_http(
+                        rest_addr,
+                        "POST",
+                        &format!("/interactions/{id}/mock/callback"),
+                        json!({"type":5}),
+                    )
+                    .await
+                        == Some(204)
+                },
+                move || async move {
+                    match dispatch_manager
+                        .dispatch_slash_with_response(dispatch_guard, key, name, args)
+                        .await
+                    {
+                        Ok(Some(content)) => {
+                            let mut progress = dispatch_progress.lock().unwrap();
+                            progress.dispatched = true;
+                            progress.content = Some(content.clone());
+                            content
+                        }
+                        _ => "コマンドを実行できませんでした".to_owned(),
+                    }
+                },
+                move |_, content| async move {
+                    let status = mock_http(
+                        rest_addr,
+                        "PATCH",
+                        "/webhooks/1/mock/messages/@original",
+                        json!({"content":content}),
+                    )
+                    .await;
+                    update_progress.lock().unwrap().status = status;
+                    matches!(status, Some(200..=299))
+                },
+            )
+            .await;
+            let (content, dispatched, status) = {
+                let progress = progress.lock().unwrap();
+                (
+                    progress.content.clone(),
+                    progress.dispatched,
+                    progress.status,
+                )
+            };
+            let receipt = if dispatched {
+                Some(manager.finish_response(guard, api_outcome(status)).await?)
+            } else if outcome == src::interaction_flow::Outcome::Completed {
+                guard.confirm();
+                None
+            } else {
+                // ACK might have been applied even though its response was lost.
+                drop(guard);
+                None
+            };
+            (
+                content,
+                if dispatched {
+                    match status {
+                        Some(200..=299) => "completed",
+                        Some(_) => "failed",
+                        None => "unknown",
+                    }
+                } else if outcome == src::interaction_flow::Outcome::Completed {
+                    "dispatch_failed"
+                } else {
+                    "unknown"
+                },
+                receipt,
+            )
+        }
+        _ => unreachable!(),
+    };
+    Ok(
+        json!({"type":"result", "id":id, "content":content, "outcome":outcome,
+        "receipt":receipt, "unknown_responses":manager.unknown_responses().1.len()}),
+    )
+}
+
+async fn mock_events(
+    stream: &mut TcpStream,
+    options: &GatewayOptions,
+    manager: Arc<worker::Manager>,
+    bot_id: u64,
+    shard: src::protocol::Shard,
+    shutdown: oneshot::Receiver<()>,
+) -> Result<(), AppError> {
+    let (reader, mut writer) = stream.split();
+    let mut reader = BufReader::new(reader);
+    let workers = manager.worker_identities().await;
+    mock_write(&mut writer, &json!({"type":"ready", "mode":"mock_discord", "pid":std::process::id(),
+        "bot_id":bot_id, "shard_id":shard.id(), "total_shards":shard.total(),
+        "ipc_path":options.path("--ipc-path"), "state_path":options.path("--state-path"),
+        "management_path":options.path("--management-path"), "workers":workers,
+        "credential_present":env::var_os(options.token_env()).is_some() || env::var_os("DISCORD_TOKEN").is_some()})).await?;
+    let shutdown = shutdown_requested(shutdown);
+    tokio::pin!(shutdown);
+    let mut inputs_open = true;
+    let mut commands = JoinSet::new();
+    let result = loop {
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => break Ok(()),
+            joined = commands.join_next(), if !commands.is_empty() => {
+                match joined {
+                    Some(Ok(Ok(value))) => if let Err(error) = mock_write(&mut writer, &value).await { break Err(error); },
+                    Some(Ok(Err(error))) => break Err(error),
+                    _ => break Err(StartupFailure::MockUnavailable.into()),
+                }
+            }
+            input = mock_frame(&mut reader), if inputs_open && commands.is_empty() => {
+                match input {
+                    Ok(Some(MockInput::Status { id })) => {
+                        if let Err(error) = mock_write(&mut writer, &json!({"type":"status", "id":id,
+                            "pid":std::process::id(), "workers":manager.worker_identities().await,
+                            "unknown_responses":manager.unknown_responses().1.len()})).await { break Err(error); }
+                    }
+                    Ok(Some(MockInput::Crash { id })) => {
+                        let _ = id;
+                        // Fault injection is reachable only through the explicitly
+                        // selected mock collector; no production listener exists.
+                        std::process::exit(86);
+                    }
+                    Ok(Some(input)) => { commands.spawn(mock_command(manager.clone(), input)); }
+                    Ok(None) => inputs_open = false,
+                    Err(error) => break Err(error),
+                }
+            }
+        }
+    };
+    // Accepted work completes before Worker stdin closes. Socket write failures
+    // cannot cancel a REST operation that may already have been applied.
+    let drained = tokio::time::timeout(Duration::from_secs(30), async {
+        let mut failed = false;
+        while let Some(joined) = commands.join_next().await {
+            match joined {
+                Ok(Ok(value)) => {
+                    let _ = mock_write(&mut writer, &value).await;
+                }
+                _ => failed = true,
+            }
+        }
+        failed
+    })
+    .await;
+    if !matches!(drained, Ok(false)) {
+        return Err(StartupFailure::ShutdownFailed.into());
+    }
+    result
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     match run().await {
@@ -156,10 +691,12 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> Result<(), AppError> {
-    if env::args_os().nth(1).as_deref() == Some(OsStr::new("--worker")) {
+    let args: Vec<_> = env::args_os().skip(1).collect();
+    if args == [OsString::from("--worker")] {
         return worker::run().await;
     }
-    let bootstrap = if env::args_os().nth(1).as_deref() == Some(OsStr::new("--local-control")) {
+    let options = GatewayOptions::parse(args)?;
+    let bootstrap = if options.local_control {
         Some(
             src::local_control::read_bootstrap()
                 .await
@@ -168,10 +705,81 @@ async fn run() -> Result<(), AppError> {
     } else {
         None
     };
+    let deployment = options.deployment()?;
+    let bot_id = deployment.bot_id.0;
+    let shard_identity = deployment.shard;
+    let watch_file = if let Some(state) = options.path("--state-path") {
+        tokio::fs::create_dir_all(&state).await?;
+        state.join("worker-path.txt")
+    } else {
+        worker::worker_file()
+    };
+    let mut mock = if let Some(addr) = options.mock_discord {
+        Some(
+            tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(addr))
+                .await
+                .map_err(|_| StartupFailure::MockUnavailable)?
+                .map_err(|_| StartupFailure::MockUnavailable)?,
+        )
+    } else {
+        None
+    };
+    // No production client, token lookup, metadata request or WebSocket exists
+    // on the explicit mock branch. Environment variables never enable it.
+    let live = if mock.is_none() {
+        Some(live_gateway(&options, &deployment).await?)
+    } else {
+        None
+    };
+    let manager = worker::Manager::start_gateway_pool(env::current_exe()?, 2, deployment).await?;
+    let shutdown = shutdown_input(!options.launch.is_empty() || options.mock_discord.is_some());
+    let mut background = JoinSet::new();
+    if let Some(bootstrap) = bootstrap {
+        let control_manager = manager.clone();
+        background.spawn(async move {
+            let _ = src::local_control::gateway_session(bootstrap, control_manager).await;
+        });
+    }
+    manager.start_jobs();
+    background.spawn(manager.clone().watch(watch_file));
+    let result = if let Some(stream) = &mut mock {
+        mock_events(
+            stream,
+            &options,
+            manager.clone(),
+            bot_id,
+            shard_identity,
+            shutdown,
+        )
+        .await
+    } else {
+        let (shard, http) = live.expect("one explicit gateway mode");
+        live_events(shard, http, manager.clone(), shutdown).await
+    };
+    // A watcher is not allowed to install another generation during shutdown.
+    background.abort_all();
+    while background.join_next().await.is_some() {}
+    let worker_pids = manager.shutdown().await?;
+    if result.is_ok()
+        && let Some(stream) = &mut mock
+    {
+        let _ = mock_write(
+            stream,
+            &json!({"type":"stopped", "pid":std::process::id(),
+            "worker_pids":worker_pids}),
+        )
+        .await;
+    }
+    result
+}
+
+async fn live_gateway(
+    options: &GatewayOptions,
+    deployment: &worker::DeploymentIdentity,
+) -> Result<(Shard, Arc<Client>), AppError> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let deployment = worker::DeploymentIdentity::from_env()?;
-    let shard_id = configured_shard(&deployment);
-    let token = token_from_env(env::var("DISCORD_TOKEN"))?;
+    let shard_id = configured_shard(deployment);
+    let token = token_from_env(env::var(options.token_env()))?;
     let http = Arc::new(Client::new(token.expose_secret().clone()));
     let queue = single_shard_queue(deployment.shard.total(), async {
         let response = http.gateway().authed().await.map_err(|_| ())?;
@@ -185,20 +793,27 @@ async fn run() -> Result<(), AppError> {
     )
     .queue(queue)
     .build();
-    let mut shard = Shard::with_config(shard_id, config);
-    let manager =
-        worker::Manager::start_pool_with_identity(env::current_exe()?, 2, deployment).await?;
-    if let Some(bootstrap) = bootstrap {
-        let control_manager = manager.clone();
-        tokio::spawn(async move {
-            let _ = src::local_control::gateway_session(bootstrap, control_manager).await;
-        });
-    }
-    manager.start_jobs();
-    tokio::spawn(manager.clone().watch(worker::worker_file()));
+    Ok((Shard::with_config(shard_id, config), http))
+}
+
+async fn live_events(
+    mut shard: Shard,
+    http: Arc<Client>,
+    manager: Arc<worker::Manager>,
+    shutdown: oneshot::Receiver<()>,
+) -> Result<(), AppError> {
     let capacity = Arc::new(Semaphore::new(64));
+    let mut requests = JoinSet::new();
+    let shutdown = shutdown_requested(shutdown);
+    tokio::pin!(shutdown);
     println!("Botを起動しています...");
-    while let Some(result) = shard.next_event(EventTypeFlags::all()).await {
+    loop {
+        let result = tokio::select! {
+            biased;
+            _ = &mut shutdown => break,
+            _ = requests.join_next(), if !requests.is_empty() => continue,
+            result = shard.next_event(EventTypeFlags::all()) => match result { Some(result) => result, None => break },
+        };
         match result {
             Ok(Event::Ready(ready)) => {
                 println!("ログイン成功: {}", ready.user.id);
@@ -208,7 +823,7 @@ async fn run() -> Result<(), AppError> {
                 };
                 let manager = manager.clone();
                 let bot_name = ready.user.name.clone();
-                tokio::spawn(async move {
+                requests.spawn(async move {
                     let _permit = permit;
                     if let Err(error) = manager.dispatch_ready(bot_name).await {
                         eprintln!(
@@ -225,7 +840,7 @@ async fn run() -> Result<(), AppError> {
                 };
                 let manager = manager.clone();
                 let http = http.clone();
-                tokio::spawn(async move {
+                requests.spawn(async move {
                     let _permit = permit;
                     if message.content.trim() == "!workers" {
                         let content = manager.describe_workers().await;
@@ -241,17 +856,19 @@ async fn run() -> Result<(), AppError> {
                         }
                         return;
                     }
-                    let mut response_guard =
-                        match manager.begin_response(message.channel_id.get()).await {
-                            Ok(guard) => guard,
-                            Err(error) => {
-                                eprintln!(
-                                    "{}",
-                                    failure_message("応答追跡を開始できません", error.as_ref())
-                                );
-                                return;
-                            }
-                        };
+                    let mut response_guard = match manager
+                        .begin_response_delivery(message.channel_id.get())
+                        .await
+                    {
+                        Ok(guard) => guard,
+                        Err(error) => {
+                            eprintln!(
+                                "{}",
+                                failure_message("応答追跡を開始できません", error.as_ref())
+                            );
+                            return;
+                        }
+                    };
                     match manager
                         .dispatch_key_with_response(
                             &mut response_guard,
@@ -261,16 +878,24 @@ async fn run() -> Result<(), AppError> {
                         .await
                     {
                         Ok(Some(content)) => {
-                            let sent = confirmed_response(
-                                std::time::Duration::from_secs(10),
+                            let status = tokio::time::timeout(
+                                Duration::from_secs(10),
                                 http.create_message(message.channel_id)
                                     .content(&content)
                                     .into_future(),
                             )
-                            .await;
-                            if sent {
-                                response_guard.confirm();
-                            } else {
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .map(|response| response.status().get());
+                            if manager
+                                .finish_response(response_guard, api_outcome(status))
+                                .await
+                                .is_err()
+                            {
+                                eprintln!("REST 結果の Worker 受領を確認できません（結果不明）");
+                            }
+                            if status.is_none() {
                                 eprintln!("送信エラーまたはタイムアウト（結果不明）");
                             }
                         }
@@ -302,9 +927,9 @@ async fn run() -> Result<(), AppError> {
                     eprintln!("Interaction を受け付けられません: 混雑中");
                     continue;
                 };
-                tokio::spawn(async move {
+                requests.spawn(async move {
                     let _permit = permit;
-                    let mut response_guard = match manager.begin_response(key).await {
+                    let mut response_guard = match manager.begin_response_delivery(key).await {
                         Ok(guard) => guard,
                         Err(error) => {
                             eprintln!(
@@ -323,6 +948,10 @@ async fn run() -> Result<(), AppError> {
                     let ack_http = http.clone();
                     let update_http = http.clone();
                     let dispatch_guard = &mut response_guard;
+                    let progress = Arc::new(Mutex::new(ResponseProgress::default()));
+                    let dispatch_progress = progress.clone();
+                    let update_progress = progress.clone();
+                    let dispatch_manager = manager.clone();
                     let outcome = src::interaction_flow::run(
                         identity,
                         std::time::Duration::from_secs(2),
@@ -339,28 +968,46 @@ async fn run() -> Result<(), AppError> {
                                 .is_ok()
                         },
                         move || async move {
-                            match manager
+                            match dispatch_manager
                                 .dispatch_slash_with_response(dispatch_guard, key, input, args)
                                 .await
                             {
-                                Ok(Some(message)) => message,
+                                Ok(Some(message)) => {
+                                    dispatch_progress.lock().unwrap().dispatched = true;
+                                    message
+                                }
                                 Ok(None) => "コマンドの応答がありません".to_owned(),
                                 Err(_) => "コマンドを実行できませんでした".to_owned(),
                             }
                         },
                         move |(application_id, _, token), message| async move {
-                            update_http
+                            let result = update_http
                                 .interaction(application_id)
                                 .update_response(token.expose_secret())
                                 .content(Some(&message))
-                                .await
-                                .is_ok()
+                                .await;
+                            let status = result.ok().map(|response| response.status().get());
+                            update_progress.lock().unwrap().status = status;
+                            status.is_some()
                         },
                     )
                     .await;
-                    if outcome == src::interaction_flow::Outcome::Completed {
+                    let (dispatched, status) = {
+                        let progress = progress.lock().unwrap();
+                        (progress.dispatched, progress.status)
+                    };
+                    if dispatched {
+                        if manager
+                            .finish_response(response_guard, api_outcome(status))
+                            .await
+                            .is_err()
+                        {
+                            eprintln!("REST 結果の Worker 受領を確認できません（結果不明）");
+                        }
+                    } else if outcome == src::interaction_flow::Outcome::Completed {
                         response_guard.confirm();
-                    } else {
+                    }
+                    if outcome != src::interaction_flow::Outcome::Completed {
                         eprintln!("Interaction の応答処理に失敗しました（結果不明）: {outcome:?}");
                     }
                 });
@@ -369,12 +1016,215 @@ async fn run() -> Result<(), AppError> {
             _ => {}
         }
     }
+    drop(shard);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while requests.join_next().await.is_some() {}
+    })
+    .await
+    .map_err(|_| StartupFailure::ShutdownFailed)?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn managed_args() -> Vec<OsString> {
+        let root = env::current_dir().unwrap();
+        let mut args = vec![
+            "--bot-id".into(),
+            "101".into(),
+            "--shard-id".into(),
+            "1".into(),
+            "--total-shards".into(),
+            "2".into(),
+            "--token-env".into(),
+            "TOKEN_ALPHA".into(),
+        ];
+        for (flag, name) in [
+            ("--ipc-path", "ipc"),
+            ("--state-path", "gateway-state"),
+            ("--management-path", "management"),
+        ] {
+            args.extend([OsString::from(flag), root.join(name).into_os_string()]);
+        }
+        args
+    }
+
+    #[test]
+    fn launch_arguments_require_explicit_mock_selection_and_complete_identity() {
+        let normal = GatewayOptions::parse(managed_args()).unwrap();
+        assert!(normal.mock_discord.is_none());
+        assert_eq!(normal.token_env(), "TOKEN_ALPHA");
+        assert!(normal.path("--state-path").unwrap().is_absolute());
+        for address in ["127.0.0.1:12345", "[::1]:12345"] {
+            let mut args = managed_args();
+            args.extend(["--mock-discord".into(), address.into()]);
+            let mock = GatewayOptions::parse(args).unwrap();
+            assert_eq!(mock.mock_discord, Some(address.parse().unwrap()));
+        }
+        assert!(
+            GatewayOptions::parse(Vec::new())
+                .unwrap()
+                .mock_discord
+                .is_none()
+        );
+        let mut incomplete = managed_args();
+        incomplete.truncate(incomplete.len() - 2);
+        assert!(GatewayOptions::parse(incomplete).is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_unknown_ambiguous_and_remote_launch_arguments() {
+        for extra in [
+            vec!["--bot-id", "101"],
+            vec!["--worker"],
+            vec!["--local-control"],
+            vec!["--mock-discord"],
+            vec!["--unknown", "sensitive-input"],
+            vec!["--mock-discord", "0.0.0.0:12345"],
+            vec!["--mock-discord", "192.0.2.1:12345"],
+            vec!["--mock-discord", "127.0.0.1:0"],
+            vec!["--mock-discord", "localhost:12345"],
+            vec![
+                "--mock-discord",
+                "127.0.0.1:12345",
+                "--mock-discord",
+                "127.0.0.1:12345",
+            ],
+        ] {
+            let mut args = managed_args();
+            args.extend(extra.into_iter().map(OsString::from));
+            assert!(GatewayOptions::parse(args).is_err());
+        }
+        assert!(
+            GatewayOptions::parse(["--local-control", "--local-control"].map(OsString::from))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn launch_paths_and_token_references_are_validated_without_echoing_values() {
+        for (index, bad) in [
+            (7, "SECRET=VALUE"),
+            (9, "relative"),
+            (11, "../outside"),
+            (13, ""),
+        ] {
+            let mut args = managed_args();
+            args[index] = bad.into();
+            let error = GatewayOptions::parse(args).err().unwrap();
+            assert_eq!(
+                error.to_string(),
+                "invalid gateway launch arguments [launch_invalid]"
+            );
+        }
+        let mut args = managed_args();
+        args[9] = env::current_dir()
+            .unwrap()
+            .join("..")
+            .join("outside")
+            .into_os_string();
+        assert!(GatewayOptions::parse(args).is_err());
+    }
+
+    #[test]
+    fn gateway_bot_ids_reject_non_numeric_and_numeric_namespace_aliases() {
+        for id in [
+            "001",
+            "+1",
+            " 1",
+            "1 ",
+            "18446744073709551616",
+            "bot-alpha",
+            "",
+        ] {
+            let mut args = managed_args();
+            args[1] = id.into();
+            assert!(GatewayOptions::parse(args).is_err());
+        }
+        for id in ["0", "1", "18446744073709551615"] {
+            let mut args = managed_args();
+            args[1] = id.into();
+            assert!(GatewayOptions::parse(args).is_ok());
+        }
+    }
+
+    async fn frame_from(bytes: &[u8]) -> Result<Option<MockInput>, AppError> {
+        let (mut input, output) = tokio::io::duplex(128 * 1024);
+        input.write_all(bytes).await.unwrap();
+        input.shutdown().await.unwrap();
+        mock_frame(&mut BufReader::new(output)).await
+    }
+
+    #[tokio::test]
+    async fn mock_input_is_bounded_typed_and_never_echoes_input() {
+        assert!(matches!(
+            frame_from(b"{\"type\":\"status\",\"id\":9}\n")
+                .await
+                .unwrap(),
+            Some(MockInput::Status { id: 9 })
+        ));
+        assert!(frame_from(b"").await.unwrap().is_none());
+        for bytes in [
+            b"{\"type\":\"status\",\"id\":9,\"unexpected\":\"sensitive-input\"}\n".to_vec(),
+            b"{\"type\":\"crash\",\"id\":9,\"unexpected\":true}\n".to_vec(),
+            b"{\"type\":\"sensitive-input\"}\n".to_vec(),
+            b"{\"type\":\"status\",\"id\":9}".to_vec(),
+            vec![b'x'; MOCK_FRAME_LIMIT as usize + 1],
+            b"\n".to_vec(),
+        ] {
+            let error = frame_from(&bytes).await.err().unwrap();
+            assert_eq!(error.to_string(), "invalid mock input [mock_input_invalid]");
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_http_confirms_only_complete_testkit_replies_without_retry() {
+        use src::testkit::{MockDiscord, MockReply};
+        for (reply, expected) in [
+            (MockReply::json(201, b"{}").unwrap(), Some(201)),
+            (MockReply::interaction_ack(), Some(204)),
+            (MockReply::rate_limited(Duration::from_secs(1)), Some(429)),
+            (MockReply::server_error(503).unwrap(), Some(503)),
+            (
+                MockReply::json(200, b"{}").unwrap().with_lost_response(),
+                None,
+            ),
+            (
+                MockReply::json(200, b"{}")
+                    .unwrap()
+                    .with_truncated_response(10_000),
+                None,
+            ),
+        ] {
+            let mock = MockDiscord::new([reply]);
+            let server = mock.spawn_tcp().await.unwrap();
+            assert_eq!(
+                mock_http(
+                    server.addr(),
+                    "POST",
+                    "/channels/1/messages",
+                    json!({"content":"Pong"})
+                )
+                .await,
+                expected
+            );
+            assert_eq!(mock.stats().requests, 1);
+            assert_eq!(mock.stats().script_exhausted, 0);
+            server.shutdown().await.unwrap();
+        }
+        assert_eq!(
+            mock_http(
+                "192.0.2.1:12345".parse().unwrap(),
+                "POST",
+                "/channels/1/messages",
+                json!({})
+            )
+            .await,
+            None
+        );
+    }
 
     #[test]
     fn failure_output_never_formats_external_error_text() {

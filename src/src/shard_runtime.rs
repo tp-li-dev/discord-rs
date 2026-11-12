@@ -1,9 +1,23 @@
 //! Pure launch descriptions. These do not authorize ownership or start processes.
 use crate::placement::LocalShardIntent;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
+
+/// Launch-owned anonymous stdin control. EOF only closes the control channel:
+/// it must not stop an otherwise healthy Gateway when its daemon disappears.
+/// Shutdown is complete only after the Gateway drains/reaps its Workers and
+/// exits successfully; writing this frame is not an acknowledgement.
+pub const GATEWAY_CONTROL_FRAME_LIMIT: usize = 512;
+pub const GATEWAY_SHUTDOWN_FRAME: &[u8] = b"{\"command\":\"shutdown\"}\n";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
+pub enum GatewayControl {
+    Shutdown {},
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -11,8 +25,9 @@ pub enum Role {
     Core,
 }
 
-/// A future launcher must clear the inherited environment and copy only these
-/// named variables from its credential source. No credential values are stored.
+/// A launcher must clear the inherited environment and read only these named
+/// credential references. Canonical Bot/Shard/generation metadata is supplied by
+/// the launcher. No credential values are stored in the description.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Environment {
     pub clear_inherited: bool,
@@ -57,12 +72,21 @@ fn token_reference(value: &str) -> bool {
         .next()
         .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
         && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+        && ![
+            "BOT_ID",
+            "SHARD_ID",
+            "TOTAL_SHARDS",
+            "GENERATION_ID",
+            "SYSTEMROOT",
+        ]
+        .contains(&value.to_ascii_uppercase().as_str())
 }
 
 /// Generate a deterministic plan beneath a native absolute root (Path::join,
 /// never shell strings). IDs are encoded injectively into portable components.
 /// The root is trusted deployment configuration; no filesystem is accessed.
-/// A plan is not a quorum/lease grant and is not wired to existing executables.
+/// A plan is not a quorum/lease grant. The daemon launches `gateway` and the
+/// Gateway owns its Worker pool; `core` records the reserved Core namespace.
 pub fn plan(
     intents: &[LocalShardIntent],
     root: &Path,
@@ -182,4 +206,49 @@ pub fn plan(
         });
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shutdown_contract_is_bounded_and_rejects_extra_control_fields() {
+        assert!(GATEWAY_SHUTDOWN_FRAME.len() <= GATEWAY_CONTROL_FRAME_LIMIT);
+        assert_eq!(
+            serde_json::from_slice::<GatewayControl>(GATEWAY_SHUTDOWN_FRAME).unwrap(),
+            GatewayControl::Shutdown {}
+        );
+        let mut encoded = serde_json::to_vec(&GatewayControl::Shutdown {}).unwrap();
+        encoded.push(b'\n');
+        assert_eq!(encoded, GATEWAY_SHUTDOWN_FRAME);
+        for frame in [
+            r#"{}"#,
+            r#"{"command":"Shutdown"}"#,
+            r#"{"command":"shutdown","force":true}"#,
+            r#"{"command":"shutdown","secret":"must-not-echo"}"#,
+            r#"{"command":"start"}"#,
+        ] {
+            assert!(serde_json::from_str::<GatewayControl>(frame).is_err());
+        }
+    }
+
+    #[test]
+    fn credentials_cannot_overwrite_launch_identity_on_either_platform() {
+        for reference in [
+            "BOT_ID",
+            "shard_id",
+            "Total_Shards",
+            "GENERATION_ID",
+            "SystemRoot",
+        ] {
+            let intent = LocalShardIntent {
+                bot_id: "101".into(),
+                shard_id: 0,
+                total_shards: 1,
+                token_env: reference.into(),
+            };
+            assert!(plan(&[intent], &std::env::current_dir().unwrap()).is_err());
+        }
+    }
 }
