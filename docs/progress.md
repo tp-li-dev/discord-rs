@@ -154,3 +154,15 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
   - `compile_fail::command_diagnostics`：trybuild の期待出力（警告文言）が Rust 1.99 前提で、1.90 の出力と不一致。実装の不具合ではなく、スナップショットのツールチェイン依存。1.99 では成功の記録があるため期待値は変更していない。
   - `botctl_daemon` の4件：全体並列実行時のみ失敗。単独実行（同ファイル、2回連続）では 11 件すべて成功。負荷依存のフレークと推定、原因は未特定（要調査）。
 - 未検証は従来どおり（Linux、GitHub Actions、実 Discord、複数ホスト）。
+
+## 2026-11-12：並列開発 第10弾（Codex 0.167.2：Astra max / Sol / Terra）
+- 運用：Codex CLI を 0.147.0→0.167.2 に更新（6.1 系・astra が旧版で拒否されたため）。`gpt-6.1-*` と `gpt-6-astra` が利用可能。openraft 0.9.26 を PM が `cargo add`（features: serde, storage-v2, generic-snapshot-data）で追加。
+- flake：botctl_daemon のタイムアウト試験の固定 1.5 秒競合を条件待ち（試験側が許可するまで Gateway が終了しない）に変更。負荷下で複数回成功。元の4件失敗が同一原因だったかは未特定。
+- `fs_perms.rs`：Unix は開いたハンドルで mode 0600/0700 を検査・設定。Windows ACL は未実装（`Unsupported`）。既存の秘密ファイル経路には未接続。
+- `tls_transport.rs`：ノードID/シリアル失効、重複期間付きローテーション、原子的交換（試験23件）。CA 更新・CA/中間失効、ポリシー永続化・配布は未実装。
+- framework↔StateStore：InteractionContext から MAC 検証付き状態の作成/取得/TTL/CAS/削除、Bot/Shard/名前空間分離、wait と Subscription の区別（試験18件、`framework/STATE_ADAPTER.md`）。trybuild の警告文言依存を除去。Worker 実接続は未実施。
+- `update_rollback.rs`/botctl：`update|rollback --plan` は dry-run 既定（SHA-256 検証、Identify予算考慮の Shard 別計画、rollback 計画）。実更新は daemon 未接続で `--yes` でも拒否。
+- Gateway/Core 配線：模擬 Discord 限定で認証付き IPC による Gateway 切替（Pause→Activate）、Bot 単位 Identify 予算共有、placement からの1 Shard 1 Core 起動（Core に token 非配布）を実プロセス試験で確認。本番既定は無効。切替後の自動 rollback、子再採用、無欠落は未保証。
+- `raft_quorum`：openraft による epoch CAS、永続ストレージ（sync_all、破損検出、ロック）、Ownership trait 接続、メモリ transport（試験35件）。本番起動は明示フラグでも拒否。mTLS 接続・自動引継ぎ・leader 転送は未実装。
+- main 統合後（Windows / Rust 1.90.0）：fmt・clippy（警告禁止）成功、`cargo test --workspace --no-fail-fast` 756 成功・失敗0・無視2。Linux、GitHub Actions、実 Discord、複数ホストは未検証。
+- 第2波を起動：raftnet（Raft を mTLS 上へ）、wkstate（StateStore の Worker 接続）、updctl（update/rollback の制御経路）、cidocs（CI・Linux 手順・文書）。
