@@ -4,7 +4,7 @@
 
 **完了**は条件全体の実装と必要な検証を確認した状態、**部分**は実装または試験があるが条件全体の達成を確認できない状態、**未実装**は対象機能がない状態。シミュレーションやモックの結果は実Discord・複数ホストでの保証に代用しない。
 
-今回のworkspace testはT04 fixtureが `tokio::time` 無効のrlibを参照して失敗し、clippyを並行しない再実行でも同じ失敗が再現した。過去の成功記録と区別し、今回の成功とは扱わない。
+workspace testは統合後のmainでWindows/Rust 1.99.0上に647件成功・失敗0・無視1（手動ベンチ）を2回連続で確認した（[progress.md](progress.md)）。T04 fixtureの不安定要因（feature構成の異なるrlib混在）は修正済み。この確認はWindowsのみで、Linuxとの区別を保つ。
 
 ## §16.2 完了条件
 
@@ -12,7 +12,7 @@
 |---|---|---|---|
 | fmt check | 完了 | `src/` で `cargo fmt --all --check` がWindowsで成功 | 他環境での実行は未確認 |
 | clippy 全target・警告禁止 | 完了 | `src/` で `cargo clippy --offline --workspace --all-targets -- -D warnings` がWindowsで成功 | Linuxでの実行は未確認 |
-| workspace test・マクロ成功/失敗 | 部分 | `src/framework/tests/compile_fail.rs` `command_diagnostics`、`src/framework/tests/cog_extensions.rs` `typed_commands_and_events_share_the_injected_instance` | 今回T04 fixtureコンパイル失敗を再現。全試験完走と未試験の障害条件 |
+| workspace test・マクロ成功/失敗 | 部分 | `src/framework/tests/compile_fail.rs` `command_diagnostics`、`src/framework/tests/cog_extensions.rs` `typed_commands_and_events_share_the_injected_instance` | Windowsでは完走（647件）。Linuxと未試験の障害条件 |
 | Windows/Ubuntu CI | 部分 | `.github/workflows/ci.yml`、progressのローカルWindows記録 | 現統合版のActions実行結果とLinux |
 | CogなしハイブリッドPing | 部分 | `src/framework/examples/hybrid_bot.rs`、`src/tests/e2e_shard_runtime.rs` `botd_real_gateways_route_hybrid_commands_isolate_bots_recover_and_drain` | 実Discord接続・応答 |
 | Cogの状態共有・イベント・コマンド | 部分 | `src/framework/tests/cog_extensions.rs` `typed_commands_and_events_share_the_injected_instance`、`src/framework/tests/example_cog_counter.rs` `ready_event_uses_the_cog_and_does_not_reset_counter` | 実WorkerのCogライフサイクル接続・実Discord |
