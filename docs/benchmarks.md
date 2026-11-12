@@ -168,3 +168,11 @@ failover は loopback mTLS 2 ノード、current-thread Tokio、既定 heartbeat
 正常 heartbeat 到着時に直前の Tick で判定した誤判定は 100 観測中 0 件。正常時の連続監視や長時間・負荷・遅延注入は行っておらず、実運用の誤判定率ではない。試験用の承認・起動完了イベントを与え TemporaryActive とした後、cooldown 経過後の heartbeat で FailbackWaiting に入り、1,518.890 ms 後に heartbeat 欠落を Tick で検出して TemporaryActive に戻った。古い FailbackComplete は無視された（1 試行）。30 秒の安定期間を通した正常フェイルバックは測定していない。
 
 TLS は heartbeat 配送に使用し、状態機械への入力はベンチが手動で接続している。実 daemon、複数ホスト、quorum/lease 承認、実プロセス起動、Discord 再接続や復旧完了は測定していない。初期の証明書 fixture による起動失敗 2 回を修正後に上記を取得した。
+
+## Linux 手動 CI の結果の解釈
+
+`.github/workflows/bench.yml` は手動実行専用で、Ubuntu の共有ランナー上で往復の自己検査と codec、Worker 往復、primitives（event_seq を含む）、failover 検知を順に実行し、環境情報と標準出力・標準エラーを artifact に保存する。依存は lockfile に固定し、CI ではオンライン取得を許可する。実行結果はまだない。各ステップの成否とログ中の成功・失敗・未実行数を合わせて確認し、失敗や中断で欠けた結果を成功として扱わない。
+
+共有ランナーは CPU の割当てや他の負荷、ホストやイメージの変化によって結果が揺らぐ。単一実行や別ランナー間の差だけで性能改善・劣化を断定せず、commit、実行環境、設定、標本数を記録し、同一条件で複数回確認する。厳密な比較には環境を管理した同一ホストでの測定が必要。
+
+codec の符号化時間・サイズ、子プロセスの stdin/stdout JSON 往復、event_seq のメモリ内処理、loopback mTLS と模擬状態機械による failover 検知はそれぞれ別の測定である。往復値から仕様の片道 IPC p99 を推定せず、failover の検知時間を実ホスト障害から Discord 再接続までの復旧時間と見なさない。quorum・lease や本番負荷下の安全性・性能はこれらのベンチだけでは検証できない。

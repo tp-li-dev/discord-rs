@@ -1,0 +1,72 @@
+name: Linux benchmarks
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  benchmarks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: src
+        shell: bash
+    env:
+      IPC_BENCH_WARMUP: 1000
+      IPC_BENCH_SAMPLES: 10000
+      IPC_ROUNDTRIP_WARMUP: 1000
+      IPC_ROUNDTRIP_SAMPLES: 10000
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.90.0
+      - uses: Swatinem/rust-cache@v2.8.1
+        with:
+          workspaces: src -> target
+      - name: Record environment
+        run: |
+          mkdir -p bench-results
+          {
+            date -u +'%Y-%m-%dT%H:%M:%SZ'
+            git rev-parse HEAD
+            uname -a
+            lscpu
+            free -h
+            rustc --version --verbose
+            cargo --version
+            printf 'IPC_BENCH_WARMUP=%s IPC_BENCH_SAMPLES=%s\n' "$IPC_BENCH_WARMUP" "$IPC_BENCH_SAMPLES"
+            printf 'IPC_ROUNDTRIP_WARMUP=%s IPC_ROUNDTRIP_SAMPLES=%s\n' "$IPC_ROUNDTRIP_WARMUP" "$IPC_ROUNDTRIP_SAMPLES"
+          } > bench-results/environment.txt
+      - name: Roundtrip self-test
+        run: |
+          set -o pipefail
+          cargo bench --locked --bench ipc_roundtrip -- --self-test 2>&1 | tee bench-results/roundtrip-self-test.log
+      - name: Codec
+        if: success() || failure()
+        run: |
+          set -o pipefail
+          cargo bench --locked --bench ipc_codec 2>&1 | tee bench-results/ipc-codec.log
+      - name: Roundtrip
+        if: success() || failure()
+        run: |
+          set -o pipefail
+          cargo bench --locked --bench ipc_roundtrip 2>&1 | tee bench-results/ipc-roundtrip.log
+      - name: Primitives and event sequence
+        if: success() || failure()
+        run: |
+          set -o pipefail
+          cargo bench --locked --bench primitives 2>&1 | tee bench-results/primitives.log
+      - name: Failover detection
+        if: success() || failure()
+        run: |
+          set -o pipefail
+          cargo bench --locked --bench failover_detect 2>&1 | tee bench-results/failover-detect.log
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-benchmarks-${{ github.run_id }}-${{ github.run_attempt }}
+          path: src/bench-results/
+          if-no-files-found: warn
