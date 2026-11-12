@@ -6,6 +6,7 @@ pub mod daemon;
 pub mod drain;
 pub mod event_seq;
 pub mod failover;
+pub mod fs_perms;
 pub mod gateway_metadata;
 pub mod gateway_switch;
 pub mod identify;
