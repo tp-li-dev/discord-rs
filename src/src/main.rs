@@ -79,6 +79,15 @@ async fn main() -> Result<(), AppError> {
     if env::args().nth(1).as_deref() == Some("--worker") {
         return worker::run().await;
     }
+    let bootstrap = if env::args().nth(1).as_deref() == Some("--local-control") {
+        Some(
+            src::local_control::read_bootstrap()
+                .await
+                .map_err(|_| "invalid management bootstrap")?,
+        )
+    } else {
+        None
+    };
     let _ = rustls::crypto::ring::default_provider().install_default();
     let token = env::var("DISCORD_TOKEN")?;
     let http = Arc::new(Client::new(token.clone()));
@@ -93,6 +102,12 @@ async fn main() -> Result<(), AppError> {
         .build();
     let mut shard = Shard::with_config(ShardId::ONE, config);
     let manager = worker::Manager::start(env::current_exe()?).await?;
+    if let Some(bootstrap) = bootstrap {
+        let control_manager = manager.clone();
+        tokio::spawn(async move {
+            let _ = src::local_control::gateway_session(bootstrap, control_manager).await;
+        });
+    }
     manager.start_jobs();
     tokio::spawn(manager.clone().watch(worker::worker_file()));
     let capacity = Arc::new(Semaphore::new(64));
