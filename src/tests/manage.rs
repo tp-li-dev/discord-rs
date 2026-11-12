@@ -52,6 +52,25 @@ async fn independent_commands_manage_a_persistent_core() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    // Missing/wrong credentials and malformed frames yield no response.
+    for frame in [
+        b"{}\n".to_vec(),
+        b"{\"secret\":\"wrong\",\"command\":\"list-unknown\"}\n".to_vec(),
+        vec![b'x'; 5000],
+        b"partial".to_vec(),
+    ] {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        stream.write_all(&frame).await.unwrap();
+        stream.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(4), stream.read_to_end(&mut response))
+            .await
+            .unwrap();
+        assert!(response.is_empty());
+    }
     // An unauthenticated client that never sends a frame must not block
     // authenticated requests for the read timeout.
     let idle = tokio::net::TcpStream::connect(("127.0.0.1", port))
@@ -67,6 +86,21 @@ async fn independent_commands_manage_a_persistent_core() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("Botプロセス: 稼働中"));
+    let unavailable = cli(&runtime, port, "list-unknown").await;
+    assert!(!unavailable.status.success());
+    assert!(String::from_utf8_lossy(&unavailable.stderr).contains("Gateway unavailable"));
+    // Exhaust the bounded unauthenticated reader pool, then verify recovery.
+    let mut idle_clients = Vec::new();
+    for _ in 0..40 {
+        idle_clients.push(
+            tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap(),
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(3300)).await;
+    drop(idle_clients);
+    assert!(cli(&runtime, port, "status").await.status.success());
     assert!(cli(&runtime, port, "stop").await.status.success());
     let output = cli(&runtime, port, "status").await;
     assert!(String::from_utf8_lossy(&output.stdout).contains("Botプロセス: 停止中"));

@@ -1,9 +1,7 @@
-//! Read-only control session over a caller-provided private transport.
-//! Bootstrap, peer authentication, process wiring, authorization and audit are not
-//! implemented here. This module does not expose a TCP listener or a CLI.
+//! Bounded read-only control over a bootstrap-bound local connection.
 use crate::worker::Manager;
 use serde::{Deserialize, Serialize};
-use std::{io, time::Duration};
+use std::{io, sync::Arc, time::Duration};
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
@@ -59,7 +57,8 @@ where
             "control request denied",
         ));
     }
-    let (instance, unknown) = manager.unknown_responses();
+    let (instance, mut unknown) = manager.unknown_responses();
+    unknown.sort_unstable();
     let mut reply = serde_json::to_vec(&ListResponse { instance, unknown })?;
     reply.push(b'\n');
     if reply.len() > RESPONSE_LIMIT {
@@ -70,4 +69,118 @@ where
     }
     stream.get_mut().write_all(&reply).await?;
     stream.get_mut().flush().await
+}
+
+/// Secrets travel only through the child's anonymous stdin pipe.
+#[derive(Serialize, Deserialize)]
+pub struct Bootstrap {
+    pub port: u16,
+    pub gateway_secret: [u8; 32],
+    pub manager_secret: [u8; 32],
+}
+
+pub async fn read_bootstrap() -> io::Result<Bootstrap> {
+    tokio::time::timeout(DEADLINE, read_json(tokio::io::stdin(), REQUEST_LIMIT))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "bootstrap timed out"))?
+}
+
+async fn read_json<R: AsyncRead + Unpin, T: serde::de::DeserializeOwned>(
+    reader: R,
+    limit: u64,
+) -> io::Result<T> {
+    let mut frame = Vec::new();
+    BufReader::new(reader)
+        .take(limit + 1)
+        .read_until(b'\n', &mut frame)
+        .await?;
+    if frame.len() as u64 > limit || frame.last() != Some(&b'\n') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid control frame",
+        ));
+    }
+    serde_json::from_slice(&frame)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid control data"))
+}
+
+pub async fn gateway_session(bootstrap: Bootstrap, manager: Arc<Manager>) -> io::Result<()> {
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", bootstrap.port)).await?;
+    stream.write_all(&bootstrap.gateway_secret).await?;
+    loop {
+        // Each request proves knowledge of the other bootstrap capability.
+        stream.readable().await?;
+        serve_list(&mut stream, &bootstrap.manager_secret, &manager).await?;
+    }
+}
+
+/// Listener lifetime and credentials are unique to one spawned Gateway.
+pub struct GatewayControl {
+    listener: tokio::net::TcpListener,
+    bootstrap: Bootstrap,
+    stream: Option<tokio::net::TcpStream>,
+}
+impl GatewayControl {
+    pub async fn bind() -> io::Result<Self> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let mut gateway_secret = [0; 32];
+        let mut manager_secret = [0; 32];
+        getrandom::fill(&mut gateway_secret).map_err(io::Error::other)?;
+        getrandom::fill(&mut manager_secret).map_err(io::Error::other)?;
+        Ok(Self {
+            bootstrap: Bootstrap {
+                port: listener.local_addr()?.port(),
+                gateway_secret,
+                manager_secret,
+            },
+            listener,
+            stream: None,
+        })
+    }
+    pub async fn bootstrap<W: AsyncWrite + Unpin>(&self, mut pipe: W) -> io::Result<()> {
+        let mut data = serde_json::to_vec(&self.bootstrap)?;
+        data.push(b'\n');
+        pipe.write_all(&data).await?;
+        pipe.shutdown().await
+    }
+    pub async fn list(&mut self) -> io::Result<ListResponse> {
+        let result = tokio::time::timeout(DEADLINE, self.list_inner())
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Gateway unavailable"));
+        match result {
+            Ok(Ok(reply)) => Ok(reply),
+            other => {
+                self.stream = None;
+                Err(other
+                    .err()
+                    .unwrap_or_else(|| io::Error::other("Gateway unavailable")))
+            }
+        }
+    }
+    async fn list_inner(&mut self) -> io::Result<ListResponse> {
+        if self.stream.is_none() {
+            // Serial bounded authentication: no unbounded tasks or buffered sockets.
+            loop {
+                let (mut stream, _) = self.listener.accept().await?;
+                let mut hello = [0; 32];
+                if matches!(
+                    tokio::time::timeout(Duration::from_millis(100), stream.read_exact(&mut hello))
+                        .await,
+                    Ok(Ok(_))
+                ) && bool::from(hello.ct_eq(&self.bootstrap.gateway_secret))
+                {
+                    self.stream = Some(stream);
+                    break;
+                }
+            }
+        }
+        let stream = self.stream.as_mut().expect("authenticated stream");
+        let mut request = serde_json::to_vec(&ListRequest {
+            secret: self.bootstrap.manager_secret,
+            command: "list_unknown".into(),
+        })?;
+        request.push(b'\n');
+        stream.write_all(&request).await?;
+        read_json(stream, RESPONSE_LIMIT as u64).await
+    }
 }

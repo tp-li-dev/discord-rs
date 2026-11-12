@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use src::local_control::GatewayControl;
 use std::{
     env,
     error::Error,
@@ -7,6 +8,7 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use subtle::ConstantTimeEq;
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
@@ -148,15 +150,35 @@ async fn build() -> Result<PathBuf, ErrorBox> {
     .await?;
     Ok(path)
 }
-fn spawn_bot(path: &Path) -> Result<Child, ErrorBox> {
-    let child = Command::new(path)
+struct Bot {
+    child: Child,
+    control: GatewayControl,
+}
+impl std::ops::Deref for Bot {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.child
+    }
+}
+impl std::ops::DerefMut for Bot {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+}
+async fn spawn_bot(path: &Path) -> Result<Bot, ErrorBox> {
+    let control = GatewayControl::bind().await?;
+    let mut child = Command::new(path)
+        .arg("--local-control")
         .current_dir(root())
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .kill_on_drop(true)
         .spawn()?;
-    Ok(child)
+    control
+        .bootstrap(child.stdin.take().ok_or("missing bootstrap pipe")?)
+        .await?;
+    Ok(Bot { child, control })
 }
-async fn stop_bot(child: &mut Option<Child>) -> Result<(), ErrorBox> {
+async fn stop_bot(child: &mut Option<Bot>) -> Result<(), ErrorBox> {
     if let Some(mut process) = child.take() {
         if process.try_wait()?.is_none() {
             process.kill().await?;
@@ -172,7 +194,7 @@ async fn core(binary: PathBuf) -> Result<(), ErrorBox> {
         port: listener.local_addr()?.port(),
         secret: secret.clone(),
     };
-    let mut bot = Some(spawn_bot(&binary)?);
+    let mut bot = Some(spawn_bot(&binary).await?);
     let mut desired_running = true;
     let mut failures = 0u8;
     let mut last_failure: Option<String> = None;
@@ -196,7 +218,7 @@ async fn core(binary: PathBuf) -> Result<(), ErrorBox> {
                         Duration::from_secs(3), read_frame(&mut reader, MAX_REQUEST_BYTES)
                     ).await else { return };
                     let Ok(input) = serde_json::from_slice::<Request>(&line) else { return };
-                    if input.secret == expected_secret {
+                    if bool::from(input.secret.as_bytes().ct_eq(expected_secret.as_bytes())) {
                         let _ = sender.try_send((input, reader));
                     }
                 });
@@ -212,7 +234,7 @@ async fn core(binary: PathBuf) -> Result<(), ErrorBox> {
                 }
                 if desired_running && bot.is_none() && failures < 3 {
                     failures += 1;
-                    match spawn_bot(&binary) {
+                    match spawn_bot(&binary).await {
                         Ok(process) => { eprintln!("Botを自動再起動しました ({failures}/3)"); bot = Some(process); started = tokio::time::Instant::now(); }
                         Err(error) => { let message = format!("Botの自動再起動に失敗しました: {error}"); eprintln!("{message}"); last_failure = Some(message); }
                     }
@@ -230,20 +252,26 @@ async fn core(binary: PathBuf) -> Result<(), ErrorBox> {
         let mut exit = false;
         let action: Result<String, ErrorBox> = async {
             match input.command.as_str() {
+                "list-unknown" => {
+                    let bot = bot.as_mut().ok_or("Gateway unavailable")?;
+                    let reply = bot.control.list().await.map_err(|_| "Gateway unavailable")?;
+                    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+                    Ok(format!("snapshot_unix_seconds={timestamp}; volatile=true; state=Unknown\n{}", serde_json::to_string(&reply)?))
+                }
                 "status" => Ok(format!("{}\n直近のエラー: {}\n自動再起動: {}/3\nログ: {}", match &bot {
                     Some(process) => format!("コア: 稼働中 (PID: {})\nBotプロセス: 稼働中 (PID: {})\nDiscord接続: Botのログで確認してください", std::process::id(), process.id().unwrap_or_default()),
                     None => format!("コア: 稼働中 (PID: {})\nBotプロセス: 停止中", std::process::id()),
                 }, last_failure.as_deref().unwrap_or("なし"), failures, runtime_dir().join("core.log").display())),
                 "start" => {
                     if bot.is_some() { return Ok("Botは既に稼働中です".into()); }
-                    let process = spawn_bot(&binary)?;
+                    let process = spawn_bot(&binary).await?;
                     let pid = process.id().unwrap_or_default(); bot = Some(process); desired_running = true; failures = 0; started = tokio::time::Instant::now();
                     Ok(format!("Botを起動しました (PID: {pid})。Discord接続はログで確認してください。"))
                 }
                 "stop" => { desired_running = false; stop_bot(&mut bot).await?; Ok("Botを停止しました。メモリ内の状態は失われます。コアは稼働中です。".into()) }
                 "restart" => {
                     desired_running = false; stop_bot(&mut bot).await?;
-                    let process = spawn_bot(&binary)?;
+                    let process = spawn_bot(&binary).await?;
                     let pid = process.id().unwrap_or_default(); bot = Some(process); desired_running = true; failures = 0; started = tokio::time::Instant::now();
                     Ok(format!("Botを再起動しました (PID: {pid})。メモリ内の状態は失われました。"))
                 }
@@ -344,15 +372,17 @@ async fn main() -> Result<(), ErrorBox> {
             }
             Err("コアの起動を確認できません。src/core-runtime/core.log を確認してください".into())
         }
-        "status" | "stop" | "restart" | "update" | "shutdown" => match request(command).await {
-            Ok(message) => {
-                println!("{message}");
-                Ok(())
+        "list-unknown" | "status" | "stop" | "restart" | "update" | "shutdown" => {
+            match request(command).await {
+                Ok(message) => {
+                    println!("{message}");
+                    Ok(())
+                }
+                Err(error) => {
+                    Err(format!("コアに接続できないか、コマンドが失敗しました: {error}").into())
+                }
             }
-            Err(error) => {
-                Err(format!("コアに接続できないか、コマンドが失敗しました: {error}").into())
-            }
-        },
+        }
         "logs" => {
             print!(
                 "{}",
@@ -362,7 +392,7 @@ async fn main() -> Result<(), ErrorBox> {
         }
         _ => {
             println!(
-                "使い方: cargo run --bin manage -- <start|status|stop|restart|update|logs|shutdown>"
+                "使い方: cargo run --bin manage -- <start|list-unknown|status|stop|restart|update|logs|shutdown>"
             );
             Ok(())
         }
