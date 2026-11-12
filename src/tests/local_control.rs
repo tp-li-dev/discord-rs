@@ -25,7 +25,8 @@ async fn authenticated_private_session_lists_only_unknown_ids() {
     let mut line = String::new();
     client.read_line(&mut line).await.unwrap();
     let result: ListResponse = serde_json::from_str(&line).unwrap();
-    assert_eq!(result.unknown, vec![(0, 0)]);
+    assert_eq!(result.unknown.len(), 1);
+    assert_eq!(result.unknown[0].0, 0);
     assert_eq!(result.instance.len(), 32);
     task.await.unwrap().unwrap();
 }
