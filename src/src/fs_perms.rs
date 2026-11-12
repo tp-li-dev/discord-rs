@@ -7,8 +7,14 @@
 //! the caller's responsibility. Setting permissions after writing a secret can
 //! expose it before the change; create it privately before writing.
 //!
-//! Windows ACL support is deliberately unsupported: a mode-bit approximation or
-//! unchecked command success cannot establish a current-user-only DACL.
+//! Windows ACL support is deliberately unsupported. The API receives only an
+//! already-open handle: if Windows followed a symlink or junction while opening
+//! it, that history cannot be recovered from the handle. A path-based ACL
+//! command would introduce a time-of-check/time-of-use race: an attacker able to
+//! replace a path component can redirect the command between validation and
+//! modification or verification. A secure implementation needs an explicit path
+//! and open policy, or a handle-based contract that does not promise to reject
+//! links traversed before the handle was supplied.
 
 use std::{fs::File, io};
 
