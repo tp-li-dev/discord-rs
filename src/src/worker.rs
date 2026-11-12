@@ -18,6 +18,25 @@ use tokio::{
 
 const PROTOCOL: u32 = 5;
 const CAPABILITIES: &[&str] = &["snapshot-v3"];
+const HELLO_CAPABILITY: &str = "hello-v1";
+const OPTIONAL_CAPABILITIES: &[&str] = &[
+    "hello-v1",
+    "command-dispatch-v1",
+    "ready-event-v1",
+    "slash-arguments-v1",
+];
+const IDENTITY_ENV: &str = "BOT_WORKER_IPC_IDENTITY";
+
+fn local_hello(identity: crate::protocol::Identity) -> crate::protocol::Hello {
+    crate::protocol::Hello {
+        protocol_min: PROTOCOL as u16,
+        protocol_max: PROTOCOL as u16,
+        identity,
+        required_capabilities: CAPABILITIES.iter().map(|s| (*s).into()).collect(),
+        optional_capabilities: OPTIONAL_CAPABILITIES.iter().map(|s| (*s).into()).collect(),
+    }
+}
+
 const STATE_VERSION: u32 = 3;
 const MAX_FRAME_BYTES: u64 = 1024 * 1024;
 const DEADLINE: Duration = Duration::from_secs(5);
@@ -59,6 +78,9 @@ pub fn error_file(file: &Path) -> PathBuf {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Request {
+    Hello {
+        hello: crate::protocol::Hello,
+    },
     Health,
     Dispatch {
         key: u64,
@@ -84,6 +106,9 @@ enum Request {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Response {
+    Hello {
+        hello: crate::protocol::Hello,
+    },
     Ready {
         protocol: u32,
         #[serde(default)]
@@ -193,8 +218,18 @@ struct Process {
 }
 impl Process {
     async fn start(path: &Path) -> Result<Self, AppError> {
+        // Demo Manager has no placement identity yet. Bind each child to a fresh
+        // generation; Bot/Shard remain the single demo context until runtime wiring.
+        let identity = crate::protocol::Identity {
+            bot_id: crate::protocol::BotId(0),
+            shard: crate::protocol::Shard::new(0, 1)?,
+            generation_id: crate::protocol::GenerationId(getrandom::u64()?),
+            ownership_epoch: crate::protocol::OwnershipEpoch(0),
+        };
+        let hello = local_hello(identity.clone());
         let mut child = Command::new(path)
             .arg("--worker")
+            .env(IDENTITY_ENV, serde_json::to_string(&identity)?)
             .env_remove("DISCORD_TOKEN")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -224,9 +259,28 @@ impl Process {
                 pid,
             } => {
                 validate_hello(protocol_min, protocol_max, &required_capabilities)?;
+                if supported_capabilities
+                    .iter()
+                    .any(|cap| cap == HELLO_CAPABILITY)
+                {
+                    match process
+                        .request(&Request::Hello {
+                            hello: hello.clone(),
+                        })
+                        .await?
+                    {
+                        Response::Hello { hello: peer } => {
+                            let (_, negotiated) = hello.negotiate(&peer)?;
+                            process.supported_capabilities = negotiated;
+                        }
+                        _ => return Err("worker hello rejected".into()),
+                    }
+                } else {
+                    // Preserve v5's advertised application capabilities.
+                    process.supported_capabilities = supported_capabilities;
+                }
                 process.build = build;
                 process.pid = pid;
-                process.supported_capabilities = supported_capabilities;
                 Ok(process)
             }
             _ => Err("incompatible worker protocol".into()),
@@ -627,14 +681,33 @@ pub async fn run() -> Result<(), AppError> {
     let mut state = crate::cogs::State::default();
     let runtime = crate::cogs::FrameworkRuntime::default();
     bot_framework::commands()?;
+    let identity = std::env::var(IDENTITY_ENV)
+        .ok()
+        .map(|value| serde_json::from_str::<crate::protocol::Identity>(&value))
+        .transpose()?;
     while let Some(frame) = read_frame(&mut input).await? {
         let response = match serde_json::from_slice(&frame)? {
+            Request::Hello { hello: peer } => match identity.clone() {
+                Some(identity) => {
+                    let hello = local_hello(identity);
+                    match hello.negotiate(&peer) {
+                        Ok(_) => Response::Hello { hello },
+                        Err(reason) => Response::Rejected {
+                            reason: reason.into(),
+                        },
+                    }
+                }
+                None => Response::Rejected {
+                    reason: "missing worker identity".into(),
+                },
+            },
             Request::Health => Response::Ready {
                 protocol: PROTOCOL,
                 protocol_min: Some(PROTOCOL),
                 protocol_max: Some(PROTOCOL),
                 required_capabilities: CAPABILITIES.iter().map(|s| (*s).to_owned()).collect(),
                 supported_capabilities: vec![
+                    HELLO_CAPABILITY.into(),
                     "command-dispatch-v1".into(),
                     "ready-event-v1".into(),
                     "slash-arguments-v1".into(),
