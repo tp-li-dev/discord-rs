@@ -1,12 +1,16 @@
 # 運用ガイド（ローカル試作）
 
-`botctl` / `botd` は、認証付きのローカル接続で複数BotのShard別Gateway子プロセスを管理します。既存のDiscord実行系と `manage` は単一Bot・単一Shard用であり、このdaemonとの接続は未実装です。manageの表示にある「コア」はローカル管理プロセスを指し、仕様のShard単位Coreとは異なります。以下はリポジトリルートで `cd src` した後のコマンドです。[制約一覧](known-limitations.md) も確認してください。
+`botctl` / `botd` は、認証付きのローカル接続で複数BotのShard別Gateway子プロセスを管理します。実 `src` Gatewayの起動引数・Workerプール・停止契約へ接続し、Discordに接続しない明示的な模擬モードを追加しました。実Discordでの複数Shard運用や分散制御の検証は完了していません。`manage` は別のローカル単一Bot管理経路で、その表示の「コア」は管理プロセスを指します。以下はリポジトリルートで `cd src` した後のコマンドです。
+
+今回の実装契約・検証範囲は [Shard実行設計](shard-runtime-design.md) を参照してください。[制約一覧](known-limitations.md) と [進捗](progress.md) はPM統合対象で、今回変更していません。そこに残る実起動未接続等の記述は、この変更以前の状態を含みます。
 
 ## 複数Botのローカル制御：botctl / botd
 
 ### 設定と対象範囲
 
 `botd` は `cluster.mode = "standalone"`、`node.remote_bind` 未指定、固定Shard数の設定だけを受け付けます。設定の `node.id` と一致するprimaryのShardを起動・操作します。他ホストに配置したShardの状態は取得せず、配置情報とローカル観測の有無を区別して返します。未解決の `total_shards = "auto"`、quorum構成、遠隔bind指定は起動エラーです。
+
+**実 `src` Gatewayには数値Bot IDが必要です。** 配置・daemonは文字列IDを許容しますが、実Worker IPCの `BotId(u64)` に合わせ、`bot_id = "101"` のようなu64の正規の10進数文字列を指定してください。UUID・任意文字列は配置検査に成功しても実Gatewayの起動で失敗します。`"001"` や `"+1"` も、別の文字列IDを同じIPC identityへ混同しないため拒否します。暗黙のハッシュ変換は行いません。Botの表示名には従来どおり名前を使用できます。
 
 例えば、次の配置を `local-bots.toml` に保存します。秘密値は書かず、Botごとに異なるtoken環境変数名を指定します。
 
@@ -20,7 +24,7 @@ id = "local-node"
 
 [[bots]]
 name = "music"
-bot_id = "music-001"
+bot_id = "101"
 application_id = "123456789012345678"
 token_env = "MUSIC_BOT_TOKEN"
 total_shards = 1
@@ -31,7 +35,7 @@ primary = "local-node"
 
 [[bots]]
 name = "support"
-bot_id = "support-001"
+bot_id = "202"
 application_id = "234567890123456789"
 token_env = "SUPPORT_BOT_TOKEN"
 total_shards = 1
@@ -42,7 +46,7 @@ primary = "local-node"
 ```
 
 ```sh
-cargo build --offline --bin botd --bin botctl
+cargo build --offline --bin src --bin botd --bin botctl
 cargo run --offline --bin botctl -- config validate --file local-bots.toml --json
 ```
 
@@ -56,17 +60,45 @@ cargo run --offline --bin botctl -- config validate --file local-bots.toml --jso
 botd --file local-bots.toml --runtime-root ABS_RUNTIME --gateway-program ABS_GATEWAY --bootstrap-stdin
 ```
 
+このリポジトリのGatewayを使う場合、`ABS_GATEWAY` はビルドした `target/debug/src.exe`（Windows）または `target/debug/src`（Linux）の絶対パスです。Gatewayは1プロセスで1Shardを担当し、既定2 WorkerをそのShard内で起動します。`--gateway-program` の任意成果物が同じ契約を実装していることまでdaemonが保証するわけではありません。
+
 ランチャーはdaemon起動ごとに暗号学的乱数の32byte secretを生成し、次の受渡しを行います。**secretを端末へ入力・表示したり、argv・環境変数・一時ファイル・ログへ記録したりしないでください。** 下表はJSONの構造を示しており、secretの固定値を用いた起動例ではありません。
 
 | 経路 | 1行JSONの内容 |
 |---|---|
 | ランチャー → `botd` の匿名stdinパイプ | `secret`: 32個のbyte値の配列 |
-| `botd` → ランチャーのstdout | `port`、`local_only`、`startup_ok`。secretは含まない |
+| `botd` → ランチャーのstdout | `port`、`local_only`、`startup_ok`、`mock_discord`。secretは含まない |
 | ランチャー → 各 `botctl --bootstrap-stdin` の匿名stdinパイプ | `port`: 公告されたポート、`secret`: 同じdaemon用の配列 |
 
 各JSONはUTF-8、末尾改行付きです。`botctl` は `127.0.0.1` の公告ポートへ接続し、各要求を認証します。接続情報はそのdaemonの存続期間だけ使用してください。自動検出用endpointファイル、一般用途の常駐ランチャー、OSサービス登録は提供していません。仕様のUnix socket / Named Pipeへの移行とOSユーザー権限の検証、遠隔相互認証・RBACも未実装です。TCPを転送・公開して遠隔管理には使用しないでください。
 
-既定ではdaemon起動時にローカルShardを起動します。`--no-autostart` を追加すると、起動を `botctl start` まで保留できます。`startup_ok` は初回起動要求の結果であり、以後の実状態は `status` で確認します。子の環境は初期化し、そのBot用に指定したtoken参照だけを渡します。Coreを起動したり、Coreへtokenを渡したりはしません。
+既定ではdaemon起動時にローカルShardを起動します。`--no-autostart` を追加すると、起動を `botctl start` まで保留できます。`startup_ok` は初回起動要求の結果であり、以後の実状態は `status` で確認します。Gatewayの環境は初期化し、通常モードではそのBot用のtokenとBot/Shard/起動世代だけを注入します。Windowsではネットワーク初期化に必要なOS変数 `SystemRoot` だけを追加継承し、`PATH` や他Botの環境は継承しません。`SystemRoot` とidentity用4変数はtoken参照名に使えません。
+
+Gatewayが起動するWorkerはさらに `env_clear` するため、任意名のBot tokenもCoreへ渡しません。状態・Worker更新監視ファイル・計画上のIPC/管理パスはBot/Shard別です。業務状態はメモリ内であり、状態パスの割当が永続化やGateway再起動時の復元を意味するわけではありません。
+
+### Discordに接続しない模擬実行
+
+実GatewayとWorkerの経路をtokenなしで検証するには、試験ランナーがloopbackでcollectorを待ち受け、botdに次の追加オプションを渡します。
+
+```text
+botd --file local-bots.toml --runtime-root ABS_RUNTIME --gateway-program ABS_GATEWAY --bootstrap-stdin --mock-discord 127.0.0.1:PORT
+```
+
+`PORT` は試験ランナーが確保した非ゼロポートへ置き換えます。模擬モードは既定無効で、token未設定や接続失敗時に暗黙で有効になりません。IPリテラルのloopbackだけを受け付け、ホスト名・外部IP・wildcard・ポート0は拒否します。選択は最初の起動試行前に確定します。botdの管理認証は通常どおり必要です。
+
+このモードのdaemonはBot token参照先を読み取らず、Gatewayへtokenを渡しません。Gatewayは指定collectorへ外向きに接続し、実Discordのメタデータ・WebSocket・RESTを呼びません。Gateway側に新たな管理listenerは作りません。collectorは試験専用の入力・観測先で、botd管理secretを受け取りません。単なる起動オプションだけで手動対話が始まる機能ではありません。
+
+collectorからの正規化されたprefix/Slash相当JSONは実Workerの同じハイブリッドハンドラーへ渡ります。`testkit.rs` の模擬REST/Interactionへの応答後、`api-result-v1` により要求元Workerへ結果を送り、操作ID・世代を照合したACKを確認します。試験用の状態照会・crash注入もこの明示モードに限定します。模擬JSONは64 KiB上限、読取開始後5秒以内に終端が必要です。模擬RESTの接続先もloopbackに限定します。実DiscordのWebSocket入力解析やHTTP/TLSはこのモードでは検証しません。
+
+Workerへ戻すのはHTTPステータスまたは結果不明で、HTTP本文・Interaction tokenは渡しません。これはWorkerの未完了操作表で照合するIPC受領確認です。Frameworkの `ctx.reply()` は応答バッファへの追加のままで、ハンドラーのreply FutureがHTTP結果を返すAPIには未接続です。
+
+再現用の統合試験は次のコマンドです。Bot AのShard 0/1とBot BのShard 0を別Gatewayプロセスで起動し、実Worker、模擬HTTP、再起動・停止までを扱います。最終実行結果は [検証記録](shard-runtime-design.md#検証記録と未検証範囲) を確認してください。
+
+```sh
+cargo test --offline --test e2e_shard_runtime
+```
+
+この試験は実Discordの登録・接続・REST、Bot全体のIdentify/REST予算、quorum/lease、Gateway新旧WebSocketのActive切替を検証するものではありません。`--offline` だけでは実行プログラムのDiscord通信は無効にならず、模擬モードの明示が必要です。
 
 ### 状態表示と操作
 
@@ -75,7 +107,7 @@ botd --file local-bots.toml --runtime-root ABS_RUNTIME --gateway-program ABS_GAT
 ```text
 botctl ps --bootstrap-stdin --json
 botctl status music --bootstrap-stdin --json
-botctl inspect music-001 --bootstrap-stdin --json
+botctl inspect 101 --bootstrap-stdin --json
 botctl shards support --bootstrap-stdin --json
 botctl start music --bootstrap-stdin --timeout 30s --json
 botctl stop music --bootstrap-stdin --timeout 30s --json
@@ -93,11 +125,13 @@ botctl restart support --bootstrap-stdin --timeout 30s --json
 | `stop BOT --force --yes` | 対象の所有済み子ハンドルを強制終了。`--yes` なしは拒否 |
 | `operation ID` / `op ID` | 同じdaemonで受け付けた操作の状態と結果を1回再照会 |
 
-通常stopは子の匿名stdinパイプへ `{"command":"shutdown"}` と改行を送り、子が処理を終えて終了コード0で終了するのを確認します。対応するGateway成果物は、新規受付停止・必要なdrain・正常終了を実装し、daemon消失によるstdinのEOFを即時終了命令として扱わない必要があります。既存の `main.rs` / `worker.rs` にはこの起動引数・終了契約を接続していません。子が契約に応答しない場合、停止の成功を返さず、自動でforceへ切り替えません。
+通常stopは子の匿名stdinパイプへ `{"command":"shutdown"}` と改行を送り、子が処理を終えて終了コード0で終了するのを確認します。実Gatewayの契約は512 byte上限で、未知command・追加field・過大/未終端フレームを拒否します。daemon消失によるstdinのEOFや不正入力を即時終了命令として扱いません。
+
+実Gatewayは新規入力を止め、受け付け済み処理とREST結果確認を待ち、Workerの周期処理・新規受付を止めて各Workerのstdinを閉じます。全Workerの終了コードと子ハンドルの回収を確認してからGatewayが正常終了します。結果不明がある場合も子の終了・回収を待ちますが、外部操作の成否は未確定のままで、Gatewayは非ゼロ終了しstopを失敗とします。期限超過・Worker異常終了もstop成功とは表示せず、daemonは自動でforceへ切り替えません。この契約は任意アプリの未管理タスクや外部副作用の完了まで保証するものではありません。
 
 既に停止したBotへのstopは成功します。起動中、または自動再試行待ちのBotへの新しいstartはエラーです。restartは対象の旧子がすべて正常終了したことを確認してから新世代を起動します。同じBotの処理中操作を `stop --force --yes` で置き換える場合、元の操作は `OperationSuperseded` として失敗し、force stopを優先します。
 
-`Running` やstart成功はDiscord READY、Heartbeat、Coreのdrain完了、quorum承認、leaseの有効性を証明しません。現在の制御対象は対応するGateway子プロセスです。実Discord・Coreライフサイクル・分散Identify・failoverへの統合は別途必要です。
+`Running` やstart成功はDiscord READY、Heartbeat、Coreのdrain完了、quorum承認、leaseの有効性を証明しません。daemonはGateway子を管理し、GatewayがWorkerのライフサイクルを所有します。実Discord検証、Shard Core全資源のライフサイクル、分散Identify・failoverへの統合は別途必要です。
 
 ### 操作ID、timeout、失敗の確認
 
@@ -110,6 +144,10 @@ botctl operation 0123456789abcdef0123456789abcdef --bootstrap-stdin --json
 ```
 
 操作状態は `running` / `succeeded` / `failed` です。`running` は完了を意味しません。`operation` の照会時に処理中なら `pending: true`、`ok: false` と非ゼロ終了コードを返します。daemonの操作期限は30秒で、Graceful停止が間に合わなければ失敗を記録し、子を強制終了しません。状態照会を続け、必要なら対象と影響を確認して明示的にforce stopを実行します。一部Shardだけ成功する場合もあり、操作失敗が全Shardの停止や変更の取消を意味するわけではありません。全体の終了コードに加えShard別結果と現在の `status` を確認してください。
+
+実Gatewayの受理済み処理待ちは30秒、Worker管理側の停止待ちは60秒で、daemon操作の30秒とは別の期限です。daemonがtimeoutを返しても後から子が終了する場合があります。失敗した操作の結果だけでなく、現在のプロセス状態を再確認してください。
+
+更新監視の取消中などに大きな未読IPC応答がWorker stdoutを塞ぐ停止競合は未検証で、shutdownがtimeoutする可能性があります。正常stop・遅延REST試験で確認した子回収を、この条件での正常終了や孤児不在の保証とは扱わないでください。
 
 操作記録はdaemonのメモリ内に最大1024件保持し、満杯なら新規操作を拒否します。1操作の対象はローカル64Shardまでで、これを超えるBotへの起動・停止・再起動は処理前に拒否します。同じID・同じ操作は記録済み結果を返し、異なる対象・操作へのID再利用は拒否します。記録はdaemon再起動で失われ、永続監査や再起動を跨ぐ重複排除にはなりません。再照会で見つからないことだけを未実行の証拠にしないでください。
 
@@ -144,7 +182,7 @@ cargo run --offline --bin register -- 123456789012345678 234567890123456789 gree
 
 ## ローカル起動・状態・停止：manage
 
-秘密をソース・ログ・コマンド履歴に記録しない方法で `DISCORD_TOKEN` を設定します。prefix処理には Message Content Intent が必要です。実行バイナリはGateway情報を取得し、推奨Shard数が1以外の場合は起動を拒否します。取得失敗・timeoutでも起動しません。
+秘密をソース・ログ・コマンド履歴に記録しない方法で `DISCORD_TOKEN` を設定します。prefix処理には Message Content Intent が必要です。実行バイナリはGateway情報を取得し、設定総Shard数がDiscord推奨値未満の場合は起動を拒否します。manageの既定は1Shardです。取得失敗・timeoutでも起動しません。IdentifyキューはGatewayプロセス内だけで、別プロセス・ホスト・再起動を跨ぐBot単位の予算共有は未接続です。
 
 内部のCargo呼び出しもofflineにする場合、管理プロセス起動前に環境を設定します。
 
@@ -195,7 +233,11 @@ cargo run --offline --bin reload -- general
 
 reloadはreleaseビルド → `src/workers/` への成果物コピー → `src/worker-path.txt` に更新先を書き込み → 完了確認を行います。確認待ちは約20秒で、timeoutや失敗後も更新要求は残り、親が再試行し得ます。直ちに再実行せず、ログと `!workers` / `!version` で実状態を確認してください。ビルドIDはコードの差分を証明しません。
 
+上記は従来のmanage/reload経路です。botd配下のGatewayはShard別のWorker更新監視ファイルを使用するため、共有の既定ファイルを書き換えて全Shardを更新できるとは扱わないでください。botctlのCore更新コマンドは未実装です。
+
 対象Workerの受付を止め、処理と外部応答確認を待ち、snapshotを新Workerへ移して切り替えます。別Workerは処理を継続できます。途中失敗時は切替済みWorkerが新版、未切替Workerが旧版のまま残り得ます。全体を旧版へ戻す原子的rollbackやCLIはありません。結果不明の外部応答があるWorkerは旧版を維持します。`list-unknown` で照会できますが、照合・解除CLIや永続監査は未実装です。再起動で追跡が消えても外部操作の成否が判明したことにはなりません。
+
+実Gatewayで使う成果物にはWorkerのReady/Helloで `api-result-v1`、`command-dispatch-v1`、`slash-arguments-v1`、`ready-event-v1` を確認できることが必要です。初回起動・更新・復旧で不足する候補は採用前に拒否し、更新時の旧Workerの状態・受付を維持します。汎用Manager APIの旧v5互換は残りますが、それだけを実Gateway用成果物の適合性確認とは扱わないでください。
 
 引き継ぎ対象は `!count` のカウンターと `!job` の計算状態です。`!job start` はチャンネルごとに1個の計算を開始し、Workerの約1秒周期で進みます。`!job status`、更新、再度statusで明示的checkpointの継続を確認できます。任意のFutureや外部APIの実行途中を移動しません。StateMap/Cogの状態はsnapshot対象外です。
 

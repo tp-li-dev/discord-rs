@@ -1,6 +1,6 @@
 //! Local supervision of one Gateway execution unit per configured Bot/Shard.
 //!
-//! This launcher starts only `ShardRuntimeSpec::gateway`; Core lifecycle and
+//! This launcher starts `ShardRuntimeSpec::gateway`, which owns its Worker pool.
 //! Gateway Ready/lease/Identify admission are separate integration work.
 //! Running means an OS child exists, not Discord readiness. Cooperative shutdown
 //! uses the owned child's anonymous stdin; the artifact must implement it.
@@ -25,6 +25,7 @@ use std::{
     ffi::OsString,
     fmt,
     io::Write,
+    net::SocketAddr,
     path::{Component, Path, PathBuf},
     process::Stdio,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -586,6 +587,71 @@ pub mod control {
         }
 
         #[test]
+        fn configured_environment_cannot_override_windows_system_root() {
+            let plane = plane(1, 1);
+            for role in [Role::Gateway, Role::Core] {
+                let mut specs: Vec<_> = plane
+                    .daemon
+                    .entries
+                    .values()
+                    .map(|entry| entry.spec.clone())
+                    .collect();
+                let process = if role == Role::Gateway {
+                    &mut specs[0].gateway
+                } else {
+                    &mut specs[0].core
+                };
+                process
+                    .environment
+                    .variables
+                    .insert("systemroot".into(), "untrusted-os-root".into());
+                assert_eq!(validate_specs(&specs), Err(DaemonError::InvalidSpec));
+            }
+        }
+
+        #[tokio::test]
+        async fn explicit_mock_configuration_never_reads_credentials_and_freezes_on_launch() {
+            let mut plane = plane(1, 1);
+            for address in ["0.0.0.0:1000", "192.0.2.1:1000", "127.0.0.1:0"] {
+                assert_eq!(
+                    plane.daemon.enable_mock_discord(address.parse().unwrap()),
+                    Err(DaemonError::InvalidSpec)
+                );
+            }
+            assert!(
+                plane
+                    .daemon
+                    .entries
+                    .values()
+                    .all(|entry| entry.mock_discord.is_none())
+            );
+            let address = "127.0.0.1:1234".parse().unwrap();
+            plane.daemon.enable_mock_discord(address).unwrap();
+            let key = ShardKey {
+                bot_id: "id-0".into(),
+                shard_id: 0,
+            };
+            let missing_program = std::env::current_dir()
+                .unwrap()
+                .join("target")
+                .join(format!(
+                    "missing-gateway-{:016x}",
+                    getrandom::u64().unwrap()
+                ));
+            plane.daemon.set_gateway_program(&missing_program).unwrap();
+            assert_eq!(
+                plane.daemon.start(&key, &no_credentials),
+                Err(DaemonError::SpawnFailed)
+            );
+            assert_eq!(
+                plane.daemon.enable_mock_discord(address),
+                Err(DaemonError::InvalidState)
+            );
+            assert!(!plane.daemon.has_child(&key));
+            assert!(plane.daemon.entries[&key].reservation.is_none());
+        }
+
+        #[test]
         fn exit_before_shutdown_child() {
             if std::env::var_os("BOTCTL_TEST_EXIT_BEFORE_SHUTDOWN").is_some() {
                 std::process::exit(27);
@@ -885,6 +951,7 @@ pub enum DaemonError {
     InvalidState,
     NoRuntime,
     MissingCredential,
+    MissingSystemEnvironment,
     ReservationExists,
     ReservationIo,
     SpawnFailed,
@@ -968,6 +1035,9 @@ struct Entry {
     started: bool,
     graceful_stop: Option<Result<(), DaemonError>>,
     restart_held: bool,
+    /// Only explicit local test configuration may select this. Never infer the
+    /// mode from missing credentials, inherited environment, or child failure.
+    mock_discord: Option<SocketAddr>,
 }
 
 pub struct Daemon<C = MonotonicClock> {
@@ -1071,6 +1141,7 @@ fn validate_specs(specs: &[ShardRuntimeSpec]) -> Result<(), DaemonError> {
             for (name, value) in &process.environment.variables {
                 if !env_name(name)
                     || value.contains('\0')
+                    || name.eq_ignore_ascii_case("SYSTEMROOT")
                     || credential_names.contains(&name.to_ascii_uppercase())
                     || !names.insert(name.to_ascii_uppercase())
                 {
@@ -1141,6 +1212,7 @@ impl<C: Clock> Daemon<C> {
                         started: false,
                         graceful_stop: None,
                         restart_held: false,
+                        mock_discord: None,
                     },
                 )
             })
@@ -1168,6 +1240,23 @@ impl<C: Clock> Daemon<C> {
         }
         for entry in self.entries.values_mut() {
             entry.spec.gateway.program = program.as_os_str().to_owned();
+        }
+        Ok(())
+    }
+
+    /// Explicit token-free Discord simulation. Gateways connect out to the
+    /// caller's loopback collector; no listener or remote management is exposed.
+    /// Configuration is frozen after the first launch attempt, including failed
+    /// attempts. Normal launches never fall back to this mode.
+    pub fn enable_mock_discord(&mut self, address: SocketAddr) -> Result<(), DaemonError> {
+        if self.entries.values().any(|entry| entry.started) {
+            return Err(DaemonError::InvalidState);
+        }
+        if !address.ip().is_loopback() || address.port() == 0 {
+            return Err(DaemonError::InvalidSpec);
+        }
+        for entry in self.entries.values_mut() {
+            entry.mock_discord = Some(address);
         }
         Ok(())
     }
@@ -1243,10 +1332,24 @@ impl<C: Clock> Daemon<C> {
             return Err(DaemonError::InvalidProgram);
         }
         let name = &spec.environment.credential_refs[0];
-        let credential = credentials
-            .read(name)
-            .filter(|v| !v.is_empty())
-            .ok_or(DaemonError::MissingCredential)?;
+        let credential = if entry.mock_discord.is_none() {
+            Some(
+                credentials
+                    .read(name)
+                    .filter(|value| !value.is_empty())
+                    .ok_or(DaemonError::MissingCredential)?,
+            )
+        } else {
+            None
+        };
+        // Windows' network stack needs SystemRoot even for a literal loopback
+        // address. Inherit only this OS location, never PATH or arbitrary user
+        // variables. The planner reserves its name against credential aliases,
+        // and validate_specs forbids an application-supplied replacement.
+        #[cfg(windows)]
+        let system_root = std::env::var_os("SystemRoot")
+            .filter(|value| !value.is_empty())
+            .ok_or(DaemonError::MissingSystemEnvironment)?;
         *sequence = sequence
             .checked_add(1)
             .ok_or(DaemonError::GenerationExhausted)?;
@@ -1291,11 +1394,25 @@ impl<C: Clock> Daemon<C> {
             .args(&spec.args)
             .env_clear()
             .envs(&spec.environment.variables)
-            .env(name, credential)
+            .env("BOT_ID", &entry.spec.bot_id)
+            .env("SHARD_ID", entry.spec.shard_id.to_string())
+            .env("TOTAL_SHARDS", entry.spec.total_shards.to_string())
+            .env("GENERATION_ID", sequence.to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(false);
+        #[cfg(windows)]
+        command.env("SystemRoot", system_root);
+        if let Some(address) = entry.mock_discord {
+            command
+                .arg("--mock-discord")
+                .arg(address.to_string())
+                .env_remove("DISCORD_TOKEN")
+                .env_remove(name);
+        } else if let Some(credential) = credential {
+            command.env(name, credential);
+        }
         // Terminal Ctrl-C must target the daemon's foreground group, not its
         // independently supervised Gateway units. This is not a service manager
         // or a guarantee against an OS/session/job object's teardown policy.
@@ -1533,7 +1650,8 @@ impl<C: Clock> Daemon<C> {
         entry.graceful_stop = Some(Err(DaemonError::StopFailed));
         let pipe = child.stdin.as_mut().ok_or(DaemonError::StopFailed)?;
         let result = tokio::time::timeout(Duration::from_millis(100), async {
-            pipe.write_all(b"{\"command\":\"shutdown\"}\n").await?;
+            pipe.write_all(shard_runtime::GATEWAY_SHUTDOWN_FRAME)
+                .await?;
             pipe.flush().await
         })
         .await;

@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use src::daemon::control::{CommandRequest, ControlPlane, NOTE};
-use std::{ffi::OsString, io, path::PathBuf, time::Duration};
+use std::{ffi::OsString, io, net::SocketAddr, path::PathBuf, time::Duration};
 use subtle::ConstantTimeEq;
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
@@ -15,13 +15,14 @@ use tokio::{
 const REQUEST_LIMIT: u64 = 4096;
 const RESPONSE_LIMIT: usize = 64 * 1024;
 const DEADLINE: Duration = Duration::from_secs(3);
-const USAGE: &str = "usage: botd --file F --runtime-root ABS --gateway-program ABS --bootstrap-stdin [--no-autostart]";
+const USAGE: &str = "usage: botd --file F --runtime-root ABS --gateway-program ABS --bootstrap-stdin [--no-autostart] [--mock-discord LOOPBACK_IP:PORT]";
 
 struct Options {
     file: PathBuf,
     runtime_root: PathBuf,
     gateway_program: PathBuf,
     no_autostart: bool,
+    mock_discord: Option<SocketAddr>,
 }
 
 fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'static str> {
@@ -31,6 +32,7 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
     let mut gateway_program = None;
     let mut bootstrap = false;
     let mut no_autostart = false;
+    let mut mock_discord = None;
     while let Some(arg) = args.next() {
         let target = match arg.to_str() {
             Some("--file") if file.is_none() => &mut file,
@@ -42,6 +44,19 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
             }
             Some("--no-autostart") if !no_autostart => {
                 no_autostart = true;
+                continue;
+            }
+            Some("--mock-discord") if mock_discord.is_none() => {
+                let value = args.next().ok_or(USAGE)?;
+                let address: SocketAddr = value
+                    .to_str()
+                    .ok_or(USAGE)?
+                    .parse()
+                    .map_err(|_| "mock Discord requires a loopback IP and nonzero port")?;
+                if !address.ip().is_loopback() || address.port() == 0 {
+                    return Err("mock Discord requires a loopback IP and nonzero port");
+                }
+                mock_discord = Some(address);
                 continue;
             }
             _ => return Err(USAGE),
@@ -57,6 +72,7 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
         runtime_root: runtime_root.ok_or(USAGE)?,
         gateway_program: gateway_program.ok_or(USAGE)?,
         no_autostart,
+        mock_discord,
     };
     if !bootstrap {
         return Err("anonymous stdin bootstrap is required");
@@ -222,6 +238,11 @@ async fn run() -> Result<(), &'static str> {
     daemon
         .set_gateway_program(&options.gateway_program)
         .map_err(|_| "invalid gateway program")?;
+    if let Some(address) = options.mock_discord {
+        daemon
+            .enable_mock_discord(address)
+            .map_err(|_| "invalid mock Discord configuration")?;
+    }
     let bootstrap = read_bootstrap(tokio::io::stdin())
         .await
         .map_err(|_| "invalid anonymous control bootstrap")?;
@@ -241,6 +262,7 @@ async fn run() -> Result<(), &'static str> {
     let mut server = tokio::spawn(status_server(listener, bootstrap.secret, sender));
     let mut announcement = serde_json::to_vec(&json!({
         "port": port, "local_only": true, "startup_ok": startup_ok,
+        "mock_discord": options.mock_discord.is_some(),
     }))
     .map_err(|_| "cannot encode daemon announcement")?;
     announcement.push(b'\n');
@@ -304,6 +326,32 @@ mod tests {
     #[test]
     fn accepts_absolute_program_and_root() {
         assert!(parse_options(options(&[])).is_ok());
+    }
+
+    #[test]
+    fn mock_discord_requires_an_explicit_loopback_endpoint() {
+        assert!(parse_options(options(&[])).unwrap().mock_discord.is_none());
+        for address in ["127.0.0.1:1234", "[::1]:1234"] {
+            let parsed = parse_options(options(&["--mock-discord", address])).unwrap();
+            assert_eq!(parsed.mock_discord, Some(address.parse().unwrap()));
+        }
+        for extra in [
+            &["--mock-discord"][..],
+            &["--mock-discord", "true"],
+            &["--mock-discord", "localhost:1234"],
+            &["--mock-discord", "127.0.0.1:0"],
+            &["--mock-discord", "0.0.0.0:1234"],
+            &["--mock-discord", "192.0.2.1:1234"],
+            &["--mock-discord", "[::]:1234"],
+            &[
+                "--mock-discord",
+                "127.0.0.1:1234",
+                "--mock-discord",
+                "127.0.0.1:5678",
+            ],
+        ] {
+            assert!(parse_options(options(extra)).is_err());
+        }
     }
 
     #[test]
