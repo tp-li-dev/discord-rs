@@ -133,6 +133,54 @@ Windows / Rust 1.99.0 でロール×全9操作、未認証遠隔要求、確認�
 
 `manage` は loopback の管理接続で資格情報を照合し、`core.json` の資格情報に admin、別の `viewer.json` の資格情報に viewer をサーバー側で結び付ける。クライアントが要求でロールを選ぶことはできない。各ファイルには同じ形式の接続先とそれぞれ別の秘密が入るため、必要な権限を持つユーザーにだけ該当ファイルへのアクセスを許可する。Windows でこれらのファイルや監査ディレクトリの ACL の設定・検証は実装されておらず、ACL は未検証。資格情報を読める同一ユーザーのプロセスからの利用を区別する仕組みではない。
 
-認証・認可の拒否と管理操作を `runtime/audit.jsonl` に記録する。操作前の監査書き込み・同期に失敗した場合は操作を実行しない。操作後の結果記録が失敗した場合は副作用を巻き戻せず、結果不明として扱う。監査の容量、排他、改竄耐性の制約は前節に従う。受信できなかったフレームなど、要求として識別できない接続のすべてを監査できる保証はない。接続枠または処理待ちキューの飽和時も拒否を記録できない場合がある。未認証の遠隔管理を許可せず、遠隔 mTLS や遠隔管理の RBAC は未実装。
+認証・認可の拒否と管理操作を `runtime/audit.jsonl` に記録する。操作前の監査書き込み・同期に失敗した場合は操作を実行しない。操作後の結果記録が失敗した場合は副作用を巻き戻せず、結果不明として扱う。監査の容量、排他、改竄耐性の制約は前節に従う。受信できなかったフレームなど、要求として識別できない接続のすべてを監査できる保証はない。接続枠または処理待ちキューの飽和時も拒否を記録できない場合がある。未認証の遠隔管理を許可せず、遠隔管理ハンドラーへの mTLS・RBAC の接続は未実装。Daemon 間 Transport 単体の実装は次節の範囲に限る。
 
 `metrics-json` と `metrics-prometheus` は管理プロセス内のメトリクススナップショットを返す。現在の registry は Gateway / Worker の観測に接続されていないため、表示値を実環境の状態や健全性の証明に使えない。Windows ACL、Linux 実機、実 Discord や遠隔管理を通じた動作は未検証。
+
+## Daemon 間 mTLS TCP Transport（2026-11-12）
+
+`src/src/tls_transport.rs` の `TlsTransport` が既存 `cluster::Transport` を実装する。Tokio TCP と rustls / tokio-rustls を使い、TLS 1.3・相互証明書認証・ALPN `botd-cluster/1` を必須にする。追加依存はない。`main.rs` / `worker.rs` / `daemon.rs`、本番の合意・lease・RBAC・監査ハンドラーには接続していない。Transport の認証試験は §4.3 / §13.1 / T20 の一部であり、遠隔 CLI 操作と永続監査を含む T20 全体の完了ではない。
+
+### 証明書とノードの対応
+
+- 管理者が明示する CA のみを信頼する。OS の公開 CA ストアや接続元 IP を認証根拠にしない。rustls / webpki で証明書チェーン、署名、期限、用途（client/server EKU）と TLS の秘密鍵保有証明を検証する。未許可ノード、未信頼 CA・自己署名、期限切れ・有効期間前、用途不一致、証明書無し、平文を拒否する。
+- `NodeId(u64)` は証明書の唯一の DNS SAN `node-<10進整数>.cluster` から取り出す（例: `NodeId(7)` は `node-7.cluster`）。先頭ゼロ、符号、ワイルドカード、末尾ドット、大文字への置換、複数 SAN、DNS 以外の SAN を受理しない。SAN がない場合だけ、UTF8String / PrintableString の唯一の CN に同形式を許す。SAN と CN が両方あれば完全一致が必要で、曖昧な名前や CN への暗黙の逃げ道を認めない。
+- CN 単独の場合は、提示チェーンが leaf 1枚だけで、設定したすべての trust anchor に NameConstraints がない場合に限定する。DNS の名前制約は CN に適用されないため、中間 CA や制約付き root を使う場合は SAN を必須にする。SAN の名前制約は webpki が検査する。SAN/CN 抽出用の小さな DER リーダーは境界・長さ・タグを検査するが、X.509 の署名・期限検証を代替しない。
+- 発信時はルート表の期待ノード ID とサーバー証明書を照合し、受信時はクライアント証明書とフレームの送信元を照合する。宛先 ID と接続開始時の受信側 incarnation も一致させる。別の許可ノードへのなりすましを防ぐ。payload 内の提案や ACK を実行する権限・現在の epoch の妥当性は、上位の合意・fencing 層で別途確認する。
+- TLS 再開と 0-RTT は無効。接続ごとに証明書を再検証する。証明書失効（CRL / OCSP）と自動ローテーション・オンラインの信頼一覧更新は**未実装**。置換時は Transport を停止して新設定で作成する。[rustls のチェーン検証 API](https://docs.rs/rustls/0.23.46/rustls/client/fn.verify_server_cert_signed_by_trust_anchor.html) は失効検査を含まない。設定した CA の秘密鍵と発行権限は運用側で管理する。
+
+### 起動・制限・配送契約
+
+`TlsTransportConfig::new(node_id, identity, trusted_cas)` は `127.0.0.1:0`、外部 bind 禁止、許可ノードは自分のみで作成する。`TlsIdentity` に leaf から順の DER 証明書チェーンと `Secret<PrivateKeyDer>` を渡し、`allowed_nodes` に自分と通信先を設定する。`TlsTransport::bind(config).await` 後、`local_addr()` を使って `set_peer(node_id, SocketAddr)` で許可済みノードの経路を登録できる。経路登録で許可ノードを増やすことはできない。起動時に自身の証明書・鍵・ノード ID・信頼・期限を検査する。秘密鍵は Debug に表示せず、エラーは固定の分類だけを持つ。`Secret` 自体にメモリ消去や OS の鍵保管・ACL 管理はない。
+
+外部アドレスや wildcard bind は `allow_external_bind = true` を明示した場合のみ受理し、固定文の警告を stderr に出す。IPv4 / IPv6 とも loopback 判定を適用する。外部公開の到達制御・ファイアウォール・Tailscale の設定は別途必要で、私設網だけを認証とは扱わない。
+
+| 制限 | 既定値と動作 |
+|---|---|
+| フレーム | u32 big-endian 長 + version 1 の固定フィールド binary。本文1 MiB、設定上限8 MiB。サイズ確認後に確保。Heartbeat の配列件数も残バイト数で制限し、余剰バイト・未知version/tag・不正Durationを拒否 |
+| 接続 | 入出力合計32（設定1〜1024）。TCP accept直後・TLS処理前に共有枠を確保し、超過接続を閉じる。完了・失敗・取消で枠を返す |
+| キュー | 送信・受信・診断それぞれ128件（設定1〜65536）。満杯時は明示拒否、診断キューのみ分類を破棄し拒否件数を維持 |
+| 時間 | 接続確立＋TLS handshake、フレーム読取、各書込に既定2秒（設定は0より大きく300秒以下）。読取はlength prefixと本文を含む絶対期限で、1バイトずつ送っても延長しない |
+| 終了 | `shutdown().await` は受付を停止し接続タスクを取消・終了待機する。未配信キューを破棄。Dropでもタスク取消を要求するが、終了待機にはshutdownを使用 |
+
+MessagePack は現 workspace では dev-dependency のみで、依存追加は禁止のため、再帰構造のない専用 binary codec を採用した。Heartbeat / OwnershipProposal / OwnershipAck / OwnershipDecision のみを運ぶ。独自の合意アルゴリズムではない。1接続1メッセージで、受信キューに登録した後に1バイト ACK を返す。恒常接続・自動再送・永続スプール・処理完了 ACK・全接続間の順序保証・アプリケーションの重複排除はない。
+
+同期の `Transport::send` 成功は**ローカル送信キューへの登録**を意味する。後続の通信失敗は `take_error()` と `stats()` で確認する。`send_confirmed(...).await` は相手のメモリ内キューへの登録 ACK を待つが、操作完了や永続 commit を意味しない。書込後の timeout・ACK喪失・Future取消では配送済みか不明になり得る。無条件に再試行しない。`stats().rejected` は ACK 送信失敗を含む受信側接続エラーで、既に登録済みの `received` と重なる場合があり、未配信件数ではない。許可ノードによる占有・連続接続の速度制限、公平なノード別帯域配分、OS のaccept backlog / メモリ全体の予算は実装していない。
+
+`incarnation` は再起動ごとに呼出側が非ゼロの新しい値を割り当てる契約で、永続採番は未実装。Transport の時刻は各プロセスの経過時間で、payload の heartbeat / lease / 提案期限は元の時計領域を保持する。既存 PeerTable / cluster_sim は共有 Clock を前提にするため、実ホスト間の時計比較や安全な lease へそのまま転用しない。mTLS や heartbeat 喪失だけで quorum 承認・昇格権限を作らない。
+
+### 検証範囲
+
+テスト内だけで rcgen により CA・ノード証明書を生成し、秘密鍵をファイルやログへ保存しない。Windows / Rust 1.99.0 の実 TCP loopback で4種類のメッセージ往復、SAN / CN、偽 CA・未許可・不一致・期限・EKU・NameConstraints・平文・TLSバージョン・ALPN の拒否、巨大/不正フレーム、slowloris、接続・キュー上限と回復、shutdown を検証した。送信側の handshake / greeting / ACK の無応答、length prefix の小分け送信、shutdown 取消後の再待機も試験した。PeerTable / Failover には共通 ManualClock と実 TCP で届いた heartbeat を供給し、途絶の Suspected → FailoverPending と quorum 不足での Degraded を検証した。分散 consensus や実 Shard 起動を検証した試験ではない。
+
+`src/` から次の確認に成功した。新規は実 TCP 統合25件と DER / codec / 名前の単体3件で、関連既存試験を含む145件と doctest 4件は失敗・ignoreとも0件。workspace 全体の実行試験は再実行していない。
+
+```text
+cargo test --offline --lib --test tls_transport --test cluster_sim --test failover --test failover_ownership
+cargo test --offline --doc
+cargo clippy --offline --workspace --all-targets -- -D warnings
+cargo fmt --all --check
+git diff --check
+```
+
+Linux 実行、IPv6実通信、複数ホスト/Tailscale、実 Discord、OS suspend・時計ずれ、本番 quorum/lease、負荷性能、証明書失効・ローテーション、永続監査との接続は未検証または未実装。既存制約文書・進捗の統合更新は PM に引き継ぎ、`docs/progress.md` は変更しない。

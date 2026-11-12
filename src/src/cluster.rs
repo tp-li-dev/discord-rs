@@ -76,6 +76,7 @@ pub enum SimulationError {
     Ownership(OwnershipError),
     Policy(failover::Error),
     MultipleActive(OwnershipKey),
+    Transport(crate::tls_transport::TransportError),
 }
 impl std::fmt::Display for SimulationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -186,6 +187,9 @@ pub struct Envelope {
 /// A transport supplies authenticated member identities. The in-memory backend
 /// trusts its test caller; it is not an implementation of remote authentication.
 /// No socket listener, tokens or remote management command exists in this module.
+/// The TCP implementation lives in `tls_transport`. Its synchronous `send`
+/// acknowledges bounded local queue admission, not remote delivery; failures
+/// after admission must be observed through that implementation's diagnostics.
 pub trait Transport {
     fn send(
         &mut self,
