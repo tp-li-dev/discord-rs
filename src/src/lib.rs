@@ -1,6 +1,7 @@
 pub mod botref;
 mod cogs;
 pub mod drain;
+pub mod event_seq;
 pub mod failover;
 pub mod gateway_metadata;
 pub mod identify;
