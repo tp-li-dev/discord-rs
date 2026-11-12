@@ -132,7 +132,10 @@ async fn t19_rejected_candidates_keep_old_worker_and_legacy_v5_starts() {
     let legacy = directory.join(format!("legacy{}", std::env::consts::EXE_SUFFIX));
     std::fs::copy(&fixture, &legacy).unwrap();
     let old = src::worker::Manager::start_pool(legacy, 1).await.unwrap();
-    assert!(old.describe_workers().await.contains("fixture"));
+    let description = old.describe_workers().await;
+    assert!(description.contains("1: [REDACTED] / PID:"));
+    assert!(!description.contains("fixture"));
+    assert_eq!(old.worker_identities().await.len(), 1);
     // kill_on_drop teardown is asynchronous on Windows; keep fixture cleanup out
     // of assertions about protocol behavior.
     drop(old);

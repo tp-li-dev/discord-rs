@@ -144,17 +144,33 @@ async fn count(manager: &Manager, expected: u64) {
     );
 }
 
-async fn wait_active(manager: &Manager, build: &str) {
+async fn is_active(manager: &Manager, scenario: &Scenario, mode: &str) -> bool {
+    let path = scenario
+        .0
+        .join(format!("{mode}{}", std::env::consts::EXE_SUFFIX));
+    let pid = std::fs::read_to_string(sidecar(&path, ".pid"))
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok());
+    let workers = manager.worker_identities().await;
+    if workers.len() != 1 || pid != Some(workers[0].pid) {
+        return false;
+    }
+    // Build names are untrusted diagnostic text. Attribute the generation by
+    // the fixture's actual PID while still requiring the protected display.
+    assert_eq!(
+        manager.describe_workers().await,
+        format!("稼働中のWorker:\n1: [REDACTED] / PID: {}", workers[0].pid)
+    );
+    true
+}
+
+async fn wait_active(manager: &Manager, scenario: &Scenario, mode: &str) {
     // The old relay remains gated until release(), so observing the new route
     // never depends on beating an application-completion sleep. Keep this
     // watchdog below the fixture's gate timeout; it is not a latency target.
     timeout(Duration::from_secs(15), async {
         loop {
-            if manager
-                .describe_workers()
-                .await
-                .contains(&format!("{build} / PID:"))
-            {
+            if is_active(manager, scenario, mode).await {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -217,7 +233,7 @@ async fn t05_candidate_crashes_before_ready_while_v1_keeps_its_process_and_state
     assert_eq!(bounded(manager.describe_workers()).await, before);
     release(&candidate);
     let failure = wait_error(&file, &candidate).await;
-    assert_eq!(failure["error"], "worker exited");
+    assert_eq!(failure["error"], "worker exited (exit_code=71)");
     assert_eq!(failure["phase"], "update");
     assert_eq!(failure["exit_code"], 71);
     assert!(!status_file(&file).exists());
@@ -231,11 +247,7 @@ async fn t05_candidate_crashes_before_ready_while_v1_keeps_its_process_and_state
     std::fs::write(&file, healthy.to_str().unwrap()).unwrap();
     wait_success(&file, &healthy).await;
     count(&manager, 4).await;
-    assert!(
-        bounded(manager.describe_workers())
-            .await
-            .contains("v2 / PID:")
-    );
+    assert!(bounded(is_active(&manager, &scenario, "v2")).await);
     watcher.0.abort();
     let _ = (&mut watcher.0).await;
     drop(watcher);
@@ -333,7 +345,14 @@ async fn t06_process_driver() {
     wait_success(&file, &candidate).await;
     let committed = bounded(manager.describe_workers()).await;
     assert_ne!(committed, before);
-    assert!(committed.contains("crash-once / PID:"));
+    assert!(
+        bounded(is_active(
+            &manager,
+            &Scenario(directory.clone()),
+            "crash-once"
+        ))
+        .await
+    );
     wait_event(&candidate, "restore-completed").await;
 
     // The production handler increments count, then its result is lost when
@@ -355,7 +374,7 @@ async fn t06_process_driver() {
     assert_eq!(recorded["worker"], 0);
     assert_eq!(recorded["outcome"], "unknown");
     assert_eq!(recorded["recovery"], "restarted");
-    assert_eq!(recorded["error"], "worker exited");
+    assert_eq!(recorded["error"], "worker exited (exit_code=72)");
     assert_eq!(recorded["exit_code"], 72);
     let committed_pid: u32 = committed
         .lines()
@@ -369,7 +388,14 @@ async fn t06_process_driver() {
     assert_eq!(recorded["pid"], committed_pid);
     let recovered = bounded(manager.describe_workers()).await;
     assert_ne!(recovered, committed);
-    assert!(recovered.contains("crash-once / PID:"));
+    assert!(
+        bounded(is_active(
+            &manager,
+            &Scenario(directory.clone()),
+            "crash-once"
+        ))
+        .await
+    );
     // Restored is flushed before the relay appends its completion marker.
     wait_for("both checkpoint restores", || {
         events(&candidate)
@@ -432,7 +458,7 @@ async fn t06_post_commit_unknown_outcome_is_recorded_for_management() {
     let failure =
         failure.expect("post-commit crash/unknown request outcome must remain observable");
     assert_eq!(failure["path"].as_str(), candidate.to_str());
-    assert_eq!(failure["error"], "worker exited");
+    assert_eq!(failure["error"], "worker exited (exit_code=72)");
     assert_eq!(failure["phase"], "runtime");
     assert_eq!(failure["outcome"], "unknown");
     assert_eq!(failure["recovery"], "restarted");
@@ -462,11 +488,7 @@ async fn t04_inflight_response_and_checkpoint_survive_cutover() {
     joined(&mut update).await.unwrap();
     // A completed update must preserve both the old response and the last
     // confirmed application checkpoint.
-    assert!(
-        bounded(manager.describe_workers())
-            .await
-            .contains("v2 / PID:")
-    );
+    assert!(bounded(is_active(&manager, &scenario, "v2")).await);
     count(&manager, 2).await;
     assert_eq!(
         events(&old)
@@ -508,7 +530,7 @@ async fn t04_five_second_v1_response_completes_during_update() {
         async move { manager.replace(candidate, false).await }
     }));
     wait_event(&candidate, "hello").await;
-    wait_active(&manager, "v2").await;
+    wait_active(&manager, &scenario, "v2").await;
     assert!(!request.0.is_finished());
     assert!(!update.0.is_finished(), "old work still requires drain");
     assert_eq!(
@@ -552,7 +574,7 @@ async fn t04_new_requests_reach_v2_before_v1_is_released() {
     wait_event(&candidate, "hello").await;
     // replace() completes only after retiring v1. Its routing commit must
     // nevertheless let v2 finish new work while v1 is explicitly held here.
-    wait_active(&manager, "v2").await;
+    wait_active(&manager, &scenario, "v2").await;
     count(&manager, 2).await;
     assert!(!request.0.is_finished(), "v1 must remain in flight");
     assert!(!update.0.is_finished(), "v1 has not drained yet");
@@ -606,7 +628,7 @@ async fn t04_external_response_stays_with_v1_while_v2_accepts_new_work() {
         let manager = manager.clone();
         async move { manager.replace(candidate, false).await }
     }));
-    wait_active(&manager, "v2").await;
+    wait_active(&manager, &scenario, "v2").await;
 
     let mut next_response = bounded(manager.begin_response(0)).await.unwrap();
     assert_eq!(
@@ -623,11 +645,7 @@ async fn t04_external_response_stays_with_v1_while_v2_accepts_new_work() {
     release(&old);
     let (result, old_response) = joined(&mut request).await;
     assert_eq!(result.unwrap().as_deref(), Some(PONG));
-    assert!(
-        bounded(manager.describe_workers())
-            .await
-            .contains("v2 / PID:")
-    );
+    assert!(bounded(is_active(&manager, &scenario, "v2")).await);
     assert!(
         !update.0.is_finished(),
         "the old external result is still pending"
@@ -664,18 +682,14 @@ async fn t04_unknown_old_response_blocks_followup_updates_until_reconciled() {
         let candidate = candidate.clone();
         async move { manager.replace(candidate, false).await }
     }));
-    wait_active(&manager, "v2").await;
+    wait_active(&manager, &scenario, "v2").await;
     assert!(!update.0.is_finished());
     drop(old_response);
     assert_eq!(
         joined(&mut update).await.unwrap_err().to_string(),
         "unresolved response outcomes prevent worker update"
     );
-    assert!(
-        bounded(manager.describe_workers())
-            .await
-            .contains("v2 / PID:")
-    );
+    assert!(bounded(is_active(&manager, &scenario, "v2")).await);
     let mut new_response = bounded(manager.begin_response(0)).await.unwrap();
     assert_eq!(
         bounded(manager.dispatch_key_with_response(&mut new_response, 0, "!count".into()))
@@ -724,7 +738,7 @@ async fn t04_cancelling_retirement_keeps_old_response_and_new_routing() {
         let candidate = candidate.clone();
         async move { manager.replace(candidate, false).await }
     }));
-    wait_active(&manager, "v2").await;
+    wait_active(&manager, &scenario, "v2").await;
     assert!(!update.0.is_finished());
     update.0.abort();
     assert!(bounded(&mut update.0).await.unwrap_err().is_cancelled());
@@ -762,11 +776,7 @@ async fn t04_stateful_request_finishes_before_snapshot_handoff() {
     wait_event(&candidate, "snapshot-completed").await;
     assert!(!request.0.is_finished());
     assert!(!update.0.is_finished());
-    assert!(
-        bounded(manager.describe_workers())
-            .await
-            .contains("count-gated / PID:")
-    );
+    assert!(bounded(is_active(&manager, &scenario, "count-gated")).await);
     assert!(!events(&candidate).contains(&"restore".into()));
     release(&old);
     assert_eq!(
@@ -774,7 +784,7 @@ async fn t04_stateful_request_finishes_before_snapshot_handoff() {
         Some("カウント: 1")
     );
     joined(&mut update).await.unwrap();
-    wait_active(&manager, "v2").await;
+    wait_active(&manager, &scenario, "v2").await;
     count(&manager, 2).await;
     drop(request);
     drop(update);
@@ -809,7 +819,7 @@ async fn t04_real_five_second_handler_drains_while_v2_serves_new_requests() {
         let manager = manager.clone();
         async move { manager.replace(candidate, false).await }
     }));
-    wait_active(&manager, "v2").await;
+    wait_active(&manager, &scenario, "v2").await;
     assert!(!request.0.is_finished());
     assert!(!update.0.is_finished());
     assert_eq!(
@@ -863,7 +873,7 @@ async fn t06_recovery_during_candidate_readiness_rechecks_unknown_old_outcomes()
     assert_eq!(unknown[0].0, 0);
     let recovered = bounded(manager.describe_workers()).await;
     assert_ne!(recovered, before);
-    assert!(recovered.contains("crash-once / PID:"));
+    assert!(bounded(is_active(&manager, &scenario, "crash-once")).await);
     assert!(!update.0.is_finished());
 
     release(&candidate);
@@ -880,7 +890,7 @@ async fn t06_recovery_during_candidate_readiness_rechecks_unknown_old_outcomes()
         .reconcile_response(&instance, worker, operation, "fixture delivery confirmed")
         .unwrap();
     bounded(manager.replace(candidate, false)).await.unwrap();
-    wait_active(&manager, "ready-gated").await;
+    wait_active(&manager, &scenario, "ready-gated").await;
     assert!(manager.unknown_responses().1.is_empty());
     // The lost result cannot advance the confirmed checkpoint or be replayed.
     count(&manager, 1).await;

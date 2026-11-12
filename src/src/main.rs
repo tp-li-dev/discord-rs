@@ -679,9 +679,14 @@ async fn mock_events(
     result
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    match run().await {
+fn main() -> ExitCode {
+    src::redact::install_panic_hook();
+    let result = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| Box::new(error) as AppError)
+        .and_then(|runtime| runtime.block_on(run()));
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{}", failure_message("実行に失敗しました", error.as_ref()));
@@ -1028,6 +1033,50 @@ async fn live_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_diagnostics_child() {
+        let Ok(secret) = std::env::var("REDSEC_MAIN_OUTPUT_FIXTURE") else {
+            return;
+        };
+        src::redact::install_panic_hook();
+        let io = std::io::Error::new(std::io::ErrorKind::PermissionDenied, secret.clone());
+        eprintln!("{}", failure_message("Worker error", &io));
+        let json = serde_json::from_value::<u64>(serde_json::json!(secret)).unwrap_err();
+        eprintln!("{}", failure_message("Gateway error", &json));
+        let unknown: AppError = secret.into();
+        eprintln!(
+            "{}",
+            failure_message("実行に失敗しました", unknown.as_ref())
+        );
+        std::process::exit(1);
+    }
+
+    #[test]
+    fn process_output_retains_causes_without_external_error_contents() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::external_diagnostics_child", "--nocapture"])
+            .env("REDSEC_MAIN_OUTPUT_FIXTURE", "short-private-value token=dummy-token secret=dummy-secret Authorization: Bearer dummy-auth private_key=dummy-key")
+            .output().unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for secret in [
+            "short-private-value",
+            "dummy-token",
+            "dummy-secret",
+            "dummy-auth",
+            "dummy-key",
+        ] {
+            assert!(!text.contains(secret));
+        }
+        assert!(text.contains("kind=PermissionDenied"));
+        assert!(text.contains("category=Data"));
+        assert!(text.contains("[REDACTED]"));
+    }
 
     fn managed_args() -> Vec<OsString> {
         let root = env::current_dir().unwrap();

@@ -1,6 +1,6 @@
 //! Explicit, one-command registration. The default is a dry run.
 use bot_framework::arguments::{ArgumentKind, ArgumentSchema};
-use src::redact::{Secret, redact};
+use src::redact::{Secret, error_diagnostic, redact};
 use std::{env, num::NonZeroU64};
 use twilight_http::Client;
 use twilight_model::application::command::{CommandOption, CommandOptionType};
@@ -79,23 +79,53 @@ fn discord_options(args: &[ArgumentSchema]) -> Vec<CommandOption> {
         .collect()
 }
 
-#[tokio::main]
-async fn main() {
-    if let Err(error) = run().await {
-        eprintln!("register: {}", redact(&error.to_string()));
+#[derive(Debug)]
+struct RegistrationFailure(&'static str);
+impl std::fmt::Display for RegistrationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl std::error::Error for RegistrationFailure {}
+fn failure(message: &'static str) -> src::AppError {
+    Box::new(RegistrationFailure(message))
+}
+fn diagnostic(error: &(dyn std::error::Error + 'static)) -> String {
+    error
+        .downcast_ref::<RegistrationFailure>()
+        .map_or_else(|| error_diagnostic(error), |e| e.0.to_owned())
+}
+
+fn main() {
+    src::redact::install_panic_hook();
+    let result = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| Box::new(error) as src::AppError)
+        .and_then(|runtime| runtime.block_on(run()));
+    if let Err(error) = result {
+        eprintln!("register: {}", diagnostic(error.as_ref()));
         std::process::exit(1);
     }
 }
 
 async fn run() -> Result<(), src::AppError> {
-    let plan = parse(&env::args().skip(1).collect::<Vec<_>>())?;
-    let commands = src::registered_commands()?;
+    let args = env::args_os()
+        .skip(1)
+        .map(|arg| {
+            arg.into_string()
+                .map_err(|_| failure("arguments are not Unicode [argument_encoding]"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let plan = parse(&args).map_err(failure)?;
+    let commands = src::registered_commands()
+        .map_err(|_| failure("linked command registry is invalid [registry_invalid]"))?;
     let command = commands
         .iter()
         .find(|cmd| cmd.name == plan.name)
-        .ok_or("unknown linked command")?;
+        .ok_or_else(|| failure("unknown linked command"))?;
     if command.description.is_empty() || command.description.chars().count() > 100 {
-        return Err("command description must contain 1–100 characters".into());
+        return Err(failure("command description must contain 1–100 characters"));
     }
     println!(
         "command={} description={} scope={}",
@@ -113,9 +143,12 @@ async fn run() -> Result<(), src::AppError> {
         println!("Dry run: no request sent. Pass --apply to register.");
         return Ok(());
     }
-    let token = Secret::new(
-        env::var("DISCORD_TOKEN").map_err(|_| "DISCORD_TOKEN is unavailable or invalid")?,
-    );
+    let token = Secret::new(env::var("DISCORD_TOKEN").map_err(|error| {
+        failure(match error {
+            env::VarError::NotPresent => "DISCORD_TOKEN is not configured [token_missing]",
+            env::VarError::NotUnicode(_) => "DISCORD_TOKEN is not Unicode [token_encoding]",
+        })
+    })?);
     let _ = rustls::crypto::ring::default_provider().install_default();
     let client = Client::new(token.into_inner());
     let application = Id::<ApplicationMarker>::new(plan.app.get());
@@ -137,7 +170,9 @@ async fn run() -> Result<(), src::AppError> {
         }
     };
     // Do not print HTTP errors: they may contain request details.
-    await_registration(request, std::time::Duration::from_secs(10)).await?;
+    await_registration(request, std::time::Duration::from_secs(10))
+        .await
+        .map_err(failure)?;
     println!("Command registered.");
     Ok(())
 }
@@ -158,6 +193,44 @@ mod tests {
     use super::*;
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|s| s.to_string()).collect()
+    }
+    #[test]
+    #[ignore = "subprocess fixture"]
+    fn secret_error_fixture() {
+        let Some(input) = env::var_os("REGISTER_ERROR_FIXTURE") else {
+            return;
+        };
+        src::redact::install_panic_hook();
+        let error = std::io::Error::other(input.to_string_lossy().to_string());
+        eprintln!("register: {}", diagnostic(&error));
+        let plan = parse(&strings(&["123", "global", &input.to_string_lossy()])).unwrap();
+        eprintln!("{plan:?}");
+        std::process::exit(1);
+    }
+
+    #[test]
+    fn process_error_and_plan_debug_keep_classification_without_payloads() {
+        let output = std::process::Command::new(env::current_exe().unwrap())
+            .args(["--exact", "tests::secret_error_fixture", "--ignored", "--nocapture"])
+            .env("REGISTER_ERROR_FIXTURE", "token=fake-token secret=fake-secret private_key=fake-key Authorization: Bearer fake-auth unlabelled-value")
+            .output().unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(text.contains("Other"));
+        assert!(text.contains("[REDACTED]"));
+        for secret in [
+            "fake-token",
+            "fake-secret",
+            "fake-key",
+            "fake-auth",
+            "unlabelled-value",
+        ] {
+            assert!(!text.contains(secret));
+        }
     }
     #[tokio::test]
     async fn registration_timeout_is_reported_as_unknown_without_error_details() {

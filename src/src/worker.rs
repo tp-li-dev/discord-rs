@@ -1,6 +1,6 @@
 use crate::{
     AppError,
-    redact::redact,
+    redact::Secret,
     response_drain::{ResponseDrain, ResponseOperation},
 };
 use bot_framework::interactions::InteractionKind;
@@ -249,7 +249,10 @@ fn failure(message: &'static str) -> AppError {
 /// Safe diagnostics without formatting an arbitrary error or traversing sources.
 pub fn diagnostic(error: &(dyn std::error::Error + 'static)) -> String {
     if let Some(error) = error.downcast_ref::<WorkerFailure>() {
-        error.message.to_owned()
+        match error.exit_code {
+            Some(code) => format!("{} (exit_code={code})", error.message),
+            None => error.message.to_owned(),
+        }
     } else if let Some(error) = error.downcast_ref::<std::io::Error>() {
         format!(
             "IO failure (kind={:?}, os_code={:?})",
@@ -266,6 +269,17 @@ pub fn diagnostic(error: &(dyn std::error::Error + 'static)) -> String {
     } else {
         crate::redact::MASK.to_owned()
     }
+}
+
+// Child diagnostics are arbitrary application/library output. Neither line
+// masking nor a known-secret list can protect split or unlabelled credentials.
+// The parent reports protocol/IO failures and the observed child exit code.
+fn protect_child_diagnostics(command: &mut Command) {
+    command.stderr(Stdio::null());
+}
+
+fn worker_description(index: usize, build: &str, pid: u32) -> String {
+    format!("{}: {} / PID: {}", index + 1, Secret::new(build), pid)
 }
 
 // Frames are newline-delimited JSON. Limit reads before allocating untrusted input.
@@ -580,12 +594,12 @@ impl Process {
         } else {
             command.arg("--worker");
         }
+        protect_child_diagnostics(&mut command);
         let mut child = command
             .env(IDENTITY_ENV, serde_json::to_string(&identity)?)
             .env_remove("DISCORD_TOKEN")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
             .kill_on_drop(true)
             .spawn()?;
         let input = child
@@ -1145,12 +1159,7 @@ impl Manager {
         let mut lines = vec!["稼働中のWorker:".to_string()];
         for (index, worker) in self.workers.iter().enumerate() {
             let generation = worker.read().await;
-            lines.push(format!(
-                "{}: {} / PID: {}",
-                index + 1,
-                redact(&generation.build),
-                generation.pid
-            ));
+            lines.push(worker_description(index, &generation.build, generation.pid));
         }
         lines.join("\n")
     }
@@ -2909,6 +2918,52 @@ async fn handle_command(
 #[cfg(test)]
 mod frame_tests {
     use super::*;
+
+    #[test]
+    fn secret_diagnostics_child() {
+        let Ok(secret) = std::env::var("REDSEC_WORKER_OUTPUT_FIXTURE") else {
+            return;
+        };
+        // A custom child/library can write arbitrary, fragmented stderr.
+        eprint!("{}", &secret[..secret.len() / 2]);
+        eprintln!("{}", &secret[secret.len() / 2..]);
+        println!("{}", worker_description(0, &secret, 123));
+        std::process::exit(37);
+    }
+
+    #[tokio::test]
+    async fn child_diagnostics_and_build_names_cannot_leak_secrets() {
+        let secret = "short-private-value token=dummy-token secret=dummy-secret Authorization: Bearer dummy-auth private_key=dummy-key";
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "worker::frame_tests::secret_diagnostics_child",
+                "--nocapture",
+            ])
+            .env("REDSEC_WORKER_OUTPUT_FIXTURE", secret)
+            .stdout(Stdio::piped());
+        protect_child_diagnostics(&mut command);
+        let output = command.spawn().unwrap().wait_with_output().await.unwrap();
+        assert_eq!(output.status.code(), Some(37));
+        assert!(output.stderr.is_empty());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        for value in [
+            "short-private-value",
+            "dummy-token",
+            "dummy-secret",
+            "dummy-auth",
+            "dummy-key",
+        ] {
+            assert!(!stdout.contains(value));
+        }
+        assert!(stdout.contains("1: [REDACTED] / PID: 123"));
+        let error = WorkerFailure {
+            message: "worker exited",
+            exit_code: output.status.code(),
+        };
+        assert_eq!(diagnostic(&error), "worker exited (exit_code=37)");
+    }
 
     fn gateway_gate() -> GatewayAdmission {
         GatewayAdmission {

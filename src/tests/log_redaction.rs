@@ -153,7 +153,8 @@ fn management_reply_errors_and_log_display_are_masked() {
         fixture_exit,
     };
     let port = ready_port(&dir, &mut core.child);
-    std::fs::write(dir.join("core.log"), "old token=fake-log-capability\n").unwrap();
+    let old_log = "old token=fake-log-capability\nshort-private-value\nold free-form diagnostic\n";
+    std::fs::write(dir.join("core.log"), old_log).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_manage"))
         .arg("logs")
         .env("DISCORD_CORE_DIR", &dir)
@@ -161,9 +162,27 @@ fn management_reply_errors_and_log_display_are_masked() {
         .output()
         .unwrap();
     assert!(output.status.success());
-    let text = String::from_utf8_lossy(&output.stdout);
-    assert!(text.contains("old token=[REDACTED]"));
-    assert!(!text.contains("fake-log-capability"));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "[REDACTED] [log_contents_suppressed]"
+    );
+    // Legacy logs can contain short, unlabelled secrets and arbitrary text;
+    // suppress the entire body at display time without rewriting the file.
+    for stream in [&output.stdout, &output.stderr] {
+        let text = String::from_utf8_lossy(stream);
+        for hidden in [
+            "old token=",
+            "fake-log-capability",
+            "short-private-value",
+            "old free-form diagnostic",
+        ] {
+            assert!(!text.contains(hidden));
+        }
+    }
+    assert_eq!(
+        std::fs::read_to_string(dir.join("core.log")).unwrap(),
+        old_log
+    );
     assert!(
         Command::new(env!("CARGO_BIN_EXE_manage"))
             .arg("shutdown")

@@ -49,8 +49,54 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
 }
 
 fn main() {
-    if let Err(error) = run(env::args().skip(1)) {
+    src::redact::install_panic_hook();
+    let args = env::args_os()
+        .skip(1)
+        .map(|arg| {
+            arg.into_string()
+                .map_err(|_| "arguments are not Unicode [argument_encoding]")
+        })
+        .collect::<Result<Vec<_>, _>>();
+    let result = args.map_err(str::to_owned).and_then(run);
+    if let Err(error) = result {
+        // run only returns code-owned diagnostics; paths and config text are never included.
         eprintln!("doctor: {}", src::redact::redact(&error));
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    #[test]
+    #[ignore = "subprocess fixture"]
+    fn secret_output_fixture() {
+        let Some(input) = env::var_os("DOCTOR_OUTPUT_FIXTURE") else {
+            return;
+        };
+        src::redact::install_panic_hook();
+        let error = run([input.into_string().unwrap()]).unwrap_err();
+        eprintln!("doctor: {}", src::redact::redact(&error));
+        std::process::exit(1);
+    }
+
+    #[test]
+    fn missing_config_diagnostic_never_echoes_secret_path() {
+        let output = Command::new(env::current_exe().unwrap())
+            .args(["--exact", "tests::secret_output_fixture", "--ignored", "--nocapture"])
+            .env("DOCTOR_OUTPUT_FIXTURE", "missing-fixture/token=fake-token/secret=fake-secret/key=fake-key/Authorization: Bearer fake-auth")
+            .output().unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(text.contains("cannot open configuration"));
+        for secret in ["fake-token", "fake-secret", "fake-key", "fake-auth"] {
+            assert!(!text.contains(secret));
+        }
     }
 }

@@ -64,20 +64,21 @@ async fn reload_command_builds_and_switches_a_live_manager() {
     );
     let after = manager.describe_workers().await;
     let output_text = String::from_utf8_lossy(&output.stdout);
-    let build = output_text
-        .lines()
-        .find_map(|line| line.strip_prefix("更新しました！ Workerのビルド: "))
-        .unwrap();
+    assert!(output_text.contains("更新しました！ Workerのビルドを確認しました"));
     assert_ne!(before, after);
-    assert_eq!(after.matches(build).count(), 2, "{after}");
-    assert!(
-        manager
-            .dispatch("!version".into())
-            .await
-            .unwrap()
-            .unwrap()
-            .contains(build)
-    );
+    assert_eq!(after.matches("[REDACTED] / PID:").count(), 2, "{after}");
+    // !version is application response data, whereas diagnostic output must
+    // suppress the arbitrary build label. Still verify the new build is live.
+    let version = manager.dispatch("!version".into()).await.unwrap().unwrap();
+    let build = version
+        .strip_prefix("Workerビルド: ")
+        .and_then(|value| value.split_once(" / PID: "))
+        .map(|(build, _)| build)
+        .unwrap();
+    assert!(build.starts_with("build-"), "{version}");
+    assert!(!output_text.contains(build));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(build));
+    assert!(!after.contains(build));
     assert_eq!(
         manager
             .dispatch("!job status".into())

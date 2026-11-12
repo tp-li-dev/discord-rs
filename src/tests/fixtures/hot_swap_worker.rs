@@ -135,6 +135,7 @@ fn request_type(line: &str) -> Result<&'static str> {
 
 fn run() -> Result<u8> {
     let executable = std::env::current_exe()?;
+    fs::write(sidecar(&executable, ".pid"), std::process::id().to_string())?;
     let mode = executable
         .file_stem()
         .and_then(|name| name.to_str())
