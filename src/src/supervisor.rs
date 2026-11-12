@@ -946,7 +946,9 @@ impl Default for RestartPolicy {
 }
 
 impl RestartPolicy {
-    fn backoff(self, restarts: u32) -> Duration {
+    // Shared with the OS child recovery policy; keep task and child delay
+    // arithmetic identical without changing the task supervisor's semantics.
+    pub(crate) fn backoff(self, restarts: u32) -> Duration {
         let mut delay = self.initial_backoff;
         // At most the bit width of Duration is needed, even with a huge budget.
         for _ in 0..restarts {
@@ -958,7 +960,7 @@ impl RestartPolicy {
         delay
     }
 
-    fn validate(self) -> Result<(), Error> {
+    pub(crate) fn validate(self) -> Result<(), Error> {
         if self.max_restarts_in_window == 0
             || self.window.is_zero()
             || self.initial_backoff.is_zero()
