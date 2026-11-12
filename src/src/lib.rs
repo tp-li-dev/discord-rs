@@ -8,6 +8,7 @@ pub mod ownership;
 pub mod placement;
 pub mod protocol;
 pub mod response_drain;
+pub mod shard_runtime;
 pub mod switch;
 pub mod worker;
 
