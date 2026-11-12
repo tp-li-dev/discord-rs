@@ -12,11 +12,13 @@ pub mod placement;
 pub mod protocol;
 pub mod redact;
 pub mod response_drain;
+pub mod rest_budget;
 pub mod shard_runtime;
 pub mod state_store;
 pub mod supervisor;
 pub mod switch;
 pub mod testkit;
+pub mod update_gate;
 pub mod worker;
 
 pub type AppError = Box<dyn std::error::Error + Send + Sync>;
