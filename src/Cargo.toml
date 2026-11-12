@@ -17,6 +17,7 @@ toml = "1.2"
 getrandom = "0.4"
 subtle = "2"
 tokio-rustls = "0.26"
+openraft = { version = "=0.9.26", features = ["serde", "storage-v2", "generic-snapshot-data"] }
 
 [workspace]
 members = ["framework", "framework-macros"]
