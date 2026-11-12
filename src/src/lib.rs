@@ -1,5 +1,6 @@
 pub mod botref;
 mod cogs;
+pub mod daemon;
 pub mod drain;
 pub mod event_seq;
 pub mod failover;
