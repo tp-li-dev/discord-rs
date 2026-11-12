@@ -28,6 +28,10 @@ rmp-serde = "1"
 name = "botctl"
 path = "src/bin/botctl.rs"
 
+[[bin]]
+name = "botd"
+path = "src/bin/botd.rs"
+
 [[bench]]
 name = "ipc_codec"
 harness = false
