@@ -28,6 +28,7 @@ struct Options {
     allow_test_quorum: bool,
     allow_test_gateway_switch: bool,
     mock_identify_budget: Option<PathBuf>,
+    mock_recovery_max_restarts: Option<u32>,
 }
 
 fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'static str> {
@@ -41,6 +42,7 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
     let mut allow_test_quorum = false;
     let mut allow_test_gateway_switch = false;
     let mut mock_identify_budget = None;
+    let mut mock_recovery_max_restarts = None;
     while let Some(arg) = args.next() {
         let target = match arg.to_str() {
             Some("--file") if file.is_none() => &mut file,
@@ -48,6 +50,17 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
             Some("--gateway-program") if gateway_program.is_none() => &mut gateway_program,
             Some("--mock-identify-budget") if mock_identify_budget.is_none() => {
                 &mut mock_identify_budget
+            }
+            Some("--mock-recovery-max-restarts") if mock_recovery_max_restarts.is_none() => {
+                mock_recovery_max_restarts = Some(
+                    args.next()
+                        .ok_or(USAGE)?
+                        .to_str()
+                        .ok_or(USAGE)?
+                        .parse::<u32>()
+                        .map_err(|_| USAGE)?,
+                );
+                continue;
             }
             Some("--allow-test-gateway-switch") if !allow_test_gateway_switch => {
                 allow_test_gateway_switch = true;
@@ -95,6 +108,7 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
         allow_test_quorum,
         allow_test_gateway_switch,
         mock_identify_budget,
+        mock_recovery_max_restarts,
     };
     if !bootstrap {
         return Err("anonymous stdin bootstrap is required");
@@ -112,7 +126,8 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
         if options.allow_test_quorum || options.no_autostart {
             return Err("test Gateway switch requires standalone automatic startup");
         }
-    } else if options.mock_identify_budget.is_some() {
+    } else if options.mock_identify_budget.is_some() || options.mock_recovery_max_restarts.is_some()
+    {
         return Err("mock Identify budget requires --allow-test-gateway-switch");
     }
     Ok(options)
@@ -265,7 +280,7 @@ async fn serve_control<S: AsyncRead + AsyncWrite + Unpin>(
         } else {
             json!({"ok": false, "offline": false, "error": "daemon control busy", "note": NOTE})
         };
-        let mut response = serde_json::to_vec(&value)?;
+        let mut response = encode_response(value)?;
         response.push(b'\n');
         if response.len() > RESPONSE_LIMIT {
             return Err(io::Error::new(
@@ -278,6 +293,51 @@ async fn serve_control<S: AsyncRead + AsyncWrite + Unpin>(
     })
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "status request timed out"))?
+}
+
+// Keep current states even when bounded transition histories accumulate. The
+// wire limit is a byte budget, not a count of records; report omitted history.
+fn encode_response(mut value: Value) -> io::Result<Vec<u8>> {
+    fn trim(value: &mut Value) -> usize {
+        match value {
+            Value::Object(fields) => {
+                let mut removed = 0;
+                for (name, value) in fields {
+                    if matches!(
+                        name.as_str(),
+                        "transitions" | "recovery_events" | "recent_events"
+                    ) {
+                        if let Some(events) = value.as_array_mut() {
+                            let count = events.len().div_ceil(2);
+                            events.drain(..count);
+                            removed += count;
+                        }
+                    } else {
+                        removed += trim(value);
+                    }
+                }
+                removed
+            }
+            Value::Array(values) => values.iter_mut().map(trim).sum(),
+            _ => 0,
+        }
+    }
+    let mut omitted = 0;
+    loop {
+        let bytes = serde_json::to_vec(&value)?;
+        if bytes.len() < RESPONSE_LIMIT {
+            return Ok(bytes);
+        }
+        let removed = trim(&mut value);
+        if removed == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "status response exceeds limit",
+            ));
+        }
+        omitted += removed;
+        value["recovery_history_omitted"] = json!(omitted);
+    }
 }
 
 async fn status_server(
@@ -298,6 +358,119 @@ async fn status_server(
             }
             _ = sessions.join_next(), if !sessions.is_empty() => {}
         }
+    }
+}
+
+// Recovery telemetry never blocks process observation or a Gateway heartbeat.
+// Saturation/I/O failure is latched and visible; it is not reported as durable
+// audit success. Files contain fixed event enums/IDs, never errors or payloads.
+struct RecoveryAudit {
+    sender: mpsc::Sender<Vec<u8>>,
+    failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    dropped: std::sync::atomic::AtomicU64,
+    upstream_dropped: std::sync::atomic::AtomicU64,
+}
+impl RecoveryAudit {
+    async fn open(path: PathBuf) -> Result<Self, &'static str> {
+        let parent = path.parent().ok_or("invalid recovery audit location")?;
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|_| "cannot create recovery audit directory")?;
+        let (file, guard) = tokio::task::spawn_blocking(move || {
+            // Lock a separate handle so readers can inspect the audit and its
+            // empty sidecar. The trusted directory protects the lock namespace.
+            let mut lock_options = std::fs::OpenOptions::new();
+            lock_options
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                lock_options.mode(0o600);
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                // Windows byte-range locks reject even read-only inspection of
+                // an empty file. Share reads, deny another writer or deletion
+                // for the lifetime of this handle instead.
+                lock_options.share_mode(0x0000_0001); // FILE_SHARE_READ
+            }
+            let guard = lock_options.open(path.with_extension("jsonl.lock"))?;
+            #[cfg(not(windows))]
+            guard
+                .try_lock()
+                .map_err(|_| io::Error::other("recovery audit is busy"))?;
+            let mut options = std::fs::OpenOptions::new();
+            options.create(true).read(true).append(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let file = options.open(path)?;
+            Ok::<_, io::Error>((file, guard))
+        })
+        .await
+        .map_err(|_| "cannot initialize recovery audit")?
+        .map_err(|_| "cannot open recovery audit")?;
+        let mut size = file
+            .metadata()
+            .map_err(|_| "cannot inspect recovery audit")?
+            .len();
+        let mut file = tokio::fs::File::from_std(file);
+        let (sender, mut receiver) = mpsc::channel::<Vec<u8>>(512);
+        let failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fault = failed.clone();
+        tokio::spawn(async move {
+            let _guard = guard;
+            while let Some(bytes) = receiver.recv().await {
+                size = size.saturating_add(bytes.len() as u64);
+                if size > 16 * 1024 * 1024
+                    || file.write_all(&bytes).await.is_err()
+                    || file.sync_data().await.is_err()
+                {
+                    fault.store(true, std::sync::atomic::Ordering::Release);
+                    break;
+                }
+            }
+        });
+        Ok(Self {
+            sender,
+            failed,
+            dropped: std::sync::atomic::AtomicU64::new(0),
+            upstream_dropped: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+    fn note_upstream_dropped(&self, total: u64) {
+        self.upstream_dropped
+            .fetch_max(total, std::sync::atomic::Ordering::Relaxed);
+        if total != 0 {
+            self.failed
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+    fn submit(&self, event: &impl Serialize) {
+        let ok = serde_json::to_vec(event)
+            .ok()
+            .filter(|v| v.len() < 4096)
+            .is_some_and(|mut bytes| {
+                bytes.push(b'\n');
+                self.sender.try_send(bytes).is_ok()
+            });
+        if !ok {
+            self.failed
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.dropped
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    fn status(&self) -> Value {
+        json!({"ok": !self.failed.load(std::sync::atomic::Ordering::Acquire),
+            "dropped_events": self.dropped.load(std::sync::atomic::Ordering::Relaxed),
+            "upstream_dropped_events":self.upstream_dropped.load(std::sync::atomic::Ordering::Relaxed)})
     }
 }
 
@@ -351,6 +524,8 @@ async fn run() -> Result<(), &'static str> {
         .local_addr()
         .map_err(|_| "cannot inspect local daemon control")?
         .port();
+    let audit = RecoveryAudit::open(options.runtime_root.join("recovery-audit.jsonl")).await?;
+    daemon.require_shared_recovery_admission();
     let credentials = EnvironmentCredentials;
     // Partial startup failures remain visible through snapshots. Dropping this
     // daemon, including any error below, deliberately does not force-kill children.
@@ -389,13 +564,15 @@ async fn run() -> Result<(), &'static str> {
             }
             _ = interval.tick() => {
                 control.tick(&credentials).await;
+                audit.note_upstream_dropped(control.recovery_events_dropped());
+                for event in control.take_recovery_events() { audit.submit(&event); }
                 for job in updates.drain() {
                     updates.complete(job, json!({"ok":false,"error":"update execution is unavailable in the default runtime; Core readiness/drain and Gateway authority are not connected"}));
                 }
             }
             Some(envelope) = receiver.recv() => {
                 if !envelope.response.is_closed() {
-                    let response = if let Some(update) = envelope.update {
+                    let mut response = if let Some(update) = envelope.update {
                         if control.operation_exists(&update.operation_id) {
                             json!({"ok":false,"error":"operation ID conflicts with an earlier request"})
                         } else {
@@ -408,6 +585,7 @@ async fn run() -> Result<(), &'static str> {
                         && (envelope.request.operation_id.as_deref().is_some_and(|id| updates.contains(id)) || envelope.request.bot.as_deref().and_then(|selector| src::botref::resolve(&config.bots, selector).ok().map(|b| updates.busy(&b.bot_id))).unwrap_or(false)) {
                         json!({"ok":false,"error":"Bot or operation ID is already busy"})
                     } else { control.request_as(&envelope.request, &envelope.access) };
+                    response["recovery_audit"] = audit.status();
                     let _ = envelope.response.send(response);
                 }
             }
@@ -587,13 +765,19 @@ async fn run_test_gateway_switch(
         .map_err(|_| "cannot inspect local daemon control")?
         .port();
     let core_program = std::env::current_exe().map_err(|_| "Core executable unavailable")?;
-    let runtime = src::daemon::test_gateway_switch::Runtime::new(
+    let audit = RecoveryAudit::open(options.runtime_root.join("recovery-audit.jsonl")).await?;
+    let mut recovery_config = src::child_recovery::RecoveryConfig::default();
+    if let Some(max_restarts) = options.mock_recovery_max_restarts {
+        recovery_config.restart.max_restarts = max_restarts;
+    }
+    let runtime = src::daemon::test_gateway_switch::Runtime::new_with_recovery_config(
         &config,
         &options.runtime_root,
         &options.gateway_program,
         &core_program,
         options.mock_discord.ok_or("mock Discord required")?,
         limits,
+        recovery_config,
     )?;
     let local = config
         .local_primary_intents(&std::collections::HashMap::new())
@@ -632,7 +816,7 @@ async fn run_test_gateway_switch(
         tokio::select! {
             signal = tokio::signal::ctrl_c() => break signal.map_err(|_| "cannot receive daemon shutdown signal"),
             Some(envelope) = receiver.recv() => {
-                let response = if let Some(update) = envelope.update {
+                let mut response = if let Some(update) = envelope.update {
                     if runtime.legacy_operation_exists(&update.operation_id) {
                         json!({"ok":false,"error":"operation ID conflicts with an earlier request"})
                     } else { updates.admit(update, envelope.access, false) }
@@ -660,13 +844,19 @@ async fn run_test_gateway_switch(
                             if let Some(transitions) = value["transitions"].as_array_mut() {
                                 transitions.retain(|s| s["bot_id"] == bot.bot_id);
                             }
+                            if let Some(events) = value["recovery_events"].as_array_mut() {
+                                events.retain(|e| e["key"]["bot_id"].as_u64().is_some_and(|id| id.to_string() == bot.bot_id));
+                            }
                         }
                         value
                     }
                 };
+                response["recovery_audit"] = audit.status();
                 let _ = envelope.response.send(response);
             },
             _ = update_tick.tick() => {
+                audit.note_upstream_dropped(runtime.recovery_events_dropped());
+                for event in runtime.take_recovery_events() { audit.submit(&event); }
                 updates.poll_backend(|id| runtime.update_status(id));
                 for job in updates.drain() {
                     let response = runtime.request_update(&job.request);
@@ -737,6 +927,78 @@ mod tests {
     }
 
     #[test]
+    fn response_budget_keeps_current_state_and_reports_omitted_history() {
+        let value = json!({"ok":true,"shards":[{"phase":"Degraded","recovery":{"reason":"RestartBudget"}}],
+            "transitions":(0..512).map(|index| json!({"index":index,"event":"child_recovery","padding":"x".repeat(180)})).collect::<Vec<_>>()});
+        let bytes = encode_response(value).unwrap();
+        assert!(bytes.len() < RESPONSE_LIMIT);
+        let result: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(result["shards"][0]["recovery"]["reason"], "RestartBudget");
+        assert!(result["recovery_history_omitted"].as_u64().unwrap() > 0);
+        assert_eq!(
+            result["transitions"].as_array().unwrap().last().unwrap()["index"],
+            511
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_audit_opens_locks_and_records_a_fixed_event() {
+        let path = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "recovery-audit-{}-{}.jsonl",
+                std::process::id(),
+                getrandom::u64().unwrap()
+            ));
+        let audit = RecoveryAudit::open(path.clone()).await.unwrap();
+        assert!(RecoveryAudit::open(path.clone()).await.is_err());
+        let lock_path = path.with_extension("jsonl.lock");
+        assert!(tokio::fs::read(&lock_path).await.unwrap().is_empty());
+        let event = src::child_recovery::RecoveryEvent {
+            key: src::child_recovery::ChildKey {
+                bot_id: src::protocol::BotId(1),
+                shard_id: 0,
+                role: src::child_recovery::ChildRole::Gateway,
+            },
+            generation: 2,
+            at: Duration::from_secs(1),
+            kind: src::child_recovery::RecoveryEventKind::Degraded {
+                reason: src::child_recovery::DegradedReason::RestartBudget,
+            },
+        };
+        audit.submit(&event);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let bytes = tokio::fs::read(&path).await.unwrap();
+                if let Ok(record) =
+                    serde_json::from_slice::<src::child_recovery::RecoveryEvent>(&bytes)
+                {
+                    assert_eq!(record, event);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(audit.status()["ok"], true);
+        audit.note_upstream_dropped(1);
+        assert_eq!(audit.status()["ok"], false);
+        drop(audit);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while tokio::fs::remove_file(&path).await.is_err() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            while tokio::fs::remove_file(&lock_path).await.is_err() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[test]
     fn mock_discord_requires_an_explicit_loopback_endpoint() {
         assert!(parse_options(options(&[])).unwrap().mock_discord.is_none());
         for address in ["127.0.0.1:1234", "[::1]:1234"] {
@@ -776,6 +1038,32 @@ mod tests {
         args.pop();
         assert!(parse_options(args).is_err());
         assert!(parse_options([OsString::from("--file")]).is_err());
+    }
+
+    #[test]
+    fn recovery_budget_override_requires_explicit_mock_switch() {
+        assert!(parse_options(options(&["--mock-recovery-max-restarts", "0"])).is_err());
+        let base = [
+            "--allow-test-gateway-switch",
+            "--mock-discord",
+            "127.0.0.1:1234",
+            "--mock-identify-budget",
+            "limits.json",
+            "--mock-recovery-max-restarts",
+        ];
+        for value in ["-1", "invalid", "4294967296"] {
+            let mut extra = base.to_vec();
+            extra.push(value);
+            assert!(parse_options(options(&extra)).is_err());
+        }
+        let mut extra = base.to_vec();
+        extra.push("0");
+        assert_eq!(
+            parse_options(options(&extra))
+                .unwrap()
+                .mock_recovery_max_restarts,
+            Some(0)
+        );
     }
 
     #[test]
