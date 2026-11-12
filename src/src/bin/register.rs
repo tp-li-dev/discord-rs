@@ -142,6 +142,17 @@ async fn run() -> Result<(), src::AppError> {
     Ok(())
 }
 
+impl std::fmt::Debug for Plan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Plan")
+            .field("app", &self.app)
+            .field("guild", &self.guild)
+            .field("name", &Secret::new(&self.name))
+            .field("apply", &self.apply)
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,16 +195,5 @@ mod tests {
         ] {
             assert!(parse(&strings(args)).is_err());
         }
-    }
-}
-
-impl std::fmt::Debug for Plan {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Plan")
-            .field("app", &self.app)
-            .field("guild", &self.guild)
-            .field("name", &Secret::new(&self.name))
-            .field("apply", &self.apply)
-            .finish()
     }
 }
