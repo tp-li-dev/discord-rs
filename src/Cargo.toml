@@ -16,12 +16,14 @@ serde_json = "1"
 toml = "1.2"
 getrandom = "0.4"
 subtle = "2"
+tokio-rustls = "0.26"
 
 [workspace]
 members = ["framework", "framework-macros"]
 resolver = "3"
 
 [dev-dependencies]
+rcgen = "0.13"
 rmp-serde = "1"
 
 [[bin]]
