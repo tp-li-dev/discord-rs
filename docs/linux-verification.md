@@ -83,3 +83,11 @@ GitHub Actions: 未実行または run URL、commit、各 OS の結果:
 `.github/workflows/bench.yml` は `workflow_dispatch` のみで起動し、Rust 1.90.0 の Ubuntu ランナーでベンチを逐次実行します。ローカル手順と異なり、CI は `--locked` を使い、依存取得のため offline にはしません。自己検査と各ベンチのログ、commit・OS・CPU・メモリ・Rust・標本設定を `linux-benchmarks-<run_id>-<run_attempt>` artifact に保存します。失敗時も残りのベンチと artifact 保存を試みますが、ジョブの中断や準備失敗時には結果が欠けることがあります。ステップの成否も確認してください。
 
 このワークフローはまだ実行しておらず、Linux 計測や Actions の動作は未検証です。共有ランナーの揺らぎと各測定の対象範囲については [benchmarks.md](benchmarks.md) を参照してください。
+
+## GitHub Actions での手動ストレス試験
+
+`.github/workflows/stress.yml` は手動実行専用です。Actions の Manual stress tests から `ref`（空欄なら実行時の `github.ref`）、`repeat`（既定 5、1〜20）、`suite`（`update_load` / `raft` / `recovery` / `acl` / `all`）を指定します。Ubuntu と Windows の各反復を最大 4 ジョブ並列で実行し、同じ ref と suite の実行は同じ concurrency グループに入ります。
+
+Rust 1.90.0 と CI と同じキャッシュを使い、Cargo は依存取得可能な状態で実行します。`update_load` は `--include-ignored` で ignore の有無にかかわらず実行します。現在この試験は既知の失敗として ignore されています。`all` は各 suite を順に実行し、途中で失敗しても残りを試します。失敗したジョブの試験出力は `stress-log-<OS>-<iteration>` artifact に保存されます（試験開始前の失敗ではログが存在しない場合があります）。サマリは反復ごとの結果と成功・失敗・その他・欠落数を示します。中断や artifact 保存失敗により結果が欠落する場合は成功と扱いません。ログと Actions の各ステップも確認してください。
+
+このワークフローは未実行です。実際の GitHub Actions の動作や Windows/Linux の試験結果は未検証です。ローカル手順の offline 条件とは異なり、この手動 CI は `--offline` を指定しません。
