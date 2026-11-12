@@ -86,3 +86,11 @@ Worker の双方向受信に 1 MiB、管理要求に 4095 byte（改行込み）
 - 認証付きローカル管理：`manage list-unknown`（読み取り専用）を匿名パイプ bootstrap で配線。解除操作・永続監査・ページ化は未実装、Windows ACL は未検証。
 - framework Cog：Ready イベント自動登録、型付き引数、既定 drain フック。実 Worker/Gateway 接続は未実施。
 - main 統合後、Linux ではなく Windows 上の Rust 1.99.0 で `cargo fmt --check`、workspace clippy（警告禁止）、workspace test が成功。Linux、Windows CI、実 Discord、複数ホスト、性能は未検証。
+
+## 2026-11-12：並列開発 第2弾（Codex CLI）
+- `protocol.rs`/`worker.rs`：双方向 Hello・バージョン範囲交渉・Bot/Shard/世代 identity 照合・必須/任意 capability 交渉を追加（T19 相当の統合試験、旧 v5 互換維持）。identity は demo 固定値で、実配置とは未接続。docs/ipc-protocol.md を追加。
+- `failover.rs`：§5.4 の状態機械（注入 Clock、500ms/1.5s/3s/30s 設定可、Quorum 不可は Degraded、指数バックオフ）を単体試験10件で検証。ネットワーク・実プロセス・Ownership との接続は未実装。
+- `redact.rs`/docs/security.md：秘密マスク、`Secret<T>`、現状の漏洩リスク調査。既存ログ経路への適用は未実施（修正案のみ）。
+- `benches/ipc_codec.rs`/docs/benchmarks.md：JSON と MessagePack の codec を Windows 開発機で計測。Linux 本番性能の根拠ではなく、採用判断は保留。
+- 統合時に、管理試験が操作IDの固定値（0）に依存し並列試験で不安定になり得る問題を、worker 番号の確認に修正。
+- main 統合後、fmt、clippy（警告禁止）、workspace test が Windows / Rust 1.99.0 で成功。Linux、Windows CI、実 Discord、複数ホストは未検証。
