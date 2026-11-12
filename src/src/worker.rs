@@ -18,8 +18,10 @@ use tokio::{
 
 const PROTOCOL: u32 = 5;
 const CAPABILITIES: &[&str] = &["snapshot-v3"];
+const EVENT_SEQ_CAPABILITY: &str = "event-seq-v1";
 const HELLO_CAPABILITY: &str = "hello-v1";
 const OPTIONAL_CAPABILITIES: &[&str] = &[
+    EVENT_SEQ_CAPABILITY,
     "hello-v1",
     "command-dispatch-v1",
     "ready-event-v1",
@@ -156,6 +158,10 @@ enum Request {
         name: String,
         args: Vec<(String, bot_framework::arguments::SlashValue)>,
     },
+    SequencedReady {
+        local_sequence: u64,
+        bot_name: String,
+    },
     ReadyEvent {
         bot_name: String,
     },
@@ -169,6 +175,9 @@ enum Request {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Response {
+    EventAccepted {
+        local_sequence: u64,
+    },
     Hello {
         hello: crate::protocol::Hello,
     },
@@ -274,6 +283,7 @@ struct Process {
     input: ChildStdin,
     output: BufReader<ChildStdout>,
     broken: bool,
+    events: crate::event_seq::Sender,
     checkpoint: Option<serde_json::Value>,
     build: String,
     pid: u32,
@@ -299,6 +309,8 @@ impl Process {
             input,
             output,
             broken: false,
+            events: crate::event_seq::Sender::new(64, 0, MAX_FRAME_BYTES as usize, 0)
+                .map_err(|_| "invalid event buffer")?,
             checkpoint: None,
             build: String::new(),
             pid: 0,
@@ -333,7 +345,10 @@ impl Process {
                     }
                 } else {
                     // Preserve v5's advertised application capabilities.
-                    process.supported_capabilities = supported_capabilities;
+                    process.supported_capabilities = supported_capabilities
+                        .into_iter()
+                        .filter(|cap| cap != EVENT_SEQ_CAPABILITY)
+                        .collect();
                 }
                 process.build = build;
                 process.pid = pid;
@@ -347,12 +362,63 @@ impl Process {
         if self.broken {
             return Err("worker is unavailable".into());
         }
+        let sequenced;
+        let request = if let Request::ReadyEvent { bot_name } = request
+            && self
+                .supported_capabilities
+                .iter()
+                .any(|cap| cap == EVENT_SEQ_CAPABILITY)
+        {
+            let sequence = self
+                .events
+                .enqueue(
+                    serde_json::to_vec(request)?,
+                    crate::event_seq::Priority::Required,
+                )
+                .map_err(|rejected| {
+                    eprintln!("worker event buffer rejected: {:?}", rejected.reason);
+                    "worker event buffer full or event too large"
+                })?;
+            sequenced = Request::SequencedReady {
+                local_sequence: sequence,
+                bot_name: bot_name.clone(),
+            };
+            &sequenced
+        } else {
+            request
+        };
+        let expected_ack = match request {
+            Request::SequencedReady { local_sequence, .. } => Some(*local_sequence),
+            _ => None,
+        };
         let result = timeout(DEADLINE, async {
             let mut data = serde_json::to_vec(request)?;
             data.push(b'\n');
+            if data.len() > MAX_FRAME_BYTES as usize {
+                return Err("worker request exceeds frame limit".into());
+            }
             self.input.write_all(&data).await?;
             self.input.flush().await?;
             let frame = read_frame(&mut self.output).await?.ok_or("worker exited")?;
+            if let Some(expected) = expected_ack {
+                match serde_json::from_slice::<Response>(&frame)? {
+                    Response::EventAccepted { local_sequence } if local_sequence == expected => {
+                        self.events
+                            .ack(crate::event_seq::EventAccepted(
+                                crate::event_seq::SequenceRange {
+                                    first: expected,
+                                    last: expected,
+                                },
+                            ))
+                            .map_err(|_| "invalid worker event ACK")?;
+                    }
+                    _ => return Err("missing or invalid worker event ACK".into()),
+                }
+                let frame = read_frame(&mut self.output)
+                    .await?
+                    .ok_or("worker exited after ACK")?;
+                return Ok(serde_json::from_slice(&frame)?);
+            }
             Ok(serde_json::from_slice(&frame)?)
         })
         .await
@@ -360,6 +426,13 @@ impl Process {
         .and_then(|result| result);
         if result.is_err() {
             self.broken = true;
+            if self.events.retained_len() != 0 {
+                eprintln!(
+                    "worker event ACK missing: unacked={:?}, retained_bytes={}; replacement replay unavailable",
+                    self.events.unacked_ranges(),
+                    self.events.retained_bytes()
+                );
+            }
         }
         result
     }
@@ -750,13 +823,40 @@ pub async fn run() -> Result<(), AppError> {
         .ok()
         .map(|value| serde_json::from_str::<crate::protocol::Identity>(&value))
         .transpose()?;
+    let mut sequenced_events = false;
+    let mut receiver = crate::event_seq::Receiver::new(0);
     while let Some(frame) = read_frame(&mut input).await? {
-        let response = match serde_json::from_slice(&frame)? {
+        let request = match serde_json::from_slice(&frame)? {
+            Request::SequencedReady {
+                local_sequence,
+                bot_name,
+            } => {
+                if !sequenced_events {
+                    return Err("event sequencing was not negotiated".into());
+                }
+                // Serial execution slot: admit at most one event before processing.
+                receiver
+                    .accept(local_sequence, true)
+                    .map_err(|_| "worker event gap or duplicate")?;
+                let mut ack = serde_json::to_vec(&Response::EventAccepted { local_sequence })?;
+                ack.push(b'\n');
+                output.write_all(&ack).await?;
+                output.flush().await?;
+                Request::ReadyEvent { bot_name }
+            }
+            request => request,
+        };
+        let response = match request {
+            Request::SequencedReady { .. } => unreachable!(),
             Request::Hello { hello: peer } => match identity.clone() {
                 Some(identity) => {
                     let hello = local_hello(identity);
                     match hello.negotiate(&peer) {
-                        Ok(_) => Response::Hello { hello },
+                        Ok((_, capabilities)) => {
+                            sequenced_events =
+                                capabilities.iter().any(|cap| cap == EVENT_SEQ_CAPABILITY);
+                            Response::Hello { hello }
+                        }
                         Err(reason) => Response::Rejected {
                             reason: reason.into(),
                         },
@@ -772,6 +872,7 @@ pub async fn run() -> Result<(), AppError> {
                 protocol_max: Some(PROTOCOL),
                 required_capabilities: CAPABILITIES.iter().map(|s| (*s).to_owned()).collect(),
                 supported_capabilities: vec![
+                    EVENT_SEQ_CAPABILITY.into(),
                     HELLO_CAPABILITY.into(),
                     "command-dispatch-v1".into(),
                     "ready-event-v1".into(),
