@@ -23,16 +23,17 @@ use crate::{
     protocol::BotId,
     supervisor::{CircuitState, Clock, MonotonicClock, RestartPolicy, RestartStatus},
 };
+use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, collections::VecDeque, io, time::Duration};
 use tokio::process::Child;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub enum ChildRole {
     Gateway,
     Core,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct ChildKey {
     pub bot_id: BotId,
     pub shard_id: u32,
@@ -78,7 +79,7 @@ impl std::fmt::Display for RecoveryError {
 }
 impl std::error::Error for RecoveryError {}
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum DegradedReason {
     RestartBudget,
     RestartWindow,
@@ -88,9 +89,10 @@ pub enum DegradedReason {
     TimeOverflow,
     GenerationExhausted,
     IdentifyUnavailable,
+    LaunchRejected,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum RecoveryState {
     /// OS child only; not an assertion of Ready, Active, lease or WS health.
     Running,
@@ -102,7 +104,7 @@ pub enum RecoveryState {
     Degraded(DegradedReason),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum StartMode {
     Core,
     /// Resume only. Rejection MUST NOT silently fall back to an Identify.
@@ -162,14 +164,14 @@ pub trait RecoveryHost {
     fn spawn(&mut self, request: StartRequest) -> io::Result<Child>;
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum DeferralReason {
     ManagementHold,
     Ownership,
     IdentifyBudget,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum RecoveryEventKind {
     Exited { success: bool, code: Option<i32> },
     SpawnFailed,
@@ -186,7 +188,7 @@ pub enum RecoveryEventKind {
 
 /// Fixed enums and identifiers only; safe to map into bounded metric labels and
 /// structured audit records. Do not append raw OS/application error text.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RecoveryEvent {
     pub key: ChildKey,
     pub generation: u64,
@@ -209,6 +211,7 @@ pub struct RecoverySnapshot {
 struct Entry {
     key: ChildKey,
     generation: u64,
+    generation_floor: u64,
     child: Option<Child>,
     state: RecoveryState,
     restart: RestartStatus,
@@ -343,6 +346,8 @@ pub struct ChildRecovery<C = MonotonicClock> {
     entries: HashMap<ChildKey, Entry>,
     last_now: Duration,
     clock_failed: bool,
+    legacy_process_exits: bool,
+    wait_for_window: bool,
 }
 
 impl<C: Clock> ChildRecovery<C> {
@@ -362,7 +367,33 @@ impl<C: Clock> ChildRecovery<C> {
             entries: HashMap::new(),
             last_now,
             clock_failed: false,
+            legacy_process_exits: false,
+            wait_for_window: false,
         })
+    }
+
+    /// Compatibility for the original process-only daemon contract: code zero
+    /// is a cooperative shutdown, and its window limit postpones retries. The
+    /// managed Gateway/Core adapters retain the strict service defaults.
+    pub(crate) fn use_legacy_process_contract(&mut self) {
+        self.legacy_process_exits = true;
+        self.wait_for_window = true;
+    }
+
+    /// Stop retrying a non-retryable host setup failure, retaining an observed
+    /// live/unknown handle. Only fixed reasons may leave this boundary.
+    pub(crate) fn fail_closed(
+        &mut self,
+        key: ChildKey,
+        reason: DegradedReason,
+    ) -> Result<Vec<RecoveryEvent>, RecoveryError> {
+        let entry = self
+            .entries
+            .get_mut(&key)
+            .ok_or(RecoveryError::UnknownChild)?;
+        let mut events = Vec::new();
+        entry.degrade(self.last_now, reason, &mut events);
+        Ok(events)
     }
 
     /// Register a stopped, reconciled slot, then let poll perform its first
@@ -384,6 +415,7 @@ impl<C: Clock> ChildRecovery<C> {
             Entry {
                 key,
                 generation: after_generation,
+                generation_floor: after_generation,
                 child: None,
                 state: RecoveryState::Waiting,
                 restart: RestartStatus {
@@ -419,6 +451,21 @@ impl<C: Clock> ChildRecovery<C> {
             stable: entry.stable,
             held: entry.held,
         })
+    }
+
+    /// Reserve generations used by admitted update candidates, including failed
+    /// candidates. Does not change the currently running generation/Ready proof.
+    pub fn advance_generation_floor(
+        &mut self,
+        key: ChildKey,
+        after_generation: u64,
+    ) -> Result<(), RecoveryError> {
+        let entry = self
+            .entries
+            .get_mut(&key)
+            .ok_or(RecoveryError::UnknownChild)?;
+        entry.generation_floor = entry.generation_floor.max(after_generation);
+        Ok(())
     }
 
     /// Trusted owner access for graceful shutdown or an explicitly authorized
@@ -509,6 +556,101 @@ impl<C: Clock> ChildRecovery<C> {
         Ok(())
     }
 
+    /// Commit an explicitly admitted management update after the replacement's
+    /// authenticated Ready/state restore and the old generation's pause ACK.
+    /// Return the old handle to its drain owner; preserve every restart budget.
+    /// On rejection the caller retains the candidate handle too. This is not a
+    /// crash recovery path and cannot clear a latched Degraded state.
+    // Both success and rejection must return an owned Child. Boxing only the
+    // error would add allocation without reducing the Child-sized return value.
+    #[allow(clippy::result_large_err)]
+    pub fn replace_ready(
+        &mut self,
+        key: ChildKey,
+        expected_generation: u64,
+        next_generation: u64,
+        child: Child,
+    ) -> Result<Child, (RecoveryError, Child)> {
+        self.install_ready(key, expected_generation, next_generation, child, false)
+            .map(|old| old.expect("replacement requires a running child"))
+    }
+
+    /// Install a verified management candidate after a failed automatic attempt
+    /// has been reaped. The owner's old routing/journal may still refer to the
+    /// earlier dead generation. No degraded budget or stop can be bypassed.
+    #[allow(clippy::result_large_err)] // Same owned-handle contract as replace_ready.
+    pub fn adopt_ready(
+        &mut self,
+        key: ChildKey,
+        expected_generation: u64,
+        next_generation: u64,
+        child: Child,
+    ) -> Result<Option<Child>, (RecoveryError, Child)> {
+        self.install_ready(key, expected_generation, next_generation, child, true)
+    }
+
+    #[allow(clippy::result_large_err)] // Preserve the caller's handle on every rejection.
+    fn install_ready(
+        &mut self,
+        key: ChildKey,
+        expected_generation: u64,
+        next_generation: u64,
+        child: Child,
+        allow_reaped: bool,
+    ) -> Result<Option<Child>, (RecoveryError, Child)> {
+        let now = self.clock.now();
+        if self.clock_failed || now < self.last_now {
+            self.clock_failed = true;
+            return Err((RecoveryError::ClockFailed, child));
+        }
+        self.last_now = now;
+        let Some(entry) = self.entries.get_mut(&key) else {
+            return Err((RecoveryError::UnknownChild, child));
+        };
+        if entry.generation != expected_generation
+            || next_generation <= expected_generation
+            || next_generation < entry.generation_floor
+        {
+            return Err((RecoveryError::StaleGeneration, child));
+        }
+        let running = entry.state == RecoveryState::Running && entry.child.is_some();
+        let reaped = allow_reaped
+            && entry.attempted
+            && entry.state == RecoveryState::Waiting
+            && entry.child.is_none();
+        if !entry.desired || !(running || reaped) {
+            return Err((RecoveryError::NotRunning, child));
+        }
+        let old = entry.child.replace(child);
+        entry.generation = next_generation;
+        entry.generation_floor = entry.generation_floor.max(next_generation);
+        entry.state = RecoveryState::Running;
+        entry.restart.retry_at = None;
+        entry.ready_at = Some(now);
+        entry.stable = false;
+        entry.deferred = None;
+        Ok(old)
+    }
+
+    /// Revoke readiness evidence without treating a transport failure as exit.
+    /// Neither the owned handle nor any restart budget is reset.
+    pub fn invalidate_ready(
+        &mut self,
+        key: ChildKey,
+        generation: u64,
+    ) -> Result<(), RecoveryError> {
+        let entry = self
+            .entries
+            .get_mut(&key)
+            .ok_or(RecoveryError::UnknownChild)?;
+        if entry.generation != generation {
+            return Err(RecoveryError::StaleGeneration);
+        }
+        entry.ready_at = None;
+        entry.stable = false;
+        Ok(())
+    }
+
     /// Nonblocking OS observation followed by at most one start attempt per slot.
     /// Every unrequested exit, including code 0, is a service failure. Explicit
     /// stop suppresses all retries. Wait errors retain the handle and latch
@@ -537,8 +679,17 @@ impl<C: Clock> ChildRecovery<C> {
                             },
                             &mut events,
                         );
+                        if self.legacy_process_exits && status.success() {
+                            entry.desired = false;
+                            entry.state = RecoveryState::Stopping;
+                            entry.restart.retry_at = None;
+                        }
                         if entry.desired && !matches!(entry.state, RecoveryState::Degraded(_)) {
-                            entry.failed(now, self.config, &mut events);
+                            let mut config = self.config;
+                            if self.wait_for_window {
+                                config.restart.max_restarts_in_window = u32::MAX;
+                            }
+                            entry.failed(now, config, &mut events);
                         }
                     }
                     Ok(None) => {
@@ -579,11 +730,30 @@ impl<C: Clock> ChildRecovery<C> {
             if entry.child.is_some() || entry.restart.retry_at.is_none_or(|at| now < at) {
                 continue;
             }
+            if self.wait_for_window && entry.attempted {
+                while entry
+                    .recent
+                    .front()
+                    .is_some_and(|at| now.saturating_sub(*at) >= self.config.restart.window)
+                {
+                    entry.recent.pop_front();
+                }
+                if entry.recent.len() >= self.config.restart.max_restarts_in_window as usize {
+                    if let Some(at) = entry.recent[0].checked_add(self.config.restart.window) {
+                        entry.restart.retry_at = Some(at);
+                        entry.not_before = at;
+                    } else {
+                        entry.degrade(now, DegradedReason::TimeOverflow, &mut events);
+                    }
+                    continue;
+                }
+            }
             if !entry.budget_available(now, self.config.restart, &mut events) {
                 host.cancel_identify(entry.key);
                 continue;
             }
-            let Some(generation) = entry.generation.checked_add(1) else {
+            let Some(generation) = entry.generation.max(entry.generation_floor).checked_add(1)
+            else {
                 entry.degrade(now, DegradedReason::GenerationExhausted, &mut events);
                 host.cancel_identify(entry.key);
                 continue;
@@ -624,6 +794,7 @@ impl<C: Clock> ChildRecovery<C> {
             }
             entry.attempted = true;
             entry.generation = generation;
+            entry.generation_floor = generation;
             entry.restart.retry_at = None;
             entry.ready_at = None;
             entry.stable = false;
@@ -644,7 +815,11 @@ impl<C: Clock> ChildRecovery<C> {
                 }
                 Err(_) => {
                     entry.emit(now, RecoveryEventKind::SpawnFailed, &mut events);
-                    entry.failed(now, self.config, &mut events);
+                    let mut config = self.config;
+                    if self.wait_for_window {
+                        config.restart.max_restarts_in_window = u32::MAX;
+                    }
+                    entry.failed(now, config, &mut events);
                 }
             }
         }

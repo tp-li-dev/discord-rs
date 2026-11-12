@@ -1,16 +1,22 @@
 use crate::{
     AppError,
+    child_recovery::{
+        ChildKey, ChildRecovery, ChildRole, DegradedReason, IdentifyAdmission, RecoveryConfig,
+        RecoveryEvent, RecoveryEventKind, RecoveryHost, RecoverySnapshot, RecoveryState,
+        StartRequest,
+    },
     redact::Secret,
     response_drain::{ResponseDrain, ResponseOperation},
 };
 use bot_framework::interactions::InteractionKind;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::VecDeque,
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
         Arc, Mutex as StdMutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -53,6 +59,7 @@ pub struct DeploymentIdentity {
     generation: Option<std::sync::atomic::AtomicU64>,
     core_launch: Option<crate::shard_runtime::test_switch::CoreLaunch>,
     interaction_state: Option<InteractionStateConfig>,
+    recovery_config: RecoveryConfig,
 }
 impl DeploymentIdentity {
     pub fn from_env() -> Result<Self, AppError> {
@@ -94,6 +101,7 @@ impl DeploymentIdentity {
             generation,
             core_launch: None,
             interaction_state: None,
+            recovery_config: RecoveryConfig::default(),
         })
     }
 
@@ -101,6 +109,13 @@ impl DeploymentIdentity {
     /// The independent signing key travels only on the child's anonymous pipe.
     pub fn with_interaction_state(mut self, config: InteractionStateConfig) -> Self {
         self.interaction_state = Some(config);
+        self
+    }
+
+    /// Trusted local process policy, validated before any Core starts. This
+    /// neither changes Gateway ownership nor provides a remote management API.
+    pub fn with_recovery_config(mut self, config: RecoveryConfig) -> Self {
+        self.recovery_config = config;
         self
     }
 
@@ -473,6 +488,31 @@ pub struct WorkerIdentity {
     pub pid: u32,
     pub identity: Option<crate::protocol::Identity>,
     pub credential_free: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<WorkerRecoveryStatus>,
+}
+
+/// Bounded, credential-free observations of the local Core owner. Running means
+/// an OS child exists, not that Discord, the lease or application work is healthy.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkerRecoveryStatus {
+    pub generation: u64,
+    pub state: RecoveryState,
+    pub degraded_reason: Option<DegradedReason>,
+    pub pid: Option<u32>,
+    pub restarts: u32,
+    pub startup_failures: u32,
+    pub ready: bool,
+    pub stable: bool,
+    pub recent_events: Vec<WorkerRecoveryEvent>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkerRecoveryEvent {
+    /// Monotonic within this Manager slot; use with the Gateway generation when
+    /// deduplicating repeated status observations in a metrics/audit consumer.
+    pub sequence: u64,
+    pub event: RecoveryEvent,
 }
 
 // Legacy protocol 5 workers omit the range. Partial ranges are malformed.
@@ -551,8 +591,30 @@ struct TransferState {
     checkpoint: Option<serde_json::Value>,
 }
 
+type ObservedExit = Arc<StdMutex<Option<(bool, Option<i32>)>>>;
+
+struct ChildOwnership {
+    // An in-flight IPC exchange must not delay an explicit routing handoff.
+    child: Mutex<Option<Child>>,
+    recovery_generation: AtomicU64,
+}
+
+impl ChildOwnership {
+    fn generation(&self) -> Option<u64> {
+        match self.recovery_generation.load(Ordering::Acquire) {
+            0 => None,
+            generation => Some(generation),
+        }
+    }
+}
+
 struct Process {
-    _child: Child,
+    // Automatic recovery owns the handle; explicit update candidates and retired
+    // generations retain theirs until the existing drain contract is complete.
+    ownership: Arc<ChildOwnership>,
+    child_pid: u32,
+    launch_identity: crate::protocol::Identity,
+    exit_status: ObservedExit,
     input: Arc<Mutex<Option<ChildStdin>>>,
     output: BufReader<ChildStdout>,
     broken: bool,
@@ -576,15 +638,17 @@ impl Process {
         deployment: &DeploymentIdentity,
         policy: LaunchPolicy,
     ) -> Result<Self, AppError> {
+        let mut process = Self::spawn(path, deployment, policy)?;
+        process.prepare(deployment, policy).await?;
+        Ok(process)
+    }
+
+    fn spawn(
+        path: &Path,
+        deployment: &DeploymentIdentity,
+        policy: LaunchPolicy,
+    ) -> Result<Self, AppError> {
         let identity = deployment.next_identity()?;
-        let mut hello = local_hello(identity.clone());
-        if deployment.interaction_state.is_none() {
-            // Existing command-only peers and relays keep their EOF drain
-            // contract. Negotiate new wire controls only when configured.
-            hello
-                .optional_capabilities
-                .retain(|cap| cap != INTERACTION_CAPABILITY && cap != DRAIN_SIGNAL_CAPABILITY);
-        }
         let mut command = Command::new(path);
         if policy.isolated || deployment.interaction_state.is_some() {
             command.env_clear();
@@ -602,24 +666,23 @@ impl Process {
             .stdout(Stdio::piped())
             .kill_on_drop(true)
             .spawn()?;
-        let input = child
-            .stdin
-            .take()
-            .ok_or_else(|| failure("missing worker stdin"))?;
-        let output = BufReader::new(
-            child
-                .stdout
-                .take()
-                .ok_or_else(|| failure("missing worker stdout"))?,
-        );
-        let mut process = Self {
-            _child: child,
+        let input = child.stdin.take().expect("piped worker stdin");
+        let output = BufReader::new(child.stdout.take().expect("piped worker stdout"));
+        let child_pid = child.id().expect("new worker process identity");
+        Ok(Self {
+            ownership: Arc::new(ChildOwnership {
+                child: Mutex::new(Some(child)),
+                recovery_generation: AtomicU64::new(0),
+            }),
+            child_pid,
+            launch_identity: identity,
+            exit_status: Arc::new(StdMutex::new(None)),
             input: Arc::new(Mutex::new(Some(input))),
             output,
             broken: false,
             transfer: Arc::new(StdMutex::new(TransferState {
                 events: crate::event_seq::Sender::new(64, 0, MAX_FRAME_BYTES as usize, 0)
-                    .map_err(|_| failure("invalid event buffer"))?,
+                    .expect("fixed valid worker event buffer"),
                 checkpoint: None,
             })),
             build: String::new(),
@@ -627,7 +690,21 @@ impl Process {
             supported_capabilities: Vec::new(),
             identity: None,
             credential_free: false,
-        };
+        })
+    }
+
+    async fn prepare(
+        &mut self,
+        deployment: &DeploymentIdentity,
+        policy: LaunchPolicy,
+    ) -> Result<(), AppError> {
+        let process = self;
+        let mut hello = local_hello(process.launch_identity.clone());
+        if deployment.interaction_state.is_none() {
+            hello
+                .optional_capabilities
+                .retain(|cap| cap != INTERACTION_CAPABILITY && cap != DRAIN_SIGNAL_CAPABILITY);
+        }
         match process.request(&Request::Health).await? {
             Response::Ready {
                 protocol: PROTOCOL,
@@ -697,7 +774,7 @@ impl Process {
                 {
                     return Err(failure("worker lacks required Gateway capabilities"));
                 }
-                if process.supports(API_RESULT_CAPABILITY) && process._child.id() != Some(pid) {
+                if process.supports(API_RESULT_CAPABILITY) && process.child_pid != pid {
                     return Err(failure("worker API result process identity mismatch"));
                 }
                 if let Some(config) = &deployment.interaction_state {
@@ -733,7 +810,7 @@ impl Process {
                         _ => return Err(failure("invalid initial worker snapshot")),
                     }
                 }
-                Ok(process)
+                Ok(())
             }
             _ => Err(failure("incompatible worker protocol")),
         }
@@ -742,11 +819,22 @@ impl Process {
     async fn exited(&mut self, after_ack: bool) -> AppError {
         // EOF normally precedes exit notification very briefly. Bound the wait
         // so a peer that only closes stdout cannot stall fault reporting.
-        let exit_code = timeout(Duration::from_millis(100), self._child.wait())
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .and_then(|status| status.code());
+        let mut owned = self.ownership.child.lock().await;
+        let exit_code = if let Some(child) = owned.as_mut() {
+            timeout(Duration::from_millis(100), child.wait())
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .and_then(|status| status.code())
+        } else {
+            // Only ChildRecovery observes/reaps managed children. A closed pipe
+            // alone is not permission to replace the process.
+            self.exit_status
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|status| status.1)
+        };
         Box::new(WorkerFailure {
             message: if after_ack {
                 "worker exited after ACK"
@@ -949,10 +1037,179 @@ impl Process {
     }
 }
 
+struct CoreRecovery {
+    key: ChildKey,
+    engine: ChildRecovery,
+    current_exit: Option<ObservedExit>,
+    ready_generation: Option<u64>,
+    sequence: u64,
+    recent_events: VecDeque<WorkerRecoveryEvent>,
+    pending_events: VecDeque<RecoveryEvent>,
+}
+
+impl CoreRecovery {
+    fn new(deployment: &DeploymentIdentity) -> Result<Self, AppError> {
+        let key = ChildKey {
+            bot_id: deployment.bot_id,
+            shard_id: deployment.shard.id(),
+            role: ChildRole::Core,
+        };
+        // Legacy pools have several independent slots in one Shard. Each slot
+        // keeps a lifetime owner and budget, including across explicit updates.
+        let mut engine = ChildRecovery::new(
+            crate::supervisor::MonotonicClock::default(),
+            deployment.recovery_config,
+            1,
+        )?;
+        engine.register(key, 0)?;
+        Ok(Self {
+            key,
+            engine,
+            current_exit: None,
+            ready_generation: None,
+            sequence: 0,
+            recent_events: VecDeque::new(),
+            pending_events: VecDeque::new(),
+        })
+    }
+
+    fn observe(&mut self, events: Vec<RecoveryEvent>) {
+        for event in events {
+            if let RecoveryEventKind::Exited { success, code } = event.kind {
+                if let Some(exit) = &self.current_exit {
+                    *exit.lock().unwrap() = Some((success, code));
+                }
+                self.ready_generation = None;
+            }
+            self.sequence = self.sequence.saturating_add(1);
+            if self.recent_events.len() == 16 {
+                self.recent_events.pop_front();
+            }
+            self.recent_events.push_back(WorkerRecoveryEvent {
+                sequence: self.sequence,
+                event,
+            });
+            if self.pending_events.len() == 64 {
+                self.pending_events.pop_front();
+            }
+            self.pending_events.push_back(event);
+        }
+    }
+
+    fn poll(&mut self, host: &mut CoreRecoveryHost<'_>) -> Option<Process> {
+        let events = self.engine.poll(host);
+        self.observe(events);
+        let candidate = host.candidate.take();
+        if let Some(candidate) = &candidate {
+            self.current_exit = Some(candidate.exit_status.clone());
+            self.ready_generation = None;
+        }
+        candidate
+    }
+
+    fn snapshot(&self) -> RecoverySnapshot {
+        self.engine
+            .snapshot(self.key)
+            .expect("registered Core slot")
+    }
+
+    fn status(&self) -> WorkerRecoveryStatus {
+        let snapshot = self.snapshot();
+        WorkerRecoveryStatus {
+            generation: snapshot.generation,
+            state: snapshot.state,
+            degraded_reason: match snapshot.state {
+                RecoveryState::Degraded(reason) => Some(reason),
+                _ => None,
+            },
+            pid: snapshot.pid,
+            restarts: snapshot.restart.restarts,
+            startup_failures: snapshot.startup_failures,
+            ready: self.ready_generation == Some(snapshot.generation)
+                && snapshot.state == RecoveryState::Running,
+            stable: snapshot.stable,
+            recent_events: self.recent_events.iter().cloned().collect(),
+        }
+    }
+
+    fn confirm(&mut self, process: &Process) -> Result<(), AppError> {
+        if process.identity.is_some() {
+            let generation = process
+                .ownership
+                .generation()
+                .ok_or_else(|| failure("missing worker recovery generation"))?;
+            self.engine.confirm_ready(self.key, generation)?;
+            self.ready_generation = Some(generation);
+        }
+        Ok(())
+    }
+
+    fn invalidate_ready(&mut self, generation: u64) {
+        if self.engine.invalidate_ready(self.key, generation).is_ok() {
+            self.ready_generation = None;
+        }
+    }
+
+    fn terminate_candidate(&mut self, generation: u64) {
+        if self.snapshot().generation == generation
+            && let Ok(Some(child)) = self.engine.child_mut(self.key)
+        {
+            // Bad Ready/restore is a failed start, not a replacement permit.
+            // The engine must reap this handle before any later spawn.
+            let _ = child.start_kill();
+        }
+        self.ready_generation = None;
+    }
+}
+
+struct CoreRecoveryHost<'a> {
+    path: &'a Path,
+    deployment: &'a DeploymentIdentity,
+    policy: LaunchPolicy,
+    authorized: &'a dyn Fn() -> bool,
+    candidate: Option<Process>,
+}
+
+impl RecoveryHost for CoreRecoveryHost<'_> {
+    fn authorized(&mut self, _: ChildKey) -> bool {
+        (self.authorized)()
+    }
+    fn resume_available(&mut self, _: ChildKey) -> bool {
+        false
+    }
+    fn try_acquire_identify(&mut self, _: ChildKey) -> IdentifyAdmission {
+        // Core recovery never touches Discord or consumes an Identify grant.
+        IdentifyAdmission::Unavailable
+    }
+    fn cancel_identify(&mut self, _: ChildKey) {}
+    fn spawn(&mut self, request: StartRequest) -> std::io::Result<Child> {
+        if request.key.role != ChildRole::Core || self.candidate.is_some() {
+            return Err(std::io::Error::other("invalid Core recovery request"));
+        }
+        let process = Process::spawn(self.path, self.deployment, self.policy)
+            .map_err(|_| std::io::Error::other("Core spawn failed"))?;
+        process
+            .ownership
+            .recovery_generation
+            .store(request.generation, Ordering::Release);
+        let child = process
+            .ownership
+            .child
+            .try_lock()
+            .expect("unshared Core handle")
+            .take()
+            .expect("new Core handle");
+        self.candidate = Some(process);
+        Ok(child)
+    }
+}
+
 // A generation stays alive through both IPC work and its external response.
 struct Generation {
     path: PathBuf,
     process: Mutex<Process>,
+    ownership: Arc<ChildOwnership>,
+    exit_status: ObservedExit,
     transfer: Arc<StdMutex<TransferState>>,
     build: String,
     pid: u32,
@@ -997,6 +1254,8 @@ impl Generation {
             capabilities: process.supported_capabilities.clone(),
             identity: process.identity.clone(),
             credential_free: process.credential_free,
+            ownership: process.ownership.clone(),
+            exit_status: process.exit_status.clone(),
             process: Mutex::new(process),
             state_barrier: Arc::new(RwLock::new(())),
             work: Arc::new(RwLock::new(())),
@@ -1058,6 +1317,7 @@ pub struct Manager {
     management: Mutex<ManagementRecord>,
     instance_id: String,
     gateway_admission: Option<StdMutex<GatewayAdmission>>,
+    core_recovery: Vec<StdMutex<CoreRecovery>>,
 }
 
 struct GatewayAdmission {
@@ -1151,9 +1411,28 @@ impl Manager {
                 pid: generation.pid,
                 identity: generation.identity.clone(),
                 credential_free: generation.credential_free,
+                recovery: Some(self.core_recovery[index].lock().unwrap().status()),
             });
         }
         identities
+    }
+
+    /// Drain bounded transition events for an authenticated owner or metrics
+    /// sink. The wire status keeps its own bounded sequence-numbered history.
+    pub fn take_recovery_events(&self) -> Vec<(usize, RecoveryEvent)> {
+        self.core_recovery
+            .iter()
+            .enumerate()
+            .flat_map(|(index, owner)| {
+                owner
+                    .lock()
+                    .unwrap()
+                    .pending_events
+                    .drain(..)
+                    .map(|event| (index, event))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
     pub async fn describe_workers(&self) -> String {
         let mut lines = vec!["稼働中のWorker:".to_string()];
@@ -1245,8 +1524,20 @@ impl Manager {
         }
         let mut workers = Vec::with_capacity(count);
         let mut generations = Vec::with_capacity(count);
+        let mut core_recovery = Vec::with_capacity(count);
         for index in 0..count {
-            let process = Process::start(&path, &deployment, launch_policy).await?;
+            let mut owner = CoreRecovery::new(&deployment)?;
+            let mut process = owner
+                .poll(&mut CoreRecoveryHost {
+                    path: &path,
+                    deployment: &deployment,
+                    policy: launch_policy,
+                    authorized: &|| true,
+                    candidate: None,
+                })
+                .ok_or_else(|| failure("Core initial spawn failed"))?;
+            process.prepare(&deployment, launch_policy).await?;
+            owner.confirm(&process)?;
             let generation = Generation::new(path.clone(), process);
             generations.push(RegisteredGeneration {
                 index,
@@ -1254,6 +1545,7 @@ impl Manager {
                 retired: false,
             });
             workers.push(RwLock::new(generation));
+            core_recovery.push(StdMutex::new(owner));
         }
         let mut instance = [0u8; 16];
         getrandom::fill(&mut instance)?;
@@ -1266,7 +1558,7 @@ impl Manager {
                 disconnected: false,
             })
         });
-        Ok(Arc::new(Self {
+        let manager = Arc::new(Self {
             deployment,
             launch_policy,
             stopping: AtomicBool::new(false),
@@ -1278,7 +1570,146 @@ impl Manager {
             replace_lock: Mutex::new(()),
             management: Mutex::new(ManagementRecord::default()),
             gateway_admission,
-        }))
+            core_recovery,
+        });
+        let owner = Arc::downgrade(&manager);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let Some(manager) = owner.upgrade() else {
+                    break;
+                };
+                if manager.stopping.load(Ordering::Acquire) {
+                    break;
+                }
+                manager.poll_core_recovery().await;
+            }
+        });
+        Ok(manager)
+    }
+
+    fn core_recovery_authorized(&self) -> bool {
+        !self.stopping.load(Ordering::Acquire)
+            && self.gateway_admission.as_ref().is_none_or(|gate| {
+                let gate = gate.lock().unwrap();
+                !gate.disconnected
+                    && matches!(
+                        gate.state,
+                        crate::shard_runtime::test_switch::State::Active
+                            | crate::shard_runtime::test_switch::State::Standby
+                    )
+            })
+    }
+
+    async fn poll_core_recovery(&self) {
+        let Ok(_update) = self.update.try_lock() else {
+            return;
+        };
+        self.reap_retired();
+        for (index, worker) in self.workers.iter().enumerate() {
+            let previous = worker.read().await.clone();
+            let broken_generation = previous.process.try_lock().ok().and_then(|process| {
+                process
+                    .broken
+                    .then_some(process.ownership.generation())
+                    .flatten()
+            });
+            let blocked = self
+                .generations
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.index == index && entry.retired);
+            let candidate = {
+                let mut owner = self.core_recovery[index].lock().unwrap();
+                let key = owner.key;
+                if let Some(generation) = broken_generation {
+                    owner.invalidate_ready(generation);
+                }
+                let _ = owner.engine.hold(key, blocked);
+                owner.poll(&mut CoreRecoveryHost {
+                    path: &previous.path,
+                    deployment: &self.deployment,
+                    policy: self.launch_policy,
+                    authorized: &|| self.core_recovery_authorized(),
+                    candidate: None,
+                })
+            };
+            let Some(mut candidate) = candidate else {
+                continue;
+            };
+            let generation = candidate
+                .ownership
+                .generation()
+                .expect("managed Core attempt");
+            let prepared = timeout(DEADLINE, async {
+                candidate
+                    .prepare(&self.deployment, self.launch_policy)
+                    .await?;
+                let _state = previous.state_barrier.write().await;
+                let transfer = previous.transfer.lock().unwrap().clone();
+                if let Some(state) = transfer.checkpoint.clone() {
+                    candidate.restore(STATE_VERSION, state).await?;
+                }
+                candidate
+                    .inherit_events(&transfer, &previous.capabilities)
+                    .await?;
+                Ok::<_, AppError>(())
+            })
+            .await;
+            if !matches!(prepared, Ok(Ok(()))) || !self.core_recovery_authorized() {
+                self.core_recovery[index]
+                    .lock()
+                    .unwrap()
+                    .terminate_candidate(generation);
+                continue;
+            }
+            let mut active = worker.write().await;
+            // Serialize the final routing commit with Pause/Drain/EOF admission.
+            // No await while the short Gateway gate is held.
+            let gate = self
+                .gateway_admission
+                .as_ref()
+                .map(|gate| gate.lock().unwrap());
+            if !Arc::ptr_eq(&active, &previous)
+                || self.stopping.load(Ordering::Acquire)
+                || gate.as_ref().is_some_and(|gate| {
+                    gate.disconnected
+                        || !matches!(
+                            gate.state,
+                            crate::shard_runtime::test_switch::State::Active
+                                | crate::shard_runtime::test_switch::State::Standby
+                        )
+                })
+            {
+                self.core_recovery[index]
+                    .lock()
+                    .unwrap()
+                    .terminate_candidate(generation);
+                continue;
+            }
+            let confirmed = self.core_recovery[index]
+                .lock()
+                .unwrap()
+                .confirm(&candidate);
+            if confirmed.is_err() {
+                self.core_recovery[index]
+                    .lock()
+                    .unwrap()
+                    .terminate_candidate(generation);
+                continue;
+            }
+            self.install(
+                index,
+                &mut active,
+                Generation::new(previous.path.clone(), candidate),
+            );
+            drop(gate);
+            // No Gateway admission, ownership epoch, session or Identify state
+            // is changed by a Core-only restart.
+            eprintln!("Workerを再起動しました");
+        }
+        self.reap_retired();
     }
 
     /// A short synchronous admission boundary, never held across IPC/await.
@@ -1462,6 +1893,12 @@ impl Manager {
             if !force && worker.read().await.path == path {
                 continue;
             }
+            if matches!(
+                self.core_recovery[index].lock().unwrap().snapshot().state,
+                RecoveryState::Degraded(_)
+            ) {
+                return Err(failure("worker recovery is degraded"));
+            }
             if self
                 .unknown_responses()
                 .1
@@ -1543,6 +1980,78 @@ impl Manager {
             candidate
                 .inherit_events(&transfer, &previous.capabilities)
                 .await?;
+            let observed = self.core_recovery[index].lock().unwrap().snapshot();
+            if observed.pid.is_none()
+                || previous.ownership.generation() != Some(observed.generation)
+            {
+                // An unsuccessful recovery candidate can advance the engine
+                // while routing retains the dead generation's confirmed journal.
+                // Neither that journal nor an IPC error proves another process
+                // is dead: require both observations before management adopts.
+                if previous.exit_status.lock().unwrap().is_none() {
+                    return Err(failure("worker recovery changed during update"));
+                }
+                timeout(DEADLINE, async {
+                    loop {
+                        let observed = {
+                            let mut owner = self.core_recovery[index].lock().unwrap();
+                            let key = owner.key;
+                            owner.engine.hold(key, true)?;
+                            let spawned = owner.poll(&mut CoreRecoveryHost {
+                                path: &previous.path,
+                                deployment: &self.deployment,
+                                policy: self.launch_policy,
+                                authorized: &|| false,
+                                candidate: None,
+                            });
+                            debug_assert!(spawned.is_none());
+                            owner.snapshot()
+                        };
+                        if observed.pid.is_none() {
+                            return Ok::<_, AppError>(());
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .map_err(|_| failure("previous recovery candidate has not exited"))??;
+            }
+            {
+                // This handle lock is independent from old in-flight IPC. Keep
+                // its handle with the old generation throughout concurrent drain.
+                let mut old_handle = previous.ownership.child.lock().await;
+                let mut candidate_handle = candidate.ownership.child.lock().await;
+                let mut owner = self.core_recovery[index].lock().unwrap();
+                let expected = owner.snapshot().generation;
+                let next = expected
+                    .checked_add(1)
+                    .ok_or_else(|| failure("worker recovery generation exhausted"))?;
+                let child = candidate_handle.take().expect("owned update candidate");
+                let key = owner.key;
+                match owner.engine.adopt_ready(key, expected, next, child) {
+                    Ok(old_child) => {
+                        *old_handle = old_child;
+                        previous
+                            .ownership
+                            .recovery_generation
+                            .store(0, Ordering::Release);
+                        candidate
+                            .ownership
+                            .recovery_generation
+                            .store(next, Ordering::Release);
+                        owner.current_exit = Some(candidate.exit_status.clone());
+                        owner.ready_generation = candidate.identity.as_ref().map(|_| next);
+                        if candidate.identity.is_none() {
+                            owner.invalidate_ready(next);
+                        }
+                        let _ = owner.engine.hold(key, false);
+                    }
+                    Err((_, child)) => {
+                        *candidate_handle = Some(child);
+                        return Err(failure("worker recovery does not permit update"));
+                    }
+                }
+            }
             self.install(index, &mut active, Generation::new(path.clone(), candidate));
             drop(state_boundary);
             drop(active);
@@ -1826,6 +2335,22 @@ impl Manager {
         }
         self.stopping.store(true, Ordering::Release);
         self.stopped.notify_waiters();
+        for (index, owner) in self.core_recovery.iter().enumerate() {
+            let path = self.workers[index].read().await.path.clone();
+            let mut owner = owner.lock().unwrap();
+            let key = owner.key;
+            if owner.snapshot().state != RecoveryState::Stopped {
+                owner.engine.stop(key)?;
+            }
+            let candidate = owner.poll(&mut CoreRecoveryHost {
+                path: &path,
+                deployment: &self.deployment,
+                policy: self.launch_policy,
+                authorized: &|| false,
+                candidate: None,
+            });
+            debug_assert!(candidate.is_none());
+        }
         timeout(DRAIN_DEADLINE, async {
             let _replacement = self.replace_lock.lock().await;
             let _recovery = self.update.lock().await;
@@ -1856,7 +2381,31 @@ impl Manager {
             let mut failed = false;
             for generation in &generations {
                 let mut process = generation.process.lock().await;
-                failed |= !process._child.wait().await?.success();
+                let mut owned = generation.ownership.child.lock().await;
+                if let Some(child) = owned.as_mut() {
+                    failed |= !child.wait().await?.success();
+                } else {
+                    loop {
+                        if let Some((success, _)) = *process.exit_status.lock().unwrap() {
+                            failed |= !success;
+                            break;
+                        }
+                        // The engine is the sole reaper, including during a
+                        // graceful stop or cancellation of an earlier stop.
+                        for owner in &self.core_recovery {
+                            let mut owner = owner.lock().unwrap();
+                            let candidate = owner.poll(&mut CoreRecoveryHost {
+                                path: &generation.path,
+                                deployment: &self.deployment,
+                                policy: self.launch_policy,
+                                authorized: &|| false,
+                                candidate: None,
+                            });
+                            debug_assert!(candidate.is_none());
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }
                 process.broken = true;
                 pids.push(process.pid);
             }
@@ -2105,71 +2654,62 @@ impl Manager {
         let Err(error) = result else {
             return;
         };
-        if !generation.process.lock().await.broken {
-            return;
-        }
-        if self.gateway_admission.is_some() {
-            // A Core failure invalidates this managed generation. Do not mint
-            // a locally overlapping identity behind the daemon's plan.
-            self.close_gateway_admission();
-            return;
-        }
-        let _recovery = self.update.lock().await;
-        if self.stopping.load(Ordering::Acquire) {
-            return;
-        }
-        let mut active = self.workers[index].write().await;
-        self.reap_retired();
-        let recovery = if Arc::ptr_eq(&active, &generation) {
-            let transfer = generation.transfer.lock().unwrap().clone();
-            let restart = async {
-                if self
-                    .generations
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .any(|entry| entry.index == index && entry.retired)
-                {
-                    return Err(failure("previous worker generation is still draining"));
-                }
-                let mut candidate =
-                    Process::start(&generation.path, &self.deployment, self.launch_policy).await?;
-                self.require_running()?;
-                if let Some(state) = transfer.checkpoint.clone() {
-                    candidate.restore(STATE_VERSION, state).await?;
-                }
-                candidate
-                    .inherit_events(&transfer, &generation.capabilities)
-                    .await?;
-                Ok::<_, AppError>(candidate)
+        let (exit_status, failed_attempt) = {
+            let process = generation.process.lock().await;
+            if !process.broken {
+                return;
             }
-            .await;
-            match restart {
-                Ok(candidate) => {
-                    self.install(
-                        index,
-                        &mut active,
-                        Generation::new(generation.path.clone(), candidate),
-                    );
-                    eprintln!("Workerを再起動しました");
-                    "restarted"
-                }
-                Err(restart_error) => {
-                    eprintln!(
-                        "Workerの再起動に失敗しました: {}",
-                        diagnostic(restart_error.as_ref())
-                    );
-                    "failed"
-                }
-            }
-        } else {
-            "superseded"
+            (process.exit_status.clone(), process.ownership.generation())
         };
-        drop(active);
+        if let Some(attempt) = failed_attempt {
+            self.core_recovery[index]
+                .lock()
+                .unwrap()
+                .invalidate_ready(attempt);
+        }
+        let started = tokio::time::Instant::now();
+        let mut recovery = "waiting";
+        // Preserve the existing bounded request-failure report, while every
+        // retry decision and actual exit observation comes from the same engine
+        // used by the periodic owner. The failed application request is not sent
+        // again; only the previously confirmed snapshot/event journal is restored.
+        while !self.stopping.load(Ordering::Acquire) && started.elapsed() < DEADLINE {
+            // Preparation is owned by the monitor task: cancelling this failed
+            // request must not abandon a spawned child before Ready/restore.
+            if !Arc::ptr_eq(&*self.workers[index].read().await, &generation) {
+                recovery = "restarted";
+                break;
+            }
+            let snapshot = self.core_recovery[index].lock().unwrap().snapshot();
+            if matches!(snapshot.state, RecoveryState::Degraded(_)) {
+                recovery = "degraded";
+                break;
+            }
+            if snapshot.state == RecoveryState::Running
+                && failed_attempt == Some(snapshot.generation)
+                && started.elapsed() >= Duration::from_millis(150)
+            {
+                // EOF/timeout/bad frames are not proof the process terminated.
+                // Retain its handle and leave explicit management able to drain
+                // or replace it, instead of launching an overlapping child.
+                recovery = "unavailable";
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         self.reap_retired();
+        let observed_exit = exit_status.lock().unwrap().and_then(|status| status.1);
+        let enriched = error
+            .downcast_ref::<WorkerFailure>()
+            .map(|error| WorkerFailure {
+                message: error.message,
+                exit_code: error.exit_code.or(observed_exit),
+            });
+        let reported: &(dyn std::error::Error + Send + Sync + 'static) =
+            enriched.as_ref().map_or(error.as_ref(), |error| error);
         self.record_failure(
             &generation.path,
-            error.as_ref(),
+            reported,
             "runtime",
             Some((index, generation.pid, recovery)),
         )
