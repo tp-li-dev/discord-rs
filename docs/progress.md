@@ -102,3 +102,11 @@ Worker の双方向受信に 1 MiB、管理要求に 4095 byte（改行込み）
 - Worker identity：`BOT_ID`/`SHARD_ID`/`TOTAL_SHARDS`/`GENERATION_ID` を handshake と Gateway に接続（未指定は従来の 0/0/1）。不一致拒否を統合試験。世代番号の永続化は未実装。
 - main 統合後、fmt・clippy（警告禁止）・workspace test が Windows / Rust 1.99.0 で成功。Linux、CI、実 Discord、複数ホストは未検証。
 - 次候補：event_seq を実 IPC に接続、failover/ownership の接続、daemon/botctl の骨格、Core 世代切替の統合、secret マスクの既存ログ経路への適用、Linux CI の実行確認。
+
+## 2026-11-12：並列開発 第4弾（Codex CLI）
+- event_seq を Worker IPC に接続：`event-seq-v1` capability 交渉時のみ Ready に連番、Worker が受付 ACK を返す。旧 Worker は従来形式。ACK 欠落/不正/timeout を可視化。切替時の未 ACK 再配送は未接続。
+- `botctl`（オフライン骨格）：config validate / shards / ps と --json、token は env 名のみ表示。daemon 操作は『未実装』で異常終了。
+- failover と ownership を接続：承認を OwnershipCoordinator 経由で取得し epoch を保持、fencing、lease 失効で Active 停止、T11〜T14 相当を模擬 Clock/Fake で試験。実プロセス・実ネットワーク・成熟した合意バックエンドは未接続。
+- 秘密マスクを bin/*.rs、placement.rs 等に適用し回帰試験を追加。worker.rs/main.rs 側の未対応箇所は docs/security.md に行・修正案を記録（PM 後続対応）。
+- 統合時に clippy（items_after_test_module）を機械修正。main で fmt・clippy・workspace test（157件）が Windows / Rust 1.99.0 で成功。
+- 運用メモ：並列 worktree ごとの target が累計約70GBとなりディスク満杯が発生。完了済み worktree の target と古い検証用 target を削除して復旧。今後は統合後に都度削除する。
