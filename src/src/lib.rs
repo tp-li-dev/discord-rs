@@ -1,4 +1,5 @@
 pub mod botref;
+pub mod cert_policy;
 pub mod cluster;
 pub mod cluster_runtime;
 mod cogs;
