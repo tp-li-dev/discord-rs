@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use src::local_control::GatewayControl;
+use src::redact::{Secret, redact};
 use std::{
     env,
     error::Error,
@@ -36,14 +37,32 @@ async fn read_frame<R: AsyncBufRead + Unpin>(
     Ok(Some(line))
 }
 
+// Wire encoding is deliberate; Secret itself remains non-serializable.
+mod secret_wire {
+    use super::*;
+    pub fn serialize<S: serde::Serializer>(
+        value: &Secret<String>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        value.expose_secret().serialize(serializer)
+    }
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Secret<String>, D::Error> {
+        String::deserialize(deserializer).map(Secret::new)
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct Endpoint {
     port: u16,
-    secret: String,
+    #[serde(with = "secret_wire")]
+    secret: Secret<String>,
 }
 #[derive(Serialize, Deserialize)]
 struct Request {
-    secret: String,
+    #[serde(with = "secret_wire")]
+    secret: Secret<String>,
     command: String,
 }
 #[derive(Serialize, Deserialize)]
@@ -115,9 +134,9 @@ async fn request(command: &str) -> Result<String, ErrorBox> {
     .ok_or("invalid or oversized management reply")?;
     let reply: Reply = serde_json::from_slice(&line)?;
     if !reply.ok {
-        return Err(reply.message.into());
+        return Err(redact(&reply.message).into());
     }
-    Ok(reply.message)
+    Ok(redact(&reply.message))
 }
 async fn build() -> Result<PathBuf, ErrorBox> {
     let target = root().join("target").join("reload-build");
@@ -128,9 +147,11 @@ async fn build() -> Result<PathBuf, ErrorBox> {
         .arg(&target)
         .env_remove("DISCORD_BUILD_ID")
         .env_remove("DISCORD_TOKEN")
-        .status()
+        .output()
         .await?;
-    if !result.success() {
+    print!("{}", redact(&String::from_utf8_lossy(&result.stdout)));
+    eprint!("{}", redact(&String::from_utf8_lossy(&result.stderr)));
+    if !result.status.success() {
         return Err("Botのビルドに失敗しました".into());
     }
     let workers = root().join("workers");
@@ -189,10 +210,10 @@ async fn stop_bot(child: &mut Option<Bot>) -> Result<(), ErrorBox> {
 }
 async fn core(binary: PathBuf) -> Result<(), ErrorBox> {
     let listener = TcpListener::bind(("127.0.0.1", port()?)).await?;
-    let secret = token()?;
+    let secret = Arc::new(Secret::new(token()?));
     let endpoint = Endpoint {
         port: listener.local_addr()?.port(),
-        secret: secret.clone(),
+        secret: Secret::new(secret.expose_secret().clone()),
     };
     let mut bot = Some(spawn_bot(&binary).await?);
     let mut desired_running = true;
@@ -218,7 +239,7 @@ async fn core(binary: PathBuf) -> Result<(), ErrorBox> {
                         Duration::from_secs(3), read_frame(&mut reader, MAX_REQUEST_BYTES)
                     ).await else { return };
                     let Ok(input) = serde_json::from_slice::<Request>(&line) else { return };
-                    if bool::from(input.secret.as_bytes().ct_eq(expected_secret.as_bytes())) {
+                    if bool::from(input.secret.expose_secret().as_bytes().ct_eq(expected_secret.expose_secret().as_bytes())) {
                         let _ = sender.try_send((input, reader));
                     }
                 });
@@ -236,7 +257,7 @@ async fn core(binary: PathBuf) -> Result<(), ErrorBox> {
                     failures += 1;
                     match spawn_bot(&binary).await {
                         Ok(process) => { eprintln!("Botを自動再起動しました ({failures}/3)"); bot = Some(process); started = tokio::time::Instant::now(); }
-                        Err(error) => { let message = format!("Botの自動再起動に失敗しました: {error}"); eprintln!("{message}"); last_failure = Some(message); }
+                        Err(error) => { let message = redact(&format!("Botの自動再起動に失敗しました: {error}")); eprintln!("{message}"); last_failure = Some(message); }
                     }
                 }
                 continue;
@@ -279,8 +300,8 @@ async fn core(binary: PathBuf) -> Result<(), ErrorBox> {
                     if bot.is_none() { return Err("Botが停止しています。先に start を実行してください".into()); }
                     let output = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into())).current_dir(root())
                         .args(["run", "--bin", "reload", "--", "general"]).env_remove("DISCORD_TOKEN").output().await?;
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let stdout = redact(&String::from_utf8_lossy(&output.stdout));
+                    let stderr = redact(&String::from_utf8_lossy(&output.stderr));
                     println!("{stdout}\n{stderr}");
                     if !output.status.success() { return Err(format!("更新できませんでした。コアのログを確認してください。{stderr}").into()); }
                     Ok(stdout.trim().to_owned())
@@ -290,9 +311,12 @@ async fn core(binary: PathBuf) -> Result<(), ErrorBox> {
             }
         }.await;
         let reply = match action {
-            Ok(message) => Reply { ok: true, message },
+            Ok(message) => Reply {
+                ok: true,
+                message: redact(&message),
+            },
             Err(error) => {
-                let message = format!("{} 失敗: {error}", input.command);
+                let message = redact(&format!("{} 失敗: {error}", input.command));
                 eprintln!("{message}");
                 last_failure = Some(message.clone());
                 Reply { ok: false, message }
@@ -340,7 +364,14 @@ fn launch_core(path: &Path) -> Result<(), ErrorBox> {
     Ok(())
 }
 #[tokio::main]
-async fn main() -> Result<(), ErrorBox> {
+async fn main() {
+    if let Err(error) = run().await {
+        eprintln!("manage: {}", redact(&error.to_string()));
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<(), ErrorBox> {
     let args: Vec<_> = env::args_os().skip(1).collect();
     let command = args.first().and_then(|s| s.to_str()).unwrap_or("help");
     if command == "__core" {
@@ -386,7 +417,7 @@ async fn main() -> Result<(), ErrorBox> {
         "logs" => {
             print!(
                 "{}",
-                tokio::fs::read_to_string(runtime_dir().join("core.log")).await?
+                redact(&tokio::fs::read_to_string(runtime_dir().join("core.log")).await?)
             );
             Ok(())
         }

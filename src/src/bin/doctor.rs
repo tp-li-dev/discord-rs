@@ -50,7 +50,7 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
 
 fn main() {
     if let Err(error) = run(env::args().skip(1)) {
-        eprintln!("doctor: {error}");
+        eprintln!("doctor: {}", src::redact::redact(&error));
         std::process::exit(1);
     }
 }
