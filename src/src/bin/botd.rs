@@ -15,7 +15,7 @@ use tokio::{
 const REQUEST_LIMIT: u64 = 4096;
 const RESPONSE_LIMIT: usize = 64 * 1024;
 const DEADLINE: Duration = Duration::from_secs(3);
-const USAGE: &str = "usage: botd --file F --runtime-root ABS --gateway-program ABS --bootstrap-stdin [--no-autostart] [--mock-discord LOOPBACK_IP:PORT]";
+const USAGE: &str = "usage: botd --file F --runtime-root ABS --gateway-program ABS --bootstrap-stdin [--no-autostart] [--mock-discord LOOPBACK_IP:PORT] [--allow-test-quorum]";
 
 struct Options {
     file: PathBuf,
@@ -23,6 +23,7 @@ struct Options {
     gateway_program: PathBuf,
     no_autostart: bool,
     mock_discord: Option<SocketAddr>,
+    allow_test_quorum: bool,
 }
 
 fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'static str> {
@@ -33,6 +34,7 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
     let mut bootstrap = false;
     let mut no_autostart = false;
     let mut mock_discord = None;
+    let mut allow_test_quorum = false;
     while let Some(arg) = args.next() {
         let target = match arg.to_str() {
             Some("--file") if file.is_none() => &mut file,
@@ -44,6 +46,10 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
             }
             Some("--no-autostart") if !no_autostart => {
                 no_autostart = true;
+                continue;
+            }
+            Some("--allow-test-quorum") if !allow_test_quorum => {
+                allow_test_quorum = true;
                 continue;
             }
             Some("--mock-discord") if mock_discord.is_none() => {
@@ -73,6 +79,7 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
         gateway_program: gateway_program.ok_or(USAGE)?,
         no_autostart,
         mock_discord,
+        allow_test_quorum,
     };
     if !bootstrap {
         return Err("anonymous stdin bootstrap is required");
@@ -223,11 +230,20 @@ async fn status_server(
 async fn run() -> Result<(), &'static str> {
     use src::{
         daemon::{Daemon, EnvironmentCredentials},
-        placement::Config,
         supervisor::RestartPolicy,
     };
     let options = parse_options(std::env::args_os().skip(1))?;
-    let config = Config::load(&options.file).map_err(|_| "cannot load daemon configuration")?;
+    let loaded = src::cluster_runtime::LoadedClusterConfig::load(&options.file)
+        .map_err(|_| "cannot load daemon configuration")?;
+    if loaded.test_cluster.is_some()
+        || loaded.placement.cluster.mode == src::placement::ClusterMode::Quorum
+    {
+        return run_test_cluster(options, loaded).await;
+    }
+    if options.allow_test_quorum {
+        return Err("test quorum flag requires test cluster configuration");
+    }
+    let config = loaded.placement;
     let mut daemon = Daemon::from_config(
         &config,
         &std::collections::HashMap::new(),
@@ -293,9 +309,142 @@ async fn run() -> Result<(), &'static str> {
     result
 }
 
-#[tokio::main]
+async fn run_test_cluster(
+    options: Options,
+    config: src::cluster_runtime::LoadedClusterConfig,
+) -> Result<(), &'static str> {
+    use src::{
+        cluster_runtime::{ClusterAction, ClusterRuntime},
+        daemon::test_cluster_processes::{ProcessEvent, TestClusterProcesses},
+    };
+    if options.no_autostart {
+        return Err("test quorum does not support manual process administration");
+    }
+    let mut runtime = ClusterRuntime::bind(
+        &config,
+        options.allow_test_quorum,
+        options.mock_discord.is_some(),
+    )
+    .await
+    .map_err(|error| {
+        use src::cluster_runtime::ClusterRuntimeError;
+        match error {
+            ClusterRuntimeError::TestOnlyOptInRequired => {
+                "test quorum requires --allow-test-quorum"
+            }
+            ClusterRuntimeError::MockDiscordRequired => "test quorum requires --mock-discord",
+            _ => "test quorum configuration or mTLS transport invalid",
+        }
+    })?;
+    let settings = config
+        .test_cluster
+        .as_ref()
+        .ok_or("test cluster configuration required")?;
+    let specs = config
+        .local_specs(&options.runtime_root)
+        .map_err(|_| "test shard launch configuration invalid")?;
+    let mut processes = TestClusterProcesses::new(
+        specs,
+        &options.gateway_program,
+        options
+            .mock_discord
+            .ok_or("test quorum requires mock Discord")?,
+        settings.node_id,
+        settings.lease_ms,
+        settings.stop_margin_ms,
+    )?;
+    let bootstrap = read_bootstrap(tokio::io::stdin())
+        .await
+        .map_err(|_| "invalid anonymous control bootstrap")?;
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|_| "cannot bind local daemon control")?;
+    let port = listener
+        .local_addr()
+        .map_err(|_| "cannot inspect local daemon control")?
+        .port();
+    let (sender, mut receiver) = mpsc::channel::<Envelope>(64);
+    let mut server = tokio::spawn(status_server(listener, bootstrap.secret, sender));
+    let announcement = json!({"port":port,"local_only":true,"startup_ok":true,
+        "mock_discord":true,"test_quorum":true,"production_ready":false});
+    let mut bytes =
+        serde_json::to_vec(&announcement).map_err(|_| "cannot encode daemon announcement")?;
+    bytes.push(b'\n');
+    let mut stdout = tokio::io::stdout();
+    if stdout.write_all(&bytes).await.is_err() || stdout.flush().await.is_err() {
+        server.abort();
+        runtime.shutdown().await;
+        return Err("cannot announce local daemon control");
+    }
+    let mut interval = tokio::time::interval(Duration::from_millis(25));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut monitor_ok = true;
+    let result = loop {
+        tokio::select! {
+            signal=tokio::signal::ctrl_c()=>break signal.map_err(|_| "cannot receive daemon shutdown signal"),
+            _=interval.tick()=> {
+                for event in processes.poll() {
+                    let result = match event {
+                        ProcessEvent::Ready(key)=>runtime.startup_complete(&key),
+                        ProcessEvent::Exited(key)=>runtime.process_exited(&key),
+                    };
+                    if result.is_err() { monitor_ok=false; }
+                }
+                let actions = match runtime.tick() {
+                    Ok(actions)=>actions,
+                    Err(_)=>break Err("test cluster runtime stopped safely"),
+                };
+                for action in actions {
+                    let (key, starting) = match &action {
+                        ClusterAction::Start{key,..}=>(key.clone(),true),
+                        ClusterAction::Renew{key,..} | ClusterAction::Stop{key,..}=>(key.clone(),false),
+                    };
+                    if processes.apply(action).await.is_err() {
+                        monitor_ok=false;
+                        if starting && !processes.has_process(&key) { let _ = runtime.process_exited(&key); }
+                        else if let Ok(Some(stop)) = runtime.process_failed(&key) {
+                            let _ = processes.apply(stop).await;
+                        }
+                    }
+                }
+            }
+            Some(envelope)=receiver.recv()=> {
+                let value = if matches!(envelope.request.command.as_str(),"ps"|"status"|"inspect"|"shards") {
+                    let mut snapshot=processes.status();
+                    snapshot["cluster"]=runtime.status();
+                    snapshot["monitor_ok"]=json!(monitor_ok);
+                    json!({"ok":true,"offline":false,"status":snapshot,
+                        "cluster":snapshot["cluster"],"processes":snapshot["processes"],
+                        "transitions":snapshot["transitions"],
+                        "note":"TEST ONLY majority ACK and loopback mock Gateway; not production consensus."})
+                } else {
+                    json!({"ok":false,"offline":false,"error":"test quorum owns process lifecycle; manual mutation denied"})
+                };
+                let _=envelope.response.send(value);
+            }
+            _=&mut server=>break Err("local daemon control stopped"),
+        }
+    };
+    server.abort();
+    runtime.shutdown().await;
+    // Dropping parent pipes cannot extend a guardian's last lease. Shutdown and
+    // botd crash therefore use the same independently supervised expiry path.
+    result
+}
+
+#[tokio::main(worker_threads = 2)]
 async fn main() {
-    if let Err(error) = run().await {
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    let result = if args
+        == [
+            OsString::from("--test-cluster-guardian"),
+            OsString::from("--allow-test-quorum"),
+        ] {
+        src::daemon::test_cluster_processes::run_guardian().await
+    } else {
+        run().await
+    };
+    if let Err(error) = result {
         // Only static messages cross this boundary; no config, child output,
         // capability, credential, or OS error text is formatted.
         eprintln!("botd: {error}");
@@ -326,6 +475,12 @@ mod tests {
     #[test]
     fn accepts_absolute_program_and_root() {
         assert!(parse_options(options(&[])).is_ok());
+        assert!(!parse_options(options(&[])).unwrap().allow_test_quorum);
+        assert!(
+            parse_options(options(&["--allow-test-quorum"]))
+                .unwrap()
+                .allow_test_quorum
+        );
     }
 
     #[test]
@@ -360,6 +515,7 @@ mod tests {
             &["--bootstrap-stdin"][..],
             &["--file", "other"],
             &["--bind", "0.0.0.0:1"],
+            &["--allow-test-quorum", "--allow-test-quorum"],
         ] {
             assert!(parse_options(options(extra)).is_err());
         }

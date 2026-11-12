@@ -86,3 +86,42 @@ daemon自体の終了時はGatewayを一括killせず、重複起動防止の予
 既存の [shard_runtime.rs](../src/tests/shard_runtime.rs) は純粋な計画の順序・入力拒否・パス分離を、[shard_plan.rs](../src/tests/shard_plan.rs) は模擬メタデータと単一プロセス内Identify bucketを検証する。これらを実Discord、複数ホスト、lease、分断耐性の証拠としない。
 
 実Discordへの接続・登録・HTTP、Linux/Ubuntu CI、Windows ACL、分散Identify/REST予算、quorum/lease/fencing、Gateway並行更新、再起動を跨ぐ状態・結果不明の永続化は未検証または未接続。T01〜T20、§16.2、無停止、完全無欠落、exactly-onceの達成は宣言しない。
+
+## 追記: 3 botd・mTLS・試験用Quorumの実プロセス経路
+
+`cluster_runtime.rs` は配置TOMLを読み、各botdの `TlsTransport` による相互認証済みheartbeat、`failover.rs` の検知・復旧安定待ち、`cluster.rs::TestOnlyQuorumCoordinator` の固定メンバー過半数ACKを接続する。単一オラクルを使う従来の `TestQuorumCoordinator` シミュレーションとは別の試験用型で、`StandaloneCoordinator` に権限を委譲しない。選挙・複製ログ・永続合意は実装していない。**openraftの代替でも本番分散合意でもなく、本番利用不可**。投票の条件と未保証事項は [quorum-evaluation.md](quorum-evaluation.md) の追記を参照。
+
+通常の `botd --file ... --runtime-root ... --gateway-program ... --bootstrap-stdin` に **`--allow-test-quorum` と `--mock-discord 127.0.0.1:PORT` の両方**を指定した場合だけ起動できる。TOMLの `[cluster].mode = "quorum"` に加え、以下の拡張を用いる。node名と整数IDの対応は固定し、各ノードは自分以外の全peerを列挙する。証明書のDNS SANは `node-1.cluster` のように整数IDと一致させる。証明書・秘密鍵・CAはDER形式で、相対パスはTOMLのディレクトリから解決する。秘密鍵の内容を配置TOMLやログへ記載しない。
+
+```toml
+[test_cluster]
+node_id = 1
+listen = "127.0.0.1:17841"
+cert_path = "node-1.der"
+key_path = "node-1-key.der"
+ca_path = "test-ca.der"
+lease_ms = 4000
+stop_margin_ms = 1000
+peers = [
+  { id = 2, name = "server-b", address = "127.0.0.1:17842" },
+  { id = 3, name = "server-c", address = "127.0.0.1:17843" },
+]
+```
+
+`[node].id` はこの例では `server-a`。既存の `[failover]` のheartbeat・疑い・障害・復旧安定待ちの各閾値を利用する。membership、配置、総Shard数、安全上の時間設定が一致しないメッセージは投票に採用しない。配置・数値Bot ID・peer重複・外部アドレス・未知フィールドを起動前に検査する。管理APIは従来の匿名stdinでbootstrapしたcapabilityによるloopback認証を保つ。この試験モードの手動start/stop/restartは拒否し、プロセスのライフサイクルはQuorumに従わせる。statusには試験用である旨、quorum、lease残時間、policy状態、プロセス状態、有限の遷移履歴を含める。
+
+各botdはprimaryまたは代理候補として列挙されたShardの計画だけを用意し、承認済みleaseがあるShardについて実Gatewayを起動する。Gatewayは従来の模擬Discordモードで実Workerを起動する。botdの内部guardianプロセスがcollectorとのloopback中継で実GatewayのReadyとidentityを観測し、その後にruntimeへ起動完了を通知する。collectorのReadyには `test_cluster_node_id`、`ownership_epoch`、`guardian_pid` を追加する。子プロセスは `env_clear` し、Bot/Shard/世代とWindowsの `SystemRoot` のみを設定する。模擬モードではBot tokenを読み取らず、Coreにも渡さない。
+
+guardianはbotdとは別のプロセスとしてlease期限を監視する。更新は起動時から所有する匿名stdinパイプだけを使い、期限は要求開始時に固定され、配送やACKの遅延で延長されない。botd強制終了によるEOFは即時終了ではなく、最後のleaseまでの存続を許す。期限到達・明示handoff・不正な更新でDrainingに入り、実Gatewayへ既存のShutdownフレームを送る。投票保持期限より前の停止余裕内に終了しなければ、試験モードで所有するGatewayハンドルを強制終了し回収する。強制終了はgraceful drain成功ではない。正常終了では既存GatewayのWorker停止・回収と `stopped` 通知を確認できる。botd側もguardianを回収するまで代替プロセスを起動しない。
+
+プロセス間の期限変換は、同一ホストの壁時計を介してguardian側の単調時計タイマーへ変換する。変換中のプリエンプションで期限が延びない順に時刻を採取し、時計後退を検知した場合は停止する。これはloopbackの試験条件に限る。時計速度差、OS suspend、guardian自体の停止・強制終了、kernelの停止遅延、実Discordでの副作用を含む包括的なfencingは保証しない。投票者再起動時の待機は永続ログや永続epochの代替ではない。複数ホストへの配備、証明書更新・失効、Identify/REST予算の分散管理はこの経路の対象外である。
+
+### 追記経路の検証記録
+
+2026-11-12、Windows / Rust 1.99.0で `cargo test --offline --workspace`、`cargo clippy --offline --workspace --all-targets -- -D warnings`、`cargo --offline fmt --all --check`、`git diff --check` が成功した。既存の手動ベンチマーク1件のみignore。実行後に起動拒否の固定診断を原因別に分け、`cargo test --offline --bin botd --test e2e_cluster_processes -- --nocapture`（botd 13件、E2E 4件）と全targetのclippyも通過した。
+
+[e2e_cluster_processes.rs](../src/tests/e2e_cluster_processes.rs) は、実3 botdと各Shardの実Gateway/Workerを使い、T10配置、T11 botd単独kill、T12同一ノード復帰と安定待機・Draining履歴、T13既存mTLS接続も含む双方向分断、T14全ノード相互分断による過半数喪失、再接続後の回復を確認した。collectorの全Ready/stopped/EOFを監視し、代理Ready時に、正常停止通知がない旧Gatewayの実PIDも照会する。fixture終了後には観測したguardian/Gateway/WorkerのPID消滅を確認する。PID照会自体が現在の試験プロセスを検出できる自己試験も含む。これは観測した遷移で二重Activeがなかったという結果で、任意の瞬間や未試験の故障条件の証明ではない。
+
+短縮設定はheartbeat 100ms、疑い300ms、障害600ms、投票保持1500ms、停止余裕500ms、復帰安定1200ms。実時間の固定sleepで成功を仮定せず、状態条件の成立待ちと15秒の失敗期限を用い、安定期間は区間全体を監視する。既定の3秒検知・30秒安定待機そのものを実時間で計測した試験ではない。最後の個別実行ではT11のkillから代理Readyまで1787ms、T12の復帰から元ノードReadyまで3536ms、E2E 4件全体30.40秒だった。単発の開発機観測でありp95/p99や将来の上限保証ではない。
+
+初回試験では、lease失効時に強制停止されたGatewayにも正常 `stopped` 通知を要求する監視条件が失敗した。正常drain通知と、強制停止時のEOF・実PID消滅を区別して修正した。また、この環境の `tasklist` はアクセス拒否となるため、成功ステータスと完了マーカーを検査する読み取り専用PowerShell照会に変更した。照会失敗を「全PID不在」として成功扱いしない。失敗実行のGit管理外一時ディレクトリ4件は、削除操作がサンドボックスポリシーに拒否されたため残置している。本番鍵は使用していない。`docs/progress.md` はPM統合対象として編集していない。

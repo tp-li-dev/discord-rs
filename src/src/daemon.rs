@@ -35,6 +35,695 @@ use tokio::{
     process::{Child, Command},
 };
 
+/// Process harness for the explicitly enabled loopback quorum experiment.
+/// It never reads Bot credentials and is not a production lease watchdog.
+pub mod test_cluster_processes {
+    use super::{ShardKey, ShardRuntimeSpec};
+    use crate::cluster_runtime::ClusterAction;
+    use serde::{Deserialize, Serialize};
+    use serde_json::{Value, json};
+    use std::{
+        collections::{BTreeMap, VecDeque},
+        io::{BufRead, Read},
+        net::SocketAddr,
+        path::{Path, PathBuf},
+        process::Stdio,
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    };
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+        net::{TcpListener, TcpStream},
+        process::{Child, Command},
+        sync::mpsc,
+        task::JoinHandle,
+    };
+
+    const PIPE_LIMIT: u64 = 64 * 1024;
+    const WRITE_WAIT: Duration = Duration::from_millis(100);
+    const HISTORY_LIMIT: usize = 256;
+
+    // Deliberately no Debug: trusted paths and arbitrary child frames are not logs.
+    #[derive(Deserialize, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct Launch {
+        program: PathBuf,
+        args: Vec<String>,
+        key: ShardKey,
+        total_shards: u32,
+        node_id: u64,
+        epoch: u64,
+        collector: SocketAddr,
+        deadline_ms: u64,
+        max_lease_ms: u64,
+        stop_grace_ms: u64,
+    }
+
+    #[derive(Deserialize, Serialize)]
+    #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
+    enum Input {
+        Launch(Launch),
+        Renew { epoch: u64, deadline_ms: u64 },
+        Stop {},
+    }
+
+    #[derive(Deserialize, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct Notice {
+        state: String,
+        gateway_pid: Option<u32>,
+        reason: String,
+    }
+
+    struct Process {
+        epoch: u64,
+        state: &'static str,
+        child: Child,
+        gateway_pid: Option<u32>,
+        reader: JoinHandle<()>,
+    }
+    impl Drop for Process {
+        fn drop(&mut self) {
+            self.reader.abort();
+            // The guardian keeps its last bounded lease after stdin EOF.
+        }
+    }
+
+    pub enum ProcessEvent {
+        Ready(ShardKey),
+        Exited(ShardKey),
+    }
+
+    /// One independent guardian per real Gateway, with a bounded anonymous pipe.
+    /// The guardian survives botd death, then drains at its last lease deadline.
+    pub struct TestClusterProcesses {
+        specs: BTreeMap<ShardKey, ShardRuntimeSpec>,
+        processes: BTreeMap<ShardKey, Process>,
+        program: PathBuf,
+        collector: SocketAddr,
+        node_id: u64,
+        max_lease_ms: u64,
+        stop_grace_ms: u64,
+        sender: mpsc::Sender<(ShardKey, u64, Notice)>,
+        notices: mpsc::Receiver<(ShardKey, u64, Notice)>,
+        history: VecDeque<Value>,
+    }
+
+    fn wall_ms() -> Result<u64, &'static str> {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| "test watchdog clock invalid")?
+            .as_millis()
+            .try_into()
+            .map_err(|_| "test watchdog clock overflow")
+    }
+
+    fn wire_deadline(expires_at: Instant) -> Result<u64, &'static str> {
+        let wall = wall_ms()?;
+        let remaining = expires_at
+            .checked_duration_since(Instant::now())
+            .ok_or("test lease expired before process action")?;
+        let millis: u64 = remaining
+            .as_millis()
+            .try_into()
+            .map_err(|_| "test lease duration overflow")?;
+        wall.checked_add(millis)
+            .ok_or("test lease deadline overflow")
+    }
+
+    async fn write_input(child: &mut Child, input: &Input) -> Result<(), &'static str> {
+        let pipe = child.stdin.as_mut().ok_or("test guardian input closed")?;
+        let mut frame = serde_json::to_vec(input).map_err(|_| "test guardian input invalid")?;
+        frame.push(b'\n');
+        if frame.len() as u64 > PIPE_LIMIT {
+            return Err("test guardian input too large");
+        }
+        tokio::time::timeout(WRITE_WAIT, async {
+            pipe.write_all(&frame).await?;
+            pipe.flush().await
+        })
+        .await
+        .map_err(|_| "test guardian input timeout")?
+        .map_err(|_| "test guardian input failed")
+    }
+
+    impl TestClusterProcesses {
+        pub fn new(
+            specs: Vec<ShardRuntimeSpec>,
+            program: &Path,
+            collector: SocketAddr,
+            node_id: u64,
+            max_lease_ms: u64,
+            stop_margin_ms: u64,
+        ) -> Result<Self, &'static str> {
+            if !program.is_absolute()
+                || !collector.ip().is_loopback()
+                || collector.port() == 0
+                || max_lease_ms == 0
+                || stop_margin_ms < 100
+            {
+                return Err("invalid test cluster process configuration");
+            }
+            let (sender, notices) = mpsc::channel(128);
+            Ok(Self {
+                specs: specs
+                    .into_iter()
+                    .map(|s| {
+                        (
+                            ShardKey {
+                                bot_id: s.bot_id.clone(),
+                                shard_id: s.shard_id,
+                            },
+                            s,
+                        )
+                    })
+                    .collect(),
+                processes: BTreeMap::new(),
+                program: program.to_owned(),
+                collector,
+                node_id,
+                max_lease_ms,
+                stop_grace_ms: (stop_margin_ms / 3).min(250),
+                sender,
+                notices,
+                history: VecDeque::new(),
+            })
+        }
+
+        fn record(&mut self, key: &ShardKey, epoch: u64, state: &str, reason: &str) {
+            if self.history.len() == HISTORY_LIMIT {
+                self.history.pop_front();
+            }
+            self.history.push_back(json!({"key":key,"bot_id":key.bot_id,
+                "shard_id":key.shard_id,"epoch":epoch,"state":state,"reason":reason}));
+        }
+
+        pub fn status(&self) -> Value {
+            let processes: Vec<_> = self
+                .processes
+                .iter()
+                .map(|(key, p)| {
+                    json!({
+                        "key":key,"bot_id":key.bot_id,"shard_id":key.shard_id,
+                        "state":p.state,"epoch":p.epoch,"guardian_pid":p.child.id(),
+                        "gateway_pid":p.gateway_pid,
+                    })
+                })
+                .collect();
+            json!({"processes":processes,"transitions":self.history})
+        }
+
+        pub fn has_process(&self, key: &ShardKey) -> bool {
+            self.processes.contains_key(key)
+        }
+
+        pub async fn apply(&mut self, action: ClusterAction) -> Result<(), &'static str> {
+            match action {
+                ClusterAction::Start {
+                    key,
+                    epoch,
+                    expires_at,
+                } => {
+                    if self.processes.contains_key(&key) {
+                        return Err("test guardian still stopping");
+                    }
+                    let spec = self
+                        .specs
+                        .get(&key)
+                        .ok_or("test shard is not assigned here")?;
+                    let launch = Launch {
+                        program: self.program.clone(),
+                        args: spec
+                            .gateway
+                            .args
+                            .iter()
+                            .map(|a| {
+                                a.to_str()
+                                    .map(str::to_owned)
+                                    .ok_or("test launch arguments must be UTF-8")
+                            })
+                            .collect::<Result<_, _>>()?,
+                        key: key.clone(),
+                        total_shards: spec.total_shards,
+                        node_id: self.node_id,
+                        epoch,
+                        collector: self.collector,
+                        deadline_ms: wire_deadline(expires_at)?,
+                        max_lease_ms: self.max_lease_ms,
+                        stop_grace_ms: self.stop_grace_ms,
+                    };
+                    let executable =
+                        std::env::current_exe().map_err(|_| "test guardian program unavailable")?;
+                    let mut command = Command::new(executable);
+                    command
+                        .args(["--test-cluster-guardian", "--allow-test-quorum"])
+                        .env_clear()
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::null())
+                        .kill_on_drop(false);
+                    #[cfg(windows)]
+                    {
+                        command.env(
+                            "SystemRoot",
+                            std::env::var_os("SystemRoot")
+                                .ok_or("test guardian system environment unavailable")?,
+                        );
+                        command.creation_flags(0x0000_0200 | 0x0800_0000);
+                    }
+                    #[cfg(unix)]
+                    command.process_group(0);
+                    let mut child = command.spawn().map_err(|_| "test guardian spawn failed")?;
+                    let stdout = child
+                        .stdout
+                        .take()
+                        .ok_or("test guardian output unavailable")?;
+                    let sender = self.sender.clone();
+                    let reader_key = key.clone();
+                    let reader = tokio::spawn(async move {
+                        let mut reader = BufReader::new(stdout);
+                        loop {
+                            let mut frame = Vec::new();
+                            let read = (&mut reader).take(4097).read_until(b'\n', &mut frame).await;
+                            if !matches!(read, Ok(1..))
+                                || frame.len() > 4096
+                                || frame.last() != Some(&b'\n')
+                            {
+                                break;
+                            }
+                            let Ok(notice) = serde_json::from_slice::<Notice>(&frame) else {
+                                break;
+                            };
+                            if sender
+                                .send((reader_key.clone(), epoch, notice))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    });
+                    self.processes.insert(
+                        key.clone(),
+                        Process {
+                            epoch,
+                            state: "starting",
+                            child,
+                            gateway_pid: None,
+                            reader,
+                        },
+                    );
+                    self.record(&key, epoch, "starting", "quorum_lease");
+                    // Even a failed write may have delivered the complete launch.
+                    // Retain the guardian handle until reaped; never kill it and
+                    // leave a newly spawned Gateway without its lease watchdog.
+                    write_input(
+                        &mut self
+                            .processes
+                            .get_mut(&key)
+                            .expect("inserted guardian")
+                            .child,
+                        &Input::Launch(launch),
+                    )
+                    .await
+                }
+                ClusterAction::Renew {
+                    key,
+                    epoch,
+                    expires_at,
+                } => {
+                    let process = self
+                        .processes
+                        .get_mut(&key)
+                        .ok_or("test guardian unavailable")?;
+                    if process.epoch != epoch || process.state == "draining" {
+                        return Err("test guardian renewal fenced");
+                    }
+                    write_input(
+                        &mut process.child,
+                        &Input::Renew {
+                            epoch,
+                            deadline_ms: wire_deadline(expires_at)?,
+                        },
+                    )
+                    .await
+                }
+                ClusterAction::Stop { key, reason } => {
+                    if let Some(process) = self.processes.get_mut(&key) {
+                        let epoch = process.epoch;
+                        process.state = "draining";
+                        let result = write_input(&mut process.child, &Input::Stop {}).await;
+                        self.record(&key, epoch, "draining", reason);
+                        result
+                    } else {
+                        Ok(())
+                    }
+                }
+            }
+        }
+
+        /// Reap owned handles, never identify/kill children using a persisted PID.
+        pub fn poll(&mut self) -> Vec<ProcessEvent> {
+            let mut events = Vec::new();
+            while let Ok((key, epoch, notice)) = self.notices.try_recv() {
+                if let Some(process) = self.processes.get_mut(&key) {
+                    if process.epoch != epoch {
+                        continue;
+                    }
+                    if notice.state == "ready" && process.state == "starting" {
+                        process.gateway_pid = notice.gateway_pid;
+                        process.state = "active";
+                        events.push(ProcessEvent::Ready(key.clone()));
+                        self.record(&key, epoch, "active", "gateway_core_ready");
+                    } else if notice.state == "draining" {
+                        process.state = "draining";
+                        self.record(&key, epoch, "draining", "guardian_stop");
+                    }
+                }
+            }
+            let ended: Vec<_> = self
+                .processes
+                .iter_mut()
+                .filter_map(|(key, p)| {
+                    matches!(p.child.try_wait(), Ok(Some(_))).then(|| (key.clone(), p.epoch))
+                })
+                .collect();
+            for (key, epoch) in ended {
+                self.processes.remove(&key);
+                self.record(&key, epoch, "stopped", "guardian_reaped");
+                events.retain(|e| !matches!(e,ProcessEvent::Ready(k) if k == &key));
+                events.push(ProcessEvent::Exited(key));
+            }
+            events
+        }
+    }
+
+    // Tokio's stdin adapter uses a blocking worker that can delay runtime exit.
+    // A detached, bounded reader thread lets a drained guardian exit even while
+    // the still-running parent retains the anonymous input pipe.
+    fn guardian_inputs() -> mpsc::Receiver<Input> {
+        let (sender, receiver) = mpsc::channel(8);
+        std::thread::spawn(move || {
+            let mut input = std::io::stdin().lock();
+            loop {
+                let mut frame = Vec::new();
+                if !matches!(
+                    (&mut input)
+                        .take(PIPE_LIMIT + 1)
+                        .read_until(b'\n', &mut frame),
+                    Ok(1..)
+                ) || frame.len() as u64 > PIPE_LIMIT
+                    || frame.last() != Some(&b'\n')
+                {
+                    break;
+                }
+                let Ok(message) = serde_json::from_slice(&frame) else {
+                    break;
+                };
+                if sender.blocking_send(message).is_err() {
+                    break;
+                }
+            }
+        });
+        receiver
+    }
+
+    fn local_deadline(
+        deadline_ms: u64,
+        max_lease_ms: u64,
+        last_wall: &mut u64,
+    ) -> Result<Instant, &'static str> {
+        let monotonic = Instant::now();
+        let now = wall_ms()?;
+        if now < *last_wall {
+            return Err("test watchdog clock regressed");
+        }
+        *last_wall = now;
+        let remaining = deadline_ms
+            .checked_sub(now)
+            .filter(|v| *v > 0 && *v <= max_lease_ms)
+            .ok_or("test watchdog deadline invalid")?;
+        monotonic
+            .checked_add(Duration::from_millis(remaining))
+            .ok_or("test watchdog deadline overflow")
+    }
+
+    async fn notice(state: &str, pid: Option<u32>, reason: &str) {
+        let Ok(mut bytes) = serde_json::to_vec(&Notice {
+            state: state.into(),
+            gateway_pid: pid,
+            reason: reason.into(),
+        }) else {
+            return;
+        };
+        bytes.push(b'\n');
+        let _ = tokio::time::timeout(Duration::from_millis(10), async {
+            let mut output = tokio::io::stdout();
+            output.write_all(&bytes).await?;
+            output.flush().await
+        })
+        .await;
+    }
+
+    async fn relay(
+        listener: TcpListener,
+        collector: SocketAddr,
+        node_id: u64,
+        epoch: u64,
+        key: ShardKey,
+        pid: u32,
+        ready: mpsc::Sender<()>,
+    ) -> Result<(), &'static str> {
+        let (gateway, peer) = listener
+            .accept()
+            .await
+            .map_err(|_| "test relay accept failed")?;
+        if !peer.ip().is_loopback() {
+            return Err("test relay peer rejected");
+        }
+        let external = TcpStream::connect(collector)
+            .await
+            .map_err(|_| "test relay connect failed")?;
+        let (read_gateway, mut write_gateway) = gateway.into_split();
+        let (mut read_external, mut write_external) = external.into_split();
+        let incoming = async {
+            tokio::io::copy(&mut read_external, &mut write_gateway)
+                .await
+                .map_err(|_| "test relay input failed")?;
+            Ok::<(), &'static str>(())
+        };
+        let outgoing = async {
+            let mut reader = BufReader::new(read_gateway);
+            let mut observed_ready = false;
+            loop {
+                let mut frame = Vec::new();
+                let read = (&mut reader)
+                    .take(PIPE_LIMIT + 1)
+                    .read_until(b'\n', &mut frame)
+                    .await
+                    .map_err(|_| "test relay output failed")?;
+                if read == 0 {
+                    return Ok(());
+                }
+                if frame.len() as u64 > PIPE_LIMIT || frame.last() != Some(&b'\n') {
+                    return Err("test relay frame rejected");
+                }
+                let mut value: Value =
+                    serde_json::from_slice(&frame).map_err(|_| "test relay frame rejected")?;
+                if value["type"] == "ready" {
+                    if observed_ready
+                        || value["pid"].as_u64() != Some(u64::from(pid))
+                        || value["bot_id"].as_u64() != key.bot_id.parse::<u64>().ok()
+                        || value["shard_id"].as_u64() != Some(u64::from(key.shard_id))
+                    {
+                        return Err("test relay identity rejected");
+                    }
+                    observed_ready = true;
+                    value["test_cluster_node_id"] = json!(node_id);
+                    value["ownership_epoch"] = json!(epoch);
+                    value["guardian_pid"] = json!(std::process::id());
+                    frame = serde_json::to_vec(&value).map_err(|_| "test relay encoding failed")?;
+                    frame.push(b'\n');
+                    ready.send(()).await.map_err(|_| "test guardian stopped")?;
+                }
+                write_external
+                    .write_all(&frame)
+                    .await
+                    .map_err(|_| "test relay output failed")?;
+            }
+        };
+        tokio::select! { result=incoming=>result, result=outgoing=>result }
+    }
+
+    /// Internal botd mode, requiring the explicit test flag at the binary entry.
+    /// Only the existing token-free mock Gateway mode is launched. Local wall
+    /// time converts pipe deadlines to a monotonic timer; expiry is never renewed
+    /// by EOF, malformed messages, stale epochs, or a late renewal. Clock skew,
+    /// OS suspend and an unresponsive kernel are outside this loopback experiment.
+    pub async fn run_guardian() -> Result<(), &'static str> {
+        let mut inputs = guardian_inputs();
+        let Some(Input::Launch(launch)) =
+            tokio::time::timeout(Duration::from_secs(3), inputs.recv())
+                .await
+                .map_err(|_| "test guardian bootstrap timeout")?
+        else {
+            return Err("test guardian bootstrap invalid");
+        };
+        if !launch.program.is_absolute()
+            || !launch.collector.ip().is_loopback()
+            || launch.collector.port() == 0
+            || launch.epoch == 0
+            || launch.max_lease_ms > 300_000
+            || launch.stop_grace_ms == 0
+            || launch.stop_grace_ms > 250
+            || launch.key.shard_id >= launch.total_shards
+        {
+            return Err("test guardian configuration invalid");
+        }
+        let mut last_wall = 0;
+        let mut expires = local_deadline(launch.deadline_ms, launch.max_lease_ms, &mut last_wall)?;
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|_| "test relay bind failed")?;
+        let address = listener
+            .local_addr()
+            .map_err(|_| "test relay address unavailable")?;
+        let mut command = Command::new(&launch.program);
+        command
+            .args(&launch.args)
+            .arg("--mock-discord")
+            .arg(address.to_string())
+            .env_clear()
+            .env("BOT_ID", &launch.key.bot_id)
+            .env("SHARD_ID", launch.key.shard_id.to_string())
+            .env("TOTAL_SHARDS", launch.total_shards.to_string())
+            .env("GENERATION_ID", launch.epoch.to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        {
+            command.env(
+                "SystemRoot",
+                std::env::var_os("SystemRoot")
+                    .ok_or("test gateway system environment unavailable")?,
+            );
+            command.creation_flags(0x0000_0200 | 0x0800_0000);
+        }
+        #[cfg(unix)]
+        command.process_group(0);
+        // Check after all preparation, immediately before the process side effect.
+        if Instant::now() >= expires {
+            return Err("test guardian initial lease expired");
+        }
+        let mut child = command.spawn().map_err(|_| "test gateway spawn failed")?;
+        let pid = child.id().ok_or("test gateway identity unavailable")?;
+        let (ready_tx, mut ready_rx) = mpsc::channel(1);
+        let mut relay = tokio::spawn(relay(
+            listener,
+            launch.collector,
+            launch.node_id,
+            launch.epoch,
+            launch.key,
+            pid,
+            ready_tx,
+        ));
+        let mut pipe_open = true;
+        let mut relay_done = false;
+        let mut clock_check = tokio::time::interval(Duration::from_millis(25));
+        let reason = loop {
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(expires.into()) => break "lease_expired",
+                status = child.wait() => {
+                    relay.abort();
+                    notice("stopped",Some(pid),"gateway_exit").await;
+                    return status.map(|_|()).map_err(|_| "test gateway wait failed");
+                }
+                _ = &mut relay => { relay_done=true; break "collector_closed"; }
+                Some(()) = ready_rx.recv() => { notice("ready",Some(pid),"gateway_core_ready").await; }
+                message = inputs.recv(), if pipe_open => match message {
+                    Some(Input::Renew{epoch,deadline_ms}) if epoch == launch.epoch => {
+                        // A queued renewal cannot revive an already expired guardian.
+                        if Instant::now() >= expires { break "lease_expired"; }
+                        match local_deadline(deadline_ms,launch.max_lease_ms,&mut last_wall) {
+                            Ok(next) if next > expires => expires = next,
+                            Ok(_) => {},
+                            Err(_) => break "invalid_lease",
+                        }
+                    }
+                    Some(Input::Stop{}) => break "handoff",
+                    Some(_) => break "invalid_control",
+                    None => pipe_open=false,
+                },
+                _=clock_check.tick() => {
+                    match wall_ms() {
+                        Ok(now) if now >= last_wall => last_wall=now,
+                        _ => break "clock_regressed",
+                    }
+                }
+            }
+        };
+        notice("draining", Some(pid), reason).await;
+        let mut grace = Duration::from_millis(launch.stop_grace_ms);
+        if reason == "handoff" {
+            // An orderly return may use the remainder of its already-approved
+            // lease to drain work. It still stops before the voter's hold can
+            // expire; no peer ACK or local shutdown request extends the lease.
+            grace += expires.saturating_duration_since(Instant::now());
+        }
+        let cooperative = async {
+            if let Some(pipe) = child.stdin.as_mut() {
+                pipe.write_all(crate::shard_runtime::GATEWAY_SHUTDOWN_FRAME)
+                    .await?;
+                pipe.flush().await?;
+            }
+            child.wait().await
+        };
+        if !matches!(tokio::time::timeout(grace, cooperative).await, Ok(Ok(_))) {
+            // Test mode's authorized lease fence: the real Gateway is terminated
+            // before the voter hold expires. Worker stdin closes with its parent.
+            let _ = child.start_kill();
+            child
+                .wait()
+                .await
+                .map_err(|_| "test gateway fence failed")?;
+        }
+        if !relay_done {
+            let _ = tokio::time::timeout(WRITE_WAIT, &mut relay).await;
+            relay.abort();
+        }
+        notice("stopped", Some(pid), reason).await;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[test]
+        fn guardian_deadlines_are_bounded_and_fail_closed() {
+            let now = wall_ms().unwrap();
+            let mut last = now;
+            assert!(local_deadline(now.saturating_sub(1), 1000, &mut last).is_err());
+            assert!(local_deadline(now + 2000, 1000, &mut last).is_err());
+            assert!(local_deadline(now + 500, 1000, &mut last).is_ok());
+            last = now + 10_000;
+            assert!(local_deadline(now + 500, 1000, &mut last).is_err());
+            assert!(wire_deadline(Instant::now() - Duration::from_secs(1)).is_err());
+        }
+        #[test]
+        fn guardian_control_rejects_untrusted_fields() {
+            for input in [
+                r#"{"command":"stop","secret":"synthetic"}"#,
+                r#"{"command":"renew","epoch":1,"deadline_ms":1,"force":true}"#,
+                r#"{"command":"activate"}"#,
+            ] {
+                assert!(serde_json::from_str::<Input>(input).is_err());
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ShardKey {
     pub bot_id: String,

@@ -1,5 +1,6 @@
 pub mod botref;
 pub mod cluster;
+pub mod cluster_runtime;
 mod cogs;
 pub mod daemon;
 pub mod drain;
