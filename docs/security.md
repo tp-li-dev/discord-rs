@@ -1,6 +1,48 @@
 # 秘密情報とログの安全性
 
-2026-11-12 調査・一部適用。基準は architecture.md §4.3 / §13.1。管理・登録・更新・診断 CLI、配置型に加え、worker.rs / main.rs の後述する出力境界に保護を接続した。全ログ経路への適用は未完了。progress.md は PM が統合するため変更していない。
+2026-11-12 調査・適用。基準は architecture.md §4.3 / §13.1。今回の担当範囲の現状は次節、従来の調査と検証履歴は後段に記載する。担当外の logger 等が残るため、リポジトリ全体の秘密保護完了は主張しない。progress.md / handoff.md は今回の指示に従い変更していない。
+
+## 残課題6：今回の出力境界の修正
+
+対象は `redact.rs`、`main.rs`、`bin/doctor.rs`、`bin/register.rs`、`bin/reload.rs`、`bin/manage.rs` と `worker.rs` のログ・エラー出力箇所。daemon.rs、botd.rs、botctl.rs、cogs、framework は変更していない。以下が後段の過去の「未対応」記述より優先する現状である。
+
+| 経路 | 今回の対策と保持する診断 |
+|---|---|
+| 外部 Error / Debug | 未知の Display / Debug / source を呼ばない。`error_diagnostic` は I/O の kind・OSコード、JSON の category・行列位置を保持する。CLI 固有の固定原因は専用エラー型で保持する。 |
+| panic | 対象5実行入口で runtime の生成・引数処理より前に `install_panic_hook()` を設定。payload・スレッド名・ソースパス・backtrace を表示せず、固定 `panic [panic]: [REDACTED]` を出す。以前の hook は呼ばない。unwind/abort と終了コードは変更しない。 |
+| main / Worker | Gateway のエラー種別、Worker の固定原因、I/O/JSON分類を維持。Worker の任意 build 名は表示時に全体を `Secret` で隠す。子の終了コードをテキスト診断にも残す。 |
+| Worker / Gateway 子プロセス | Worker の stderr と manage が起動する Bot の stdout/stderr を null に接続。断片化された秘密・無ラベル秘密を含む任意子出力をログへ継承・保存しない。親の protocol/I/O/終了コード診断は維持する。 |
+| ビルド / reload 子出力 | 原文を表示しない。reload のビルド出力は null に廃棄。manage の収集済み子出力は本文を表示・応答・保存せず、成否と終了コードのみ報告する。子 Cargo にも `--offline` を指定。コンパイラーの自由文による詳細診断は表示できなくなる。 |
+| reload 状態エラー | 自由文 reason は全体を隠し、`worker_update_failed`、許可した phase (update/runtime)、i32 の exit_code を表示する。要求との一致照合用 path は表示しない。 |
+| manage 応答 / last_failure | 自由文 message を診断として信用せず、閉じた診断列挙型と数値の optional wire field を使用。未知・旧 peer の自由文は全体抑制。JSON の不正値も本文を表示しない。status の PID・再起動回数・失敗分類を保持する。 |
+| manage 既存ログ | `logs` は本文を全体抑制する。短い無ラベル秘密を検出できないため、従来のマスク済み本文表示から動作が変わる。既存ログファイルの内容は書き換えない。 |
+| manage 観測値 / 監査 | list-unknown は32桁小文字hexの公開 instance と数値を保持し、他の自由文を隠す。metrics は正規の数値 Bot ID、Shard/世代・既知 role/component・観測数値のみ保持し、自由ラベルを隠す。認可拒否7分類・監査失敗8分類と実行前/後の区別を閉じた wire 診断で保持する。 |
+| doctor / register | 非Unicode引数・環境変数の値は表示しない。doctor の配置検査は既存の固定原因のみ表示。register の preview は入力から構築されないコード内の登録済み静的 schema の表示を維持し、補助的に redact を適用する。Plan Debug は name を全体抑制。 |
+| 鍵 / 構造化フィールド | private_key / signing_key / api_key / password 等のラベル、配列・オブジェクトの秘密値、PEM秘密鍵（未終端も含む）、Authorization の空白継続行を追加保護。文字列マスク単独で任意秘密を識別する保証ではない。 |
+
+Worker の stdout は JSON IPC 専用で、通常の content/state や設定を運ぶ。要求された機能データを消すとプロトコルが壊れるため、診断出力とは区別し、wire 自体の丸ごとマスクは行わない。更新状態ファイルの照合用 path も同様であり、ここに秘密を埋め込まない運用とアクセス制限が必要。任意のアプリ機能データまで秘密を含まないという保証ではない。
+
+担当外に残る箇所：`cogs/mod.rs` の任意 logger と framework の自由文エラー、daemon.rs / botd.rs / botctl.rs の全出力は今回変更していない。特に `--worker` を直接起動した場合、Ready の bot_name は cogs の logger から stderr に出得る。親 Manager から起動した子では stderr を遮断するが、直接起動の出口保護には cogs の logger を固定分類または構造化出力へ変更する別作業が必要。外部ライブラリがプロセス内で独自に書く出力、hook の再置換、ネイティブ abort、クラッシュダンプ・メモリ消去・OS権限は本対策の保証外。
+
+新規試験は担当 Rust ファイル内に置き、自己再起動する子プロセスへ架空の token / secret / key / Authorization と短い無ラベル値を渡し、stdout/stderr と終了コードを検査する。panic の payload・スレッド名、子出力、外部 I/O/JSON エラー、管理応答・保存用失敗分類を対象とする。重い workspace 全試験、release ビルド、実Discordは実行しない。
+
+### 今回の検証結果（Windows / Rust 1.90.0）
+
+`src/` から Cargo はすべて `--offline -p src --jobs 2` で実行した。対象を絞った結果は重複再実行を除き62件成功・1件失敗。子プロセス専用fixtureの4件は通常実行ではignoreされ、親の回帰試験から明示実行される。
+
+| 対象 | 結果 |
+|---|---|
+| `cargo test … --lib redact::tests` | 4件成功。生の無ラベルpanic payload、秘密入りスレッド名、backtrace有効時も検査。 |
+| `cargo test … --lib worker::frame_tests` | 10件成功。初回は試験側の `Command::output()` がstderr設定を上書きして1件失敗したが、本番同様 `spawn().wait_with_output()` に修正後成功。 |
+| `cargo test … --bin src --bin doctor --bin register --bin reload` | 22件成功、子fixture4件ignore。 |
+| `cargo test … --bin manage` | 最終版6件成功。管理応答・子出力・保存診断・監査原因・公開識別子/観測値を確認。 |
+| `cargo test … --test doctor` | 2件成功。 |
+| `cargo test … --test main_security --test register --test redact` | 13件成功。実CLIの起動失敗・不正Worker JSON・正常health wireを含む。 |
+| `cargo test … --test log_redaction` | 2件成功・1件失敗。`management_reply_errors_and_log_display_are_masked` の165行目は旧仕様 `old token=[REDACTED]` の本文表示を期待する。今回は本文全抑制へ変更したため不一致。漏洩を検出した失敗ではない。担当外の試験ファイルは変更していない。PM側で `[log_contents_suppressed]` と秘密不在の期待へ更新が必要。 |
+| `cargo test … --test worker_replay rejected_worker_text_is_hidden_at_manager_boundaries` と `… watch_persists_only_protected_update_failure_text` | 各1件成功。拒否理由の保護、実watchの失敗状態保存、旧Worker継続を確認。 |
+| `cargo test … --test manage independent_commands_manage_a_persistent_core` | 1件成功。認証・権限拒否、status/metrics、再起動と終了診断の既存動作を確認。 |
+
+`cargo clippy --offline -p src --lib --bin src --bin doctor --bin register --bin reload --bin manage --test main_security --test doctor --test register --test redact --test log_redaction --jobs 2 -- -D warnings`、変更Rustファイルの `rustfmt --check --edition 2024`、`git diff --check` は成功。依存追加・commitは行っていない。Linux実行、実Discord/HTTPエラー、本番ログ収集、担当外全経路、全体負荷試験は未検証。
 
 ## 追加 API と適用範囲
 
@@ -32,9 +74,9 @@
 
 ## 制約と検証
 
-ヒューリスティックはすべての秘密を識別できない。未知のラベル、短い無ラベル Interaction token、分割された token、JSON / URL エンコードされたキーやスラッシュ、複数ログレコード間の分割は保証しない。非引用の値は空白・URL 区切り等で終了するため、その後の断片は検出対象外となりうる。非標準の折り返し Authorization（認証値途中の改行）も保証しない。必要なら構造化データ段階でフィールドを丸ごと隠す。誤検出により通常文章を隠すこともある。
+ヒューリスティックはすべての秘密を識別できない。未知のラベル、短い無ラベル Interaction token、分割された token、JSON / URL エンコードされたキーやスラッシュ、複数ログレコード間の分割は保証しない。非引用の値は空白・URL 区切り等で終了するため、その後の断片は検出対象外となりうる。Authorization は改行後に SP/TAB がある継続行を隠すが、任意の改行・分割を復元して検出する保証ではない。必要なら構造化データ段階でフィールドを丸ごと隠す。誤検出により通常文章を隠すこともある。
 
-入力文字列や一時コピーはメモリに残る。改行によるログ偽装の防止、ログ容量制限、クラッシュダンプ・外部ライブラリ独自ログ・Gateway 子プロセスの直接出力の保護は未対応。純関数を呼ばない出力先には効果がない。ビルドの stdout/stderr は終了までメモリに収集してからマスク・表示するため、表示が遅れ、出力量に比例してメモリを使う。
+入力文字列や一時コピーはメモリに残る。改行によるログ偽装の一般的防止、ログ容量制限、クラッシュダンプ・外部ライブラリ独自ログの包括的保護は未対応。純関数を呼ばない出力先には効果がない。今回、対象の親から起動する Worker / Bot 子の出力は前節のとおり遮断した。manage の build/reload 出力は終了までメモリに収集するため出力量に比例してメモリを使うが、原文を表示・ログ保存しない。reload 自身のビルド子出力は収集せず廃棄する。
 
 ## 既存経路への適用（2026-11-12）
 
@@ -62,7 +104,7 @@
 
 更新状態ファイルの成功パスと失敗 JSON の `path` は、reload が要求と応答を完全一致で照合するための制御データであり、引き続き正確なパスを保持する。診断ログには出力しない。パスを含む wire データ全体のマスクや状態ファイルのアクセス権変更は行っていない。この照合フィールドへ秘密を埋め込まない運用とファイル権限制限が必要であり、任意のファイル名の秘密まで保存されないという保証ではない。
 
-担当外の `cogs/mod.rs` / framework の任意 logger は未変更で、Ready の bot_name を表示し得る。アプリの panic hook、子プロセス自身の stderr、Twilight 等の独自ログもこの境界では保護しない。TaskManager がパニックを固定分類へ変換しても、標準 panic hook の出力保護を意味しない。
+担当外の `cogs/mod.rs` / framework の任意 logger は未変更で、直接 Worker を起動すれば Ready の bot_name を表示し得る。今回、対象実行入口の panic hook と親から起動する子の出力を保護した（前節参照）。Twilight 等のプロセス内独自ログ全体を保護するグローバルなログフィルターは実装していない。TaskManager のパニック分類だけに秘密保護を依存しない。
 
 `src/tests/main_security.rs` は実バイナリの欠落・非 Unicode token、不正 Worker JSON（短い無ラベル秘密を含む）、正常 health wire を確認する。main の単体試験は、外部 Display / Debug を実行しないこと、token 読込分類、Interaction identity の HTTP 相当クロージャへの引渡しを確認する。`src/tests/worker_replay.rs` は未信頼のコマンド・restore 拒否理由の保護と、実 watch が書く失敗状態の診断文字列の保護、旧 Worker 継続を確認する。すべて架空値を使用する。実 Discord・実 HTTP の例外ログと Linux は未検証。
 
