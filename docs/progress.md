@@ -175,3 +175,12 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - 実行中：zdtfix（上記の修正）、raftwire（Raft runtime の botd 配線。既定無効・模擬 Discord のみ）。完了後は `ci-verify` ブランチで Actions 検証を先行し、main へは確認後に反映する。
 - 範囲：実 Discord での検証（接続、Slash 登録、Interaction 3秒、Identify/Resume）はユーザーが実施する。手順は docs/real-discord-verification.md。それより前の手順（模擬環境での実装・試験と CI）を完成の範囲とする。
 - 未検証のまま：実 Discord、複数ホストの実障害、OS suspend、本番での Raft 有効化（起動は拒否のまま）、Windows ACL のディレクトリ対応、メトリクスの daemon 接続、永続 Subscription/ジョブの Worker 接続。
+
+## 2026-11-12 終了時点（Codex クオータ切れで中断）
+- Codex の利用枠が尽きた（次回利用可能: 2026-11-18 18:17 頃）。以降の Codex 方針: Luna max の高速モードを主、Terra は medium、Astra は設計・最終チェックのみ（コスパ重視）。
+- 中断した作業は WIP としてブランチに保全済み（origin に push 済み、いずれも未検証・main 未統合）：
+  - `codex/zdtfix`：無停止更新の修正。4ケース中3つ（連続更新、Gateway 切替、旧 Worker クラッシュ）は欠落0・ACK 47ms 以内。残る『ハンドラー実行後・結果返却前のクラッシュ』は仕様上の限界（結果不明）。次は `tests/update_load.rs` を、(1) 厳格な通常テスト、(2) 結果不明の #[ignore] テスト、に分割してから main へ統合する（分割しないと CI が失敗する）。
+  - `codex/raftwire`：Raft runtime の botd 配線（既定無効・模擬 Discord のみ）と 3 プロセス E2E。ほぼ実装済みで未検証。
+  - `codex/finaldocs`：docs の最終整備（benchmarks, conformance, developer-guide, known-limitations, operator-guide, security を途中まで更新）。事実照合が未了。
+- 要調査：Actions の手動 stress（suite=acl、repeat=5）で Ubuntu iteration 1 と Windows iteration 4 が失敗。Windows ACL の CI 差の修正が完全には効いていない可能性がある。ログ確認から始める。main の Windows テストの結果は未確認のまま。
+- 再開手順：`gh run list` で Actions を確認 → 上記3ブランチを `ci-verify` 等で Actions 検証 → 問題なければ main へ統合。ローカルの重い全体試験は避け、Actions（ci.yml、stress.yml、bench.yml）で行う。
