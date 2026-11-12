@@ -143,3 +143,6 @@ Worker の双方向受信に 1 MiB、管理要求に 4095 byte（改行込み）
 
 ## 残課題（次段階）
 Linux と GitHub Actions での実行確認、実 Discord での接続・登録・Interaction 応答・Identify 検証、実 openraft 組込みと永続ストレージ、Daemon↔Gateway/Core の実本番配線（Worker を Core 代替から Shard 単位 Core へ）、StateStore と framework コンポーネント経路の Worker 接続、update/rollback、証明書失効・ローテーション、Windows ACL、性能の Linux 再測定。
+
+## 引き継ぎ
+別環境への移行用に、方針・PM/Codex 並列の進め方・運用上の注意・残課題を [handoff.md](handoff.md) にまとめた（2026-11-12）。
