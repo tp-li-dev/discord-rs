@@ -1,0 +1,5 @@
+error: cog command must be async and take &self and one Context; typed arguments are not yet supported
+ --> tests/ui/cog_arguments.rs:6:5
+  |
+6 |     async fn add(&self, _ctx: Context<'_>, _value: u64) -> BotResult<()> { Ok(()) }
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

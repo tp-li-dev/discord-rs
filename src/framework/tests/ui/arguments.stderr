@@ -1,0 +1,5 @@
+error: required arguments must precede optional arguments
+ --> tests/ui/arguments.rs:3:58
+  |
+3 | async fn ping(_ctx: Context<'_>, _value: Option<String>, _required: i64) -> BotResult<()> { Ok(()) }
+  |                                                          ^^^^^^^^^^^^^^

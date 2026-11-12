@@ -52,7 +52,15 @@ async fn independent_commands_manage_a_persistent_core() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let output = cli(&runtime, port, "status").await;
+    // An unauthenticated client that never sends a frame must not block
+    // authenticated requests for the read timeout.
+    let idle = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let output = tokio::time::timeout(Duration::from_millis(1500), cli(&runtime, port, "status"))
+        .await
+        .expect("idle client blocked management");
+    drop(idle);
     assert!(
         output.status.success(),
         "{}",
@@ -65,6 +73,19 @@ async fn independent_commands_manage_a_persistent_core() {
     assert!(cli(&runtime, port, "start").await.status.success());
     assert!(cli(&runtime, port, "restart").await.status.success());
     std::fs::write(runtime.join("fail"), "fail").unwrap();
+    let idle = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let output = tokio::time::timeout(Duration::from_millis(1000), cli(&runtime, port, "status"))
+        .await
+        .expect("idle client blocked supervision");
+    let status = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        status.contains("自動再起動: 1/3") || status.contains("自動再起動: 2/3"),
+        "{status}"
+    );
+    drop(idle);
     let mut saw_failure = false;
     for _ in 0..30 {
         tokio::time::sleep(Duration::from_millis(500)).await;

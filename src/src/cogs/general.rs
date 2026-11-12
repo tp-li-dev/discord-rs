@@ -1,4 +1,38 @@
-use super::{Job, State};
+use super::{FrameworkCounter, Job, State};
+use bot_framework::prelude::*;
+use std::sync::atomic::Ordering;
+
+#[hybrid_command(name = "ping", description = "Check response")]
+async fn ping(ctx: Context<'_>) -> BotResult<()> {
+    ctx.reply("Pong! 🦀").await
+}
+
+/// Small typed-argument example for the prefix path.
+#[hybrid_command(name = "greet", description = "Greet a user")]
+async fn greet(ctx: Context<'_>, name: String, count: Option<i64>) -> BotResult<()> {
+    ctx.reply(format!("Hello, {name}! ({})", count.unwrap_or(1)))
+        .await
+}
+
+/// Demonstrates process-local typed state, distinct from the snapshot-backed !count.
+#[hybrid_command(
+    name = "state_counter",
+    description = "Increment process-local counter"
+)]
+async fn state_counter(ctx: Context<'_>) -> BotResult<()> {
+    let value = ctx
+        .state::<FrameworkCounter>()?
+        .0
+        .fetch_add(1, Ordering::Relaxed)
+        + 1;
+    ctx.reply(format!("State counter: {value}")).await
+}
+
+#[event]
+async fn on_ready(ctx: EventContext<'_>, ready: ReadyEvent) -> BotResult<()> {
+    ctx.log_info(&format!("Ready: {}", ready.bot_name));
+    Ok(())
+}
 
 pub const BUILD_ID: &str = match option_env!("DISCORD_BUILD_ID") {
     Some(value) => value,
@@ -7,7 +41,6 @@ pub const BUILD_ID: &str = match option_env!("DISCORD_BUILD_ID") {
 
 pub fn dispatch(key: u64, content: &str, state: &mut State) -> Option<String> {
     match content.trim() {
-        "!ping" => Some("Pong! 🦀".to_owned()),
         "!version" => Some(format!(
             "Workerビルド: {BUILD_ID} / PID: {}",
             std::process::id()

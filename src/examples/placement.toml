@@ -1,0 +1,43 @@
+# Placement intent only: the current daemon does not consume this file.
+[cluster]
+id = "example"
+mode = "quorum"
+
+[node]
+id = "server-a"
+
+[failover]
+heartbeat_ms = 500
+suspect_after_ms = 1500
+unhealthy_after_ms = 3000
+failback_stable_ms = 30000
+
+[[bots]]
+name = "first"
+bot_id = "bot-one"
+application_id = "123456789012345678"
+token_env = "FIRST_BOT_TOKEN"
+total_shards = 2
+prefix = "!"
+
+[[bots.shard_placement]]
+shard_id = 0
+primary = "server-a"
+failover = ["server-b"]
+
+[[bots.shard_placement]]
+shard_id = 1
+primary = "server-b"
+failover = ["server-a"]
+
+[[bots]]
+name = "second"
+bot_id = "bot-two"
+application_id = "223456789012345678"
+token_env = "SECOND_BOT_TOKEN"
+total_shards = "auto"
+
+[[bots.shard_placement]]
+shard_id = 0
+primary = "server-b"
+failover = ["server-a"]

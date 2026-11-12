@@ -4,16 +4,35 @@ use std::{
     error::Error,
     path::{Path, PathBuf},
     process::Stdio,
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
     process::{Child, Command},
+    sync::{Semaphore, mpsc},
 };
 
 type ErrorBox = Box<dyn Error + Send + Sync>;
 const DEFAULT_PORT: u16 = 39483;
+// Includes the newline. Reject oversized or incomplete requests without buffering them.
+const MAX_REQUEST_BYTES: usize = 4095;
+
+async fn read_frame<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    limit: usize,
+) -> std::io::Result<Option<Vec<u8>>> {
+    let mut line = Vec::new();
+    reader
+        .take((limit + 1) as u64)
+        .read_until(b'\n', &mut line)
+        .await?;
+    if line.len() > limit || line.last() != Some(&b'\n') {
+        return Ok(None);
+    }
+    Ok(Some(line))
+}
 
 #[derive(Serialize, Deserialize)]
 struct Endpoint {
@@ -86,13 +105,13 @@ async fn request(command: &str) -> Result<String, ErrorBox> {
     })?;
     data.push(b'\n');
     stream.write_all(&data).await?;
-    let mut line = String::new();
-    tokio::time::timeout(
+    let line = tokio::time::timeout(
         Duration::from_secs(600),
-        BufReader::new(stream).read_line(&mut line),
+        read_frame(&mut BufReader::new(stream), 64 * 1024),
     )
-    .await??;
-    let reply: Reply = serde_json::from_str(&line)?;
+    .await??
+    .ok_or("invalid or oversized management reply")?;
+    let reply: Reply = serde_json::from_slice(&line)?;
     if !reply.ok {
         return Err(reply.message.into());
     }
@@ -159,11 +178,31 @@ async fn core(binary: PathBuf) -> Result<(), ErrorBox> {
     let mut last_failure: Option<String> = None;
     let mut started = tokio::time::Instant::now();
     let mut supervision = tokio::time::interval(Duration::from_secs(2));
+    let readers = Arc::new(Semaphore::new(32));
+    let (requests_tx, mut requests_rx) = mpsc::channel::<(Request, BufReader<TcpStream>)>(32);
     write_endpoint(&endpoint).await?;
     println!("コアを起動しました。BotのDiscord接続状態はログで確認してください。");
     loop {
-        let (stream, _) = tokio::select! {
-            accepted = listener.accept() => accepted?,
+        let (input, mut reader) = tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, _) = accepted?;
+                let Ok(permit) = readers.clone().try_acquire_owned() else { continue };
+                let sender = requests_tx.clone();
+                let expected_secret = secret.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let mut reader = BufReader::new(stream);
+                    let Ok(Ok(Some(line))) = tokio::time::timeout(
+                        Duration::from_secs(3), read_frame(&mut reader, MAX_REQUEST_BYTES)
+                    ).await else { return };
+                    let Ok(input) = serde_json::from_slice::<Request>(&line) else { return };
+                    if input.secret == expected_secret {
+                        let _ = sender.try_send((input, reader));
+                    }
+                });
+                continue;
+            },
+            Some(request) = requests_rx.recv() => request,
             _ = supervision.tick() => {
                 if let Some(process) = bot.as_mut() {
                     if let Some(status) = process.try_wait()? {
@@ -181,18 +220,6 @@ async fn core(binary: PathBuf) -> Result<(), ErrorBox> {
                 continue;
             }
         };
-        let mut reader = BufReader::new(stream);
-        let mut line = String::new();
-        let read = tokio::time::timeout(Duration::from_secs(3), reader.read_line(&mut line)).await;
-        if !matches!(read, Ok(Ok(n)) if n > 0 && n < 4096) {
-            continue;
-        }
-        let Ok(input) = serde_json::from_str::<Request>(&line) else {
-            continue;
-        };
-        if input.secret != secret {
-            continue;
-        }
         if let Some(process) = bot.as_mut()
             && let Some(status) = process.try_wait()?
         {
@@ -245,7 +272,8 @@ async fn core(binary: PathBuf) -> Result<(), ErrorBox> {
         };
         let mut data = serde_json::to_vec(&reply)?;
         data.push(b'\n');
-        let _ = reader.get_mut().write_all(&data).await;
+        let _ =
+            tokio::time::timeout(Duration::from_secs(3), reader.get_mut().write_all(&data)).await;
         if exit {
             break;
         }
@@ -338,5 +366,37 @@ async fn main() -> Result<(), ErrorBox> {
             );
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod request_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn request_frame_limits_and_termination() {
+        let valid = vec![b'x'; MAX_REQUEST_BYTES - 1]
+            .into_iter()
+            .chain(*b"\n")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            read_frame(&mut BufReader::new(valid.as_slice()), MAX_REQUEST_BYTES)
+                .await
+                .unwrap(),
+            Some(valid)
+        );
+        let oversized = vec![b'x'; MAX_REQUEST_BYTES + 100];
+        assert!(
+            read_frame(&mut BufReader::new(oversized.as_slice()), MAX_REQUEST_BYTES)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            read_frame(&mut BufReader::new(&b"unfinished"[..]), MAX_REQUEST_BYTES)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

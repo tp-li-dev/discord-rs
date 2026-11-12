@@ -1,0 +1,5 @@
+error: duplicate attribute
+ --> tests/ui/attributes.rs:3:33
+  |
+3 | #[hybrid_command(name = "ping", name = "pong")]
+  |                                 ^^^^

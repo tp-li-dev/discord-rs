@@ -27,6 +27,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let status = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
         .current_dir(&root)
         .env("DISCORD_BUILD_ID", &build)
+        .env_remove("DISCORD_TOKEN")
         .args(["build", "--release", "--bin", "src", "--target-dir"])
         .arg(&target)
         .status()?;

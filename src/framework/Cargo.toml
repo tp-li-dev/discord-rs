@@ -1,0 +1,13 @@
+[package]
+name = "bot-framework"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+bot-framework-macros = { path = "../framework-macros" }
+inventory = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
+trybuild = "1"

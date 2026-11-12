@@ -1,0 +1,5 @@
+error: command must be async
+ --> tests/ui/not_async.rs:4:1
+  |
+4 | fn ping(_ctx: Context<'_>) -> BotResult<()> { Ok(()) }
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

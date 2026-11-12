@@ -4,10 +4,19 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+bot-framework = { path = "framework" }
 rustls = { version = "0.23.46", features = ["ring"] }
 tokio = { version = "1.54.1", features = ["full"] }
 twilight-gateway = "0.18"
+twilight-gateway-queue = "0.18"
 twilight-http = "0.18"
+twilight-model = "0.18"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "1.2"
 getrandom = "0.4"
+subtle = "2"
+
+[workspace]
+members = ["framework", "framework-macros"]
+resolver = "3"
