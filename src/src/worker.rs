@@ -27,6 +27,69 @@ const OPTIONAL_CAPABILITIES: &[&str] = &[
 ];
 const IDENTITY_ENV: &str = "BOT_WORKER_IPC_IDENTITY";
 
+/// Deployment metadata only; this is not an ownership/lease grant.
+/// BOT_ID, SHARD_ID, TOTAL_SHARDS default to 0, 0, 1. GENERATION_ID,
+/// when supplied, is the first child generation, incremented on every spawn.
+pub struct DeploymentIdentity {
+    pub bot_id: crate::protocol::BotId,
+    pub shard: crate::protocol::Shard,
+    generation: Option<std::sync::atomic::AtomicU64>,
+}
+impl DeploymentIdentity {
+    pub fn from_env() -> Result<Self, AppError> {
+        Self::parse(|name| match std::env::var(name) {
+            Ok(value) => Ok(Some(value)),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(_) => Err("invalid deployment environment"),
+        })
+    }
+
+    /// Pure parser for environment-like inputs; errors never echo input values.
+    pub fn parse(
+        mut lookup: impl FnMut(&str) -> Result<Option<String>, &'static str>,
+    ) -> Result<Self, AppError> {
+        fn number(value: Option<String>, default: u64) -> Result<u64, AppError> {
+            match value {
+                None => Ok(default),
+                Some(value) if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) => {
+                    value
+                        .parse()
+                        .map_err(|_| "invalid deployment number".into())
+                }
+                Some(_) => Err("invalid deployment number".into()),
+            }
+        }
+        let bot_id = crate::protocol::BotId(number(lookup("BOT_ID")?, 0)?);
+        let id = u32::try_from(number(lookup("SHARD_ID")?, 0)?).map_err(|_| "invalid shard id")?;
+        let total = u32::try_from(number(lookup("TOTAL_SHARDS")?, 1)?)
+            .map_err(|_| "invalid shard total")?;
+        let generation = lookup("GENERATION_ID")?
+            .map(|value| number(Some(value), 0).map(std::sync::atomic::AtomicU64::new))
+            .transpose()?;
+        Ok(Self {
+            bot_id,
+            shard: crate::protocol::Shard::new(id, total)?,
+            generation,
+        })
+    }
+
+    fn next_identity(&self) -> Result<crate::protocol::Identity, AppError> {
+        use std::sync::atomic::Ordering;
+        let generation = match &self.generation {
+            Some(next) => next
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+                .map_err(|_| "worker generation exhausted")?,
+            None => getrandom::u64()?,
+        };
+        Ok(crate::protocol::Identity {
+            bot_id: self.bot_id,
+            shard: self.shard,
+            generation_id: crate::protocol::GenerationId(generation),
+            ownership_epoch: crate::protocol::OwnershipEpoch(0),
+        })
+    }
+}
+
 fn local_hello(identity: crate::protocol::Identity) -> crate::protocol::Hello {
     crate::protocol::Hello {
         protocol_min: PROTOCOL as u16,
@@ -217,15 +280,8 @@ struct Process {
     supported_capabilities: Vec<String>,
 }
 impl Process {
-    async fn start(path: &Path) -> Result<Self, AppError> {
-        // Demo Manager has no placement identity yet. Bind each child to a fresh
-        // generation; Bot/Shard remain the single demo context until runtime wiring.
-        let identity = crate::protocol::Identity {
-            bot_id: crate::protocol::BotId(0),
-            shard: crate::protocol::Shard::new(0, 1)?,
-            generation_id: crate::protocol::GenerationId(getrandom::u64()?),
-            ownership_epoch: crate::protocol::OwnershipEpoch(0),
-        };
+    async fn start(path: &Path, deployment: &DeploymentIdentity) -> Result<Self, AppError> {
+        let identity = deployment.next_identity()?;
         let hello = local_hello(identity.clone());
         let mut child = Command::new(path)
             .arg("--worker")
@@ -322,6 +378,7 @@ struct Active {
     process: Arc<Mutex<Process>>,
 }
 pub struct Manager {
+    deployment: DeploymentIdentity,
     workers: Vec<RwLock<Active>>,
     update: Mutex<()>,
     replace_lock: Mutex<()>,
@@ -360,12 +417,19 @@ impl Manager {
         Self::start_pool(path, 2).await
     }
     pub async fn start_pool(path: PathBuf, count: usize) -> Result<Arc<Self>, AppError> {
+        Self::start_pool_with_identity(path, count, DeploymentIdentity::from_env()?).await
+    }
+    pub async fn start_pool_with_identity(
+        path: PathBuf,
+        count: usize,
+        deployment: DeploymentIdentity,
+    ) -> Result<Arc<Self>, AppError> {
         if count == 0 {
             return Err("Worker数は1以上にしてください".into());
         }
         let mut workers = Vec::with_capacity(count);
         for _ in 0..count {
-            let process = Process::start(&path).await?;
+            let process = Process::start(&path, &deployment).await?;
             workers.push(RwLock::new(Active {
                 path: path.clone(),
                 process: Arc::new(Mutex::new(process)),
@@ -375,6 +439,7 @@ impl Manager {
         getrandom::fill(&mut instance)?;
         let instance_id = instance.iter().map(|byte| format!("{byte:02x}")).collect();
         Ok(Arc::new(Self {
+            deployment,
             workers,
             instance_id,
             update: Mutex::new(()),
@@ -404,7 +469,7 @@ impl Manager {
             if !force && worker.read().await.path == path {
                 continue;
             }
-            let mut process = Process::start(&path).await?;
+            let mut process = Process::start(&path, &self.deployment).await?;
             // Exclusive lock drains accepted requests and queues new ones during migration.
             let mut active = worker.write().await;
             let snapshot = active
@@ -605,7 +670,7 @@ impl Manager {
             if Arc::ptr_eq(&active.process, &process) {
                 let path = active.path.clone();
                 drop(active);
-                match Process::start(&path).await {
+                match Process::start(&path, &self.deployment).await {
                     Ok(mut new_process) => {
                         if let Some(state) = checkpoint {
                             match new_process
