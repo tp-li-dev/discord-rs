@@ -8,7 +8,7 @@
 
 ### 設定と対象範囲
 
-`botd` は `cluster.mode = "standalone"`、`node.remote_bind` 未指定、固定Shard数の設定だけを受け付けます。設定の `node.id` と一致するprimaryのShardを起動・操作します。他ホストに配置したShardの状態は取得せず、配置情報とローカル観測の有無を区別して返します。未解決の `total_shards = "auto"`、quorum構成、遠隔bind指定は起動エラーです。
+通常の `botd` は `cluster.mode = "standalone"`、`node.remote_bind` 未指定、固定Shard数の設定を受け付けます。設定の `node.id` と一致するprimaryのShardを起動・操作します。他ホストに配置したShardの状態は取得せず、配置情報とローカル観測の有無を区別して返します。未解決の `total_shards = "auto"`、遠隔bind指定は起動エラーです。quorum構成は明示的な試験オプションと模擬Discordを必要とし、本番分散合意ではありません（[試験経路](shard-runtime-design.md) 参照）。
 
 **実 `src` Gatewayには数値Bot IDが必要です。** 配置・daemonは文字列IDを許容しますが、実Worker IPCの `BotId(u64)` に合わせ、`bot_id = "101"` のようなu64の正規の10進数文字列を指定してください。UUID・任意文字列は配置検査に成功しても実Gatewayの起動で失敗します。`"001"` や `"+1"` も、別の文字列IDを同じIPC identityへ混同しないため拒否します。暗黙のハッシュ変換は行いません。Botの表示名には従来どおり名前を使用できます。
 
@@ -98,7 +98,7 @@ Workerへ戻すのはHTTPステータスまたは結果不明で、HTTP本文・
 cargo test --offline --test e2e_shard_runtime
 ```
 
-この試験は実Discordの登録・接続・REST、Bot全体のIdentify/REST予算、quorum/lease、Gateway新旧WebSocketのActive切替を検証するものではありません。`--offline` だけでは実行プログラムのDiscord通信は無効にならず、模擬モードの明示が必要です。
+この試験は実Discordの登録・接続・REST、Bot全体のIdentify/REST予算、quorum/lease、Gateway新旧WebSocketのActive切替を検証するものではありません。別の `e2e_gateway_process_switch` は明示試験モードで実Gatewayプロセスの新旧切替を模擬Discord上で扱いますが、実WebSocket切替や本番安全性の証明ではありません。`--offline` だけでは実行プログラムのDiscord通信は無効にならず、模擬モードの明示が必要です。
 
 ### 状態表示と操作
 
@@ -153,7 +153,28 @@ botctl operation 0123456789abcdef0123456789abcdef --bootstrap-stdin --json
 
 daemon終了時に子を無条件でkillしません。子が残る可能性があるため起動予約を保持し、再起動後の重複起動を拒否します。PID・起動世代・OS開始時刻・認証済みIPCによる孤児の照合と再採用は未実装です。予約を削除して新しい子を起動する前に外部で実態の確認が必要です。ランタイムrootの別名・シンボリックリンク・Windows ACL、OSやサービス管理側による子の終了、停電時の永続性は保証していません。
 
-`botctl update` / `rollback` は未実装エラーです。Core/Gateway更新・rollbackを成功したようには表示しません。`create`、`logs`、`nodes`、`doctor` などのdaemon機能も未提供で、既存の `manage` / `reload` / `doctor` は以下の別経路を利用します。
+`botctl update` / `rollback` はオフライン計画を作成できますが、daemonによる実行は未接続です。実行要求は拒否し、Core/Gateway更新・rollbackを成功したようには表示しません。`create`、`logs`、`nodes`、`doctor` などのdaemon機能も未提供で、既存の `manage` / `reload` / `doctor` は以下の別経路を利用します。
+
+## 更新・rollbackのオフライン計画：botctl
+
+`update` / `rollback` はJSON manifestを必須とし、既定でdry-runです。`--component` の既定は `core`、選択肢は `core` / `gateway` / `all` です。Gatewayを含む計画にはIdentify制限の観測値も必要です。manifest形式の例と制約は [update_rollback.rs](../src/src/update_rollback.rs) を参照してください。パスはmanifestのディレクトリから解決し、対象成果物のSHA-256を照合します。秘密情報をmanifestに含めないでください。
+
+```sh
+cargo run --offline --bin botctl -- update BOT --plan manifest.json --component core --dry-run --json
+cargo run --offline --bin botctl -- rollback BOT --plan manifest.json --component core --dry-run --json
+```
+
+rollbackでも候補のプロセス世代は現在より大きくします。計画中のIdentify情報は入力された観測値に基づく推定であり、残量予約、最新状態、quorum・lease、所有権、準備完了の証明ではありません。ハッシュ一致も署名、実行可能性、将来の起動時点のファイル一致を保証しません。
+
+`--yes --bootstrap-stdin` による実行は未接続エラーとなり、daemonに接続も要求送信もしません。計画の成功は実更新・rollbackの成功ではありません。新旧切替や結果不明の処理については実装側の統合と検証が必要です。
+
+## 試験実装と運用上の境界
+
+- `fs_perms` は開いたハンドルに対しUnixのファイル `0600` / ディレクトリ `0700` のモードと種別を検査・設定する補助APIです。所有者、POSIX ACL、親ディレクトリ、ハードリンクや実際のアクセス制御は検証しません。書込み前の安全な作成が必要です。WindowsではACLを近似せず `Unsupported` を返します。このAPIの存在だけで管理ファイルの保護を保証しません。
+- mTLS transportには失効リストとリーフ証明書の重複期間を設けた更新APIがあります。信頼できるプロセス内呼び出し専用で、配布・永続化・ファイル監視・CA更新・遠隔管理はありません。再起動後はpolicy復元までlistenerを隔離する必要があります。適用済みメッセージや送信済みバイトは取り消せず、ACK消失時の配送結果も不明になり得ます。実運用の証明書更新手順が完成したことを意味しません。
+- OpenRaftを使う永続ownership coordinatorは実験的で、botdに接続されておらず本番起動を拒否します。固定membershipで、クラッシュ後の自動引継ぎや強制解除はありません。ローカル期限切れだけで他ホストへの引継ぎを許可しません。
+- Gatewayのプロセス切替経路は `--allow-test-gateway-switch`、`--mock-discord`、`--mock-identify-budget` を必要とするstandalone自動起動の試験専用です。実Discord・本番Gateway更新には使えません。試験では新旧プロセスと模擬応答を観測しますが、実ネットワークや障害全般の無停止・無欠落を保証しません。
+- frameworkの `FrameworkStateStore` はBot/Shardとnamespaceに束縛したコンポーネント状態のアダプターです。メモリbackendの状態は揮発性であり、アダプターを使ってもWorkerの実経路への接続や再起動・ホスト障害を跨ぐ永続化は保証されません。
 
 ## オフライン配置検査：doctor
 
@@ -236,7 +257,7 @@ cargo run --offline --bin reload -- general
 
 reloadはreleaseビルド → `src/workers/` への成果物コピー → `src/worker-path.txt` に更新先を書き込み → 完了確認を行います。確認待ちは約20秒で、timeoutや失敗後も更新要求は残り、親が再試行し得ます。直ちに再実行せず、ログと `!workers` / `!version` で実状態を確認してください。ビルドIDはコードの差分を証明しません。
 
-上記は従来のmanage/reload経路です。botd配下のGatewayはShard別のWorker更新監視ファイルを使用するため、共有の既定ファイルを書き換えて全Shardを更新できるとは扱わないでください。botctlのCore更新コマンドは未実装です。
+上記は従来のmanage/reload経路です。botd配下のGatewayはShard別のWorker更新監視ファイルを使用するため、共有の既定ファイルを書き換えて全Shardを更新できるとは扱わないでください。botctlのCore更新は計画のみで、実行は未実装です。
 
 対応capabilityを交渉できた場合、snapshotを引き継いだ新Workerへの配送を開始し、旧Workerの受付済み処理と外部応答の確認を並行して待ちます。旧版が対応しない場合は直列切替です。別Workerは処理を継続できます。途中失敗時は切替済みWorkerが新版、未切替Workerが旧版のまま残り得ます。全体を旧版へ戻す原子的rollbackやCLIはありません。切替前に結果不明があれば更新を拒否し、切替後に不明になった場合は新版をActiveのまま旧世代の記録を保持します。`list-unknown` で照会できますが、照合・解除CLIや永続的な結果不明操作の記録は未実装です。再起動で追跡が消えても外部操作の成否が判明したことにはなりません。
 
