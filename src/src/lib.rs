@@ -23,6 +23,7 @@ pub mod state_store;
 pub mod supervisor;
 pub mod switch;
 pub mod testkit;
+pub mod tls_transport;
 pub mod update_gate;
 pub mod worker;
 
