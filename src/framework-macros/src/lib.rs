@@ -407,3 +407,147 @@ fn command_arguments<'a>(
         values,
     })
 }
+
+/// Register a message component handler for a namespaced, versioned route.
+#[proc_macro_attribute]
+pub fn component(args: TokenStream, input: TokenStream) -> TokenStream {
+    interaction_handler(args, input, false)
+}
+
+/// Register a modal handler for a namespaced, versioned route.
+#[proc_macro_attribute]
+pub fn modal(args: TokenStream, input: TokenStream) -> TokenStream {
+    interaction_handler(args, input, true)
+}
+
+fn interaction_handler(args: TokenStream, input: TokenStream, modal: bool) -> TokenStream {
+    let function = parse_macro_input!(input as ItemFn);
+    let sig = &function.sig;
+    if sig.asyncness.is_none()
+        || sig.unsafety.is_some()
+        || sig.abi.is_some()
+        || !sig.generics.params.is_empty()
+        || sig.generics.where_clause.is_some()
+        || sig.receiver().is_some()
+        || sig.inputs.len() != 1
+    {
+        return syn::Error::new_spanned(sig, "interaction handler must be an async, non-generic safe function taking one InteractionContext")
+            .into_compile_error().into();
+    }
+    let args = match Punctuated::<syn::MetaNameValue, Token![,]>::parse_terminated.parse(args) {
+        Ok(args) => args,
+        Err(error) => return error.into_compile_error().into(),
+    };
+    let mut namespace = None;
+    let mut name = None;
+    let mut version = None;
+    for arg in args {
+        if arg.path.is_ident("namespace") || arg.path.is_ident("name") {
+            let syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(value),
+                ..
+            }) = arg.value
+            else {
+                return syn::Error::new_spanned(arg.path, "expected a string literal")
+                    .into_compile_error()
+                    .into();
+            };
+            if value.value().is_empty()
+                || value.value().len() > 24
+                || !value.value().as_bytes()[0].is_ascii_lowercase()
+                || !value
+                    .value()
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+                || [
+                    "token",
+                    "secret",
+                    "password",
+                    "authorization",
+                    "bearer",
+                    "credential",
+                    "private_key",
+                    "api_key",
+                ]
+                .iter()
+                .any(|s| value.value().contains(s))
+            {
+                return syn::Error::new_spanned(
+                    value,
+                    "route label must match StateStore public label rules",
+                )
+                .into_compile_error()
+                .into();
+            }
+            let target = if arg.path.is_ident("namespace") {
+                &mut namespace
+            } else {
+                &mut name
+            };
+            if target.replace(value).is_some() {
+                return syn::Error::new_spanned(arg.path, "duplicate attribute")
+                    .into_compile_error()
+                    .into();
+            }
+        } else if arg.path.is_ident("version") {
+            let syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Int(value),
+                ..
+            }) = arg.value
+            else {
+                return syn::Error::new_spanned(
+                    arg.path,
+                    "version must be a nonzero u16 integer literal",
+                )
+                .into_compile_error()
+                .into();
+            };
+            if !matches!(value.base10_parse::<u16>(), Ok(1..=u16::MAX)) {
+                return syn::Error::new_spanned(
+                    value,
+                    "version must be a nonzero u16 integer literal",
+                )
+                .into_compile_error()
+                .into();
+            }
+            if version.replace(value).is_some() {
+                return syn::Error::new_spanned(arg.path, "duplicate attribute")
+                    .into_compile_error()
+                    .into();
+            }
+        } else {
+            return syn::Error::new_spanned(arg.path, "expected namespace, name or version")
+                .into_compile_error()
+                .into();
+        }
+    }
+    let (Some(namespace), Some(name), Some(version)) = (namespace, name, version) else {
+        return syn::Error::new_spanned(sig, "namespace, name and version are required")
+            .into_compile_error()
+            .into();
+    };
+    let ident = &sig.ident;
+    let wrapper = if modal {
+        format_ident!("__bot_framework_modal_{}", ident)
+    } else {
+        format_ident!("__bot_framework_component_{}", ident)
+    };
+    let kind = if modal {
+        quote!(Modal)
+    } else {
+        quote!(Component)
+    };
+    quote! {
+        #function
+        #[doc(hidden)]
+        fn #wrapper<'a>(ctx: ::bot_framework::interactions::InteractionContext<'a>) -> ::bot_framework::CommandFuture<'a> {
+            Box::pin(#ident(ctx))
+        }
+        ::bot_framework::__private::inventory::submit! {
+            ::bot_framework::interactions::InteractionHandler {
+                namespace: #namespace, name: #name, version: #version,
+                kind: ::bot_framework::interactions::InteractionKind::#kind, handler: #wrapper,
+            }
+        }
+    }.into()
+}

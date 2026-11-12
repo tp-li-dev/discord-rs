@@ -14,7 +14,9 @@ pub mod arguments;
 
 pub mod lifecycle;
 
-pub use bot_framework_macros::{cog, event, hybrid_command};
+pub mod interactions;
+
+pub use bot_framework_macros::{cog, component, event, hybrid_command, modal};
 #[doc(hidden)]
 pub mod __private {
     pub use inventory;
@@ -276,7 +278,7 @@ pub async fn dispatch_ready(ctx: EventContext<'_>, event: ReadyEvent) -> BotResu
 
 pub mod prelude {
     pub use crate::{
-        BotResult, Cog, CogSet, Context, EventContext, ReadyEvent, StateMap, cog, event,
-        hybrid_command,
+        BotResult, Cog, CogSet, Context, EventContext, ReadyEvent, StateMap, cog, component, event,
+        hybrid_command, modal,
     };
 }
