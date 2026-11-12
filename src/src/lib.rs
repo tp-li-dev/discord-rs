@@ -7,6 +7,7 @@ pub mod gateway_metadata;
 pub mod identify;
 pub mod interaction_flow;
 pub mod local_control;
+pub mod metrics;
 pub mod ownership;
 pub mod placement;
 pub mod protocol;
