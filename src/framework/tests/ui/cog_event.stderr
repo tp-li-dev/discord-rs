@@ -1,0 +1,5 @@
+error: cog event takes &self, EventContext and ReadyEvent, with no attributes
+ --> tests/ui/cog_event.rs:6:5
+  |
+6 |     async fn ready(&self, ctx: EventContext<'_>) -> BotResult<()> { Ok(()) }
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
