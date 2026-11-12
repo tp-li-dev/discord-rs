@@ -25,7 +25,7 @@
 //! closes only the local gate; follow it with `release_quorum` to free the durable
 //! reservation. A new session cannot adopt an old reservation after a crash.
 //! `begin_takeover` first commits a new epoch that fences all old renewals, then
-//! quarantines the new reservation for the GLOBAL lease upper bound, measured
+//! quarantines the new reservation for the fleet-wide lease upper bound, measured
 //! locally AFTER the commit response. `finish_takeover` requires another quorum
 //! write before admission. Pending takeovers cannot release their reservation;
 //! cancellation/restart never restores a grant or skips quarantine. No remote
@@ -60,9 +60,10 @@ use std::{
 use storage::{FileStore, StateMachine};
 use transport::{ForwardResponse, NetworkFactory, RaftRpcTransport, RpcRequest, RpcResponse};
 
-/// Fleet-wide lease ceiling, including nodes started with a different local
-/// `max_lease_ttl`. Never shorten this on an existing cluster without a separate
-/// migration/quarantine protocol. Local options are not cluster-wide evidence.
+/// Legacy fleet-wide lease ceiling, including nodes started with a different
+/// local `max_lease_ttl`. Authenticated transports may select a smaller immutable
+/// ceiling in a disjoint RPC/store namespace at cluster creation. Never shorten
+/// a live cluster's ceiling. Local options alone are not cluster-wide evidence.
 pub const TAKEOVER_QUARANTINE: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -332,6 +333,7 @@ pub struct RaftNode {
     members: BTreeSet<u64>,
     options: NodeOptions,
     transport: Arc<dyn RaftRpcTransport>,
+    lease_ceiling: Duration,
 }
 
 impl RaftNode {
@@ -351,6 +353,31 @@ impl RaftNode {
         if !options.allow_test_mode {
             return Err(QuorumError::Disabled);
         }
+        let (lease_ceiling, storage_cluster_name) = match transport.cluster_lease_ceiling() {
+            Some(ceiling) => {
+                let scope = transport
+                    .cluster_scope()
+                    .ok_or(QuorumError::InvalidConfig)?;
+                if !transport.is_authenticated()
+                    || ceiling.is_zero()
+                    || ceiling > TAKEOVER_QUARANTINE
+                    || scope.members != members
+                    || scope.cluster_id == [0; 16]
+                    || options.raft_config.cluster_name.trim().is_empty()
+                    || options.raft_config.cluster_name.len() > 256
+                {
+                    return Err(QuorumError::InvalidConfig);
+                }
+                (
+                    ceiling,
+                    scope.lease_storage_name(&options.raft_config.cluster_name, ceiling),
+                )
+            }
+            None => (
+                TAKEOVER_QUARANTINE,
+                options.raft_config.cluster_name.clone(),
+            ),
+        };
         if node_id == 0
             || members.contains(&0)
             || !members.contains(&node_id)
@@ -359,7 +386,7 @@ impl RaftNode {
             || options.write_timeout.is_zero()
             || options.write_timeout > Duration::from_secs(60)
             || options.max_lease_ttl.is_zero()
-            || options.max_lease_ttl > TAKEOVER_QUARANTINE
+            || options.max_lease_ttl > lease_ceiling
         {
             return Err(QuorumError::InvalidConfig);
         }
@@ -370,22 +397,12 @@ impl RaftNode {
             .map_err(|_| QuorumError::InvalidConfig)?;
         let (logs, machine) = match mode {
             StorageMode::Create => {
-                FileStore::create_in_cluster(
-                    path,
-                    node_id,
-                    members.clone(),
-                    options.raft_config.cluster_name.clone(),
-                )
-                .await
+                FileStore::create_in_cluster(path, node_id, members.clone(), storage_cluster_name)
+                    .await
             }
             StorageMode::Open => {
-                FileStore::open_in_cluster(
-                    path,
-                    node_id,
-                    members.clone(),
-                    options.raft_config.cluster_name.clone(),
-                )
-                .await
+                FileStore::open_in_cluster(path, node_id, members.clone(), storage_cluster_name)
+                    .await
             }
         }
         .map_err(|_| QuorumError::Storage)?;
@@ -405,7 +422,15 @@ impl RaftNode {
             members,
             options,
             transport,
+            lease_ceiling,
         })
+    }
+
+    /// The bound used for crash-takeover quarantine. For a scoped policy this is
+    /// fixed by authenticated RPC scope and durable store identity, not by the
+    /// local `max_lease_ttl` setting or the current health/leader view.
+    pub fn lease_ceiling(&self) -> Duration {
+        self.lease_ceiling
     }
 
     /// Bootstrap ONCE on one node, with all peers configured identically. A
@@ -651,7 +676,7 @@ impl<C: Clock> QuorumCoordinator<C> {
 
     /// Fence the previous reservation with a new epoch, without granting a
     /// lease. Failure detection/placement policy belongs to the trusted caller.
-    /// The new owner waits the global maximum TTL AFTER the successful commit,
+    /// The new owner waits the fleet-wide maximum TTL AFTER the successful commit,
     /// so even a renewal ordered immediately before this fence must expire.
     /// An ambiguous commit keeps an unreleasable pending claim. Recovery uses a
     /// new coordinator/session and another epoch CAS plus the full quarantine;
@@ -701,7 +726,7 @@ impl<C: Clock> QuorumCoordinator<C> {
         }
         let not_before = self
             .now()?
-            .checked_add(TAKEOVER_QUARANTINE)
+            .checked_add(self.node.lease_ceiling)
             .ok_or(OwnershipError::TimeOverflow)?;
         self.takeovers.insert(key, Some(not_before));
         Ok(epoch)
