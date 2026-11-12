@@ -14,6 +14,7 @@ pub mod redact;
 pub mod response_drain;
 pub mod shard_runtime;
 pub mod supervisor;
+pub mod state_store;
 pub mod switch;
 pub mod worker;
 
