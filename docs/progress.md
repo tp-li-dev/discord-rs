@@ -119,3 +119,11 @@ Worker の双方向受信に 1 MiB、管理要求に 4095 byte（改行込み）
 - `framework/examples`：ping・hybrid・cog_counter・cog_moderation の実行可能サンプルと統合試験17件、CI に examples ビルドを追加（GitHub Actions 実行は未確認）。ban は dry-run、on_message 相当は未対応と明記。
 - `benches/ipc_roundtrip.rs`/docs/benchmarks.md：実 Worker IPC 往復 各10,000件・失敗0、p99 は並列度1/4/16 で 126.3/389.5/588.3 µs（Windows 開発機、1ms 目標との比較は Linux で要再測定）。
 - main 統合後、fmt・clippy（警告禁止）・workspace test（269件）が Windows / Rust 1.99.0 で成功。
+
+## 2026-11-12：並列開発 第6〜7弾（Codex CLI：Sol/Terra/Astra）
+- 第6弾：Core ホットスワップ試験(T04/T05/T06/T19 実 Worker)、REST/Identify 予算(`rest_budget.rs`/`update_gate.rs`)、RBAC・監査(`rbac_audit.rs`)、worker 統合（秘密保護・TaskManager 接続・event_seq 再配送）、`daemon.rs`/`botd`、`gateway_switch.rs`（307状態・34,549遷移で単一 Active 検証）、`metrics.rs`（Prometheus 出力）。
+- 統合時に、秘密マスクがエラー診断まで潰して試験が5件失敗。第7弾で、秘密のみマスクし診断（種別・原因・終了コード）を保持する設計に修正。さらに T04（5秒処理中の in-flight 応答、並行 drain）と T06（切替直後クラッシュの管理記録）の本体不備を修正し、#[ignore] を解除。
+- 第7弾：`cluster.rs`（Transport/Peer 表/決定的模擬ネットワーク、試験専用の過半数 ACK、T10〜T14、1,555 イベント列と 128 seed×96 障害操作で二重 Active 違反なし。本番合意ではない）、botctl↔botd 接続（ps/status/inspect/shards/start/stop/restart、force は --yes 必須、update/rollback は未実装）、管理経路への RBAC・監査・metrics 適用（T20）、Gateway ローリング結合シミュレーション（T07〜T09）。
+- 統合後の試験不安定要因を修正：fixture の rlib 選択が古い rlib で失敗（最新を選ぶよう修正）、log_redaction を RBAC 前提へ更新。
+- 現状：main で fmt・clippy（警告禁止）・workspace test が Windows / Rust 1.99.0 で成功（545件、無視1件の手動ベンチ、2回連続）。未検証: Linux、GitHub Actions、実 Discord、複数ホスト・実ネットワーク、Windows ACL、本番合意（openraft は評価のみ）。
+- 運用：Codex は Sol(high)/Terra(high)/Astra(max) を難易度で使い分け。
