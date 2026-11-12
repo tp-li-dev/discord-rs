@@ -1,0 +1,12 @@
+[package]
+name = "quorum-spike"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+openraft = { version = "=0.9.26", features = ["serde", "storage-v2", "generic-snapshot-data"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+
+[workspace]
