@@ -16,6 +16,7 @@ pub mod shard_runtime;
 pub mod supervisor;
 pub mod state_store;
 pub mod switch;
+pub mod testkit;
 pub mod worker;
 
 pub type AppError = Box<dyn std::error::Error + Send + Sync>;
