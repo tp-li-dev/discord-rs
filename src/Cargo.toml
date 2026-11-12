@@ -23,3 +23,7 @@ resolver = "3"
 
 [dev-dependencies]
 rmp-serde = "1"
+
+[[bench]]
+name = "ipc_codec"
+harness = false
