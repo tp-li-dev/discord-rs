@@ -66,6 +66,11 @@ impl std::error::Error for OwnershipError {}
 /// Trusted control-plane boundary. Authentication/authorization precedes calls.
 /// Distributed implementations must obtain quorum approval before granting or
 /// renewing authority; local `check` must never perform network or storage I/O.
+/// A distributed grant must not overlap a previous holder's usable local lease:
+/// wait for safe expiry or confirm its admission gate has stopped before transfer.
+/// Epoch fencing alone cannot revoke a disconnected holder's cached authority.
+/// Returned deadlines use the caller's Clock domain. Standalone transfers require
+/// serialized local admission gates; they are not safe cross-host failover.
 pub trait OwnershipCoordinator {
     /// Explicitly transfer authority, fencing any previous epoch immediately.
     fn acquire(&mut self, key: OwnershipKey, ttl: Duration) -> Result<Lease, OwnershipError>;
