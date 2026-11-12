@@ -13,6 +13,7 @@ pub mod identify;
 pub mod interaction_flow;
 pub mod local_control;
 pub mod metrics;
+pub mod metrics_feed;
 pub mod ownership;
 pub mod placement;
 pub mod protocol;
