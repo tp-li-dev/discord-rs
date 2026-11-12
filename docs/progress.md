@@ -166,3 +166,12 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - `raft_quorum`：openraft による epoch CAS、永続ストレージ（sync_all、破損検出、ロック）、Ownership trait 接続、メモリ transport（試験35件）。本番起動は明示フラグでも拒否。mTLS 接続・自動引継ぎ・leader 転送は未実装。
 - main 統合後（Windows / Rust 1.90.0）：fmt・clippy（警告禁止）成功、`cargo test --workspace --no-fail-fast` 756 成功・失敗0・無視2。Linux、GitHub Actions、実 Discord、複数ホストは未検証。
 - 第2波を起動：raftnet（Raft を mTLS 上へ）、wkstate（StateStore の Worker 接続）、updctl（update/rollback の制御経路）、cidocs（CI・Linux 手順・文書）。
+
+## 2026-11-12：並列開発 第11〜13弾（Codex：Astra max / Sol / Terra）と現状
+- 統合済み：Raft(mTLS) transport・leader 転送・fencing 付き引継ぎ・自動 failover/failback runtime（`raft_quorum*`、`cluster_runtime.rs`）、証明書の失効/ローテーション/CA 管理/方針永続化（`tls_transport.rs`、`cert_policy.rs`）、永続 Subscription/ジョブ（`subscription.rs`、`durable_jobs.rs`）、framework↔StateStore↔Worker 接続とファイル永続 StateStore、daemon 側 update/rollback（認可・監査・同一操作ID）、子プロセス自動復旧（`child_recovery.rs` を daemon/worker に接続）、ログ経路の秘密保護、メトリクスのフィード API（daemon 未接続）、ファイル権限（`fs_perms.rs`：Unix mode、Windows は icacls /save の SDDL 解析によるパス指定 API）、実 Discord 検証の準備（`discord_smoke`、docs/real-discord-verification.md）。
+- CI：GitHub Actions を並列ジョブ化（fmt、clippy、test、examples+doctor、stable 互換）。Linux は全ジョブ成功。Windows は Raft snapshot 試験と ACL 試験がランナー固有でタイミング/環境依存し、修正を統合済み（Actions での再確認は未了）。
+- Linux ベンチ（Actions ubuntu-latest、AMD EPYC 7763 4vCPU、共有ランナー）：IPC 往復 各10,000件失敗0、p99 は並列度1/4/16 で 115.5/258.1/973.6 µs、failover 検知 Suspected p50 1503.6 ms / FailoverPending p50 3003.1 ms。往復値であり仕様の片道 p99<1ms の直接測定ではない。本番性能の保証ではない。
+- **未達（正直な記録）**：無停止更新の負荷試験（`tests/update_load.rs`、現在 `#[ignore]`、手動実行）は許容基準（欠落0・ACK3秒以内等）を満たさない。連続更新で欠落1、Gateway 切替で欠落4・ACK未着2・2回目の切替失敗、新 Worker クラッシュで ACK 最大4.6秒。修正は実行中（zdtfix）。
+- 実行中：zdtfix（上記の修正）、raftwire（Raft runtime の botd 配線。既定無効・模擬 Discord のみ）。完了後は `ci-verify` ブランチで Actions 検証を先行し、main へは確認後に反映する。
+- 範囲：実 Discord での検証（接続、Slash 登録、Interaction 3秒、Identify/Resume）はユーザーが実施する。手順は docs/real-discord-verification.md。それより前の手順（模擬環境での実装・試験と CI）を完成の範囲とする。
+- 未検証のまま：実 Discord、複数ホストの実障害、OS suspend、本番での Raft 有効化（起動は拒否のまま）、Windows ACL のディレクトリ対応、メトリクスの daemon 接続、永続 Subscription/ジョブの Worker 接続。
