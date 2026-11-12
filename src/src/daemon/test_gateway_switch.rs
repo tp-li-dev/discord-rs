@@ -41,6 +41,8 @@ struct IngressState {
     holding: bool,
     pending: VecDeque<(u64, Value, usize)>,
     pending_bytes: usize,
+    shadow: VecDeque<(u64, Value, usize)>,
+    shadow_bytes: usize,
     recent: HashSet<u64>,
     recent_order: VecDeque<u64>,
     unaccepted: HashMap<u64, HashSet<u64>>,
@@ -60,7 +62,24 @@ enum IngressRoute {
 }
 
 impl IngressState {
+    fn forget_shadow(&mut self, id: u64) {
+        if let Some(index) = self.shadow.iter().position(|(event, _, _)| *event == id)
+            && let Some((_, _, bytes)) = self.shadow.remove(index)
+        {
+            self.shadow_bytes -= bytes;
+        }
+    }
+
+    fn has_capacity(&self, event: u64, bytes: usize) -> bool {
+        let existing = self.shadow.iter().find(|(id, _, _)| *id == event);
+        let entries = self.pending.len() + self.shadow.len() - usize::from(existing.is_some());
+        let retained =
+            self.pending_bytes + self.shadow_bytes - existing.map_or(0, |(_, _, bytes)| *bytes);
+        entries < HANDOFF_EVENTS && bytes <= HANDOFF_BYTES.saturating_sub(retained)
+    }
+
     fn remember(&mut self, id: u64) {
+        self.forget_shadow(id);
         self.recent.insert(id);
         self.recent_order.push_back(id);
         if self.recent_order.len() > RECENT_EVENTS
@@ -90,9 +109,7 @@ impl IngressState {
                 && (!self.pending.is_empty() || awaiting_acceptance))
         {
             let bytes = serde_json::to_vec(&value).map_or(usize::MAX, |bytes| bytes.len());
-            if self.pending.len() >= HANDOFF_EVENTS
-                || bytes > HANDOFF_BYTES.saturating_sub(self.pending_bytes)
-            {
+            if !self.has_capacity(event, bytes) {
                 return IngressRoute::Rejected;
             }
             self.remember(event);
@@ -105,8 +122,19 @@ impl IngressState {
             self.unaccepted.entry(generation).or_default().insert(event);
             IngressRoute::Forward(value)
         } else {
-            // A shadow copy is not an admission. The Active session or the
-            // bounded handoff queue will claim the semantic event identity.
+            // Retain unclaimed shadow copies in their observed stream order.
+            // A shadow may read N before Pause while Active still has N in its
+            // socket. Losing that copy could put a later N+1 ahead of N during
+            // the handoff. Active admission removes the cached duplicate.
+            if self.active.is_some() && !self.shadow.iter().any(|(id, _, _)| *id == event) {
+                let bytes = serde_json::to_vec(&value).map_or(usize::MAX, |bytes| bytes.len());
+                if !self.has_capacity(event, bytes) {
+                    return IngressRoute::Rejected;
+                }
+                self.shadow_bytes += bytes;
+                self.shadow.push_back((event, value, bytes));
+            }
+            // Cached shadow input is still not an admission or REST effect.
             IngressRoute::Suppressed
         }
     }
@@ -149,6 +177,14 @@ impl Ingress {
         if state.active == Some(generation) {
             state.active = None;
             state.holding = true;
+            while let Some((event, value, bytes)) = state.shadow.pop_front() {
+                state.shadow_bytes -= bytes;
+                if !state.recent.contains(&event) {
+                    state.remember(event);
+                    state.pending_bytes += bytes;
+                    state.pending.push_back((event, value, bytes));
+                }
+            }
         }
     }
 
@@ -194,13 +230,15 @@ impl Ingress {
         Ok(())
     }
 
-    fn close(&self) -> bool {
+    fn close(&self) {
         let mut state = self.state.lock().unwrap();
         state.active = None;
         state.holding = false;
-        // Retained input is not a successful drain. The owner must report a
-        // failed/cancelled handoff rather than silently treating it as work done.
-        !state.pending.is_empty() || !state.unaccepted.is_empty()
+    }
+
+    fn has_pending_input(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        !state.pending.is_empty() || !state.shadow.is_empty() || !state.unaccepted.is_empty()
     }
 }
 
@@ -1514,7 +1552,7 @@ impl Actor {
         }
         self.pending = Some(job);
         if self.pending.as_ref().unwrap().command == "stop" {
-            let pending_input = self.ingress.close();
+            self.ingress.close();
             let epoch = self
                 .machine
                 .as_ref()
@@ -1525,7 +1563,7 @@ impl Actor {
             if let Some((_, ready)) = self.ready.take() {
                 ready.abort();
             }
-            let mut error = pending_input.then_some("Gateway stopped with pending input admission");
+            let mut error = None;
             let mut reaped = Vec::new();
             for (generation, gateway) in &mut self.gateways {
                 gateway.gate.store(false, Ordering::SeqCst);
@@ -1552,6 +1590,9 @@ impl Actor {
                         error.get_or_insert("Gateway monitor failed during stop");
                     }
                     Ok(None) => {}
+                }
+                if let Err(failure) = self.ingress.wait_accepted(*generation).await {
+                    error.get_or_insert(failure);
                 }
                 if let Err(failure) = gateway.control(Action::Quiesce, epoch).await {
                     error.get_or_insert(failure);
@@ -1603,6 +1644,11 @@ impl Actor {
             for generation in reaped {
                 self.record("stopped", generation, epoch.0);
                 self.remove_gateway(generation);
+            }
+            // Evaluate after the admission/result barriers, not at the instant
+            // stop was requested. An ACK arriving during stop is still valid.
+            if self.ingress.has_pending_input() {
+                error.get_or_insert("Gateway stopped with pending input admission");
             }
             let _ = self.poll_recovery(false);
             self.machine = None;
@@ -2317,6 +2363,80 @@ mod update_tests {
     }
 
     #[test]
+    fn handoff_keeps_the_unclaimed_shadow_prefix_before_new_gap_input() {
+        let ingress = Ingress::default();
+        ingress.activate(1);
+        // IDs are deliberately not ordered numerically: they identify events,
+        // while the shadow's observed stream supplies the prefix order.
+        assert!(matches!(
+            ingress
+                .state
+                .lock()
+                .unwrap()
+                .route(2, keyed_input(900), false),
+            IngressRoute::Suppressed
+        ));
+        assert_eq!(ingress.state.lock().unwrap().shadow.len(), 1);
+        ingress.begin_pause(1);
+        assert!(matches!(
+            ingress
+                .state
+                .lock()
+                .unwrap()
+                .route(2, keyed_input(3), false),
+            IngressRoute::Held
+        ));
+        // The previous Active now reads its delayed copy of the cached prefix.
+        assert!(matches!(
+            ingress
+                .state
+                .lock()
+                .unwrap()
+                .route(1, keyed_input(900), false),
+            IngressRoute::Suppressed
+        ));
+        ingress.release(2);
+        for id in [900, 3] {
+            assert_eq!(ingress.state.lock().unwrap().next(2).unwrap()["id"], id);
+            ingress.accepted(2, id).unwrap();
+        }
+        assert!(!ingress.has_pending_input());
+
+        // If Active already claimed the shadow prefix, Pause must not replay it.
+        assert!(matches!(
+            ingress
+                .state
+                .lock()
+                .unwrap()
+                .route(3, keyed_input(4), false),
+            IngressRoute::Suppressed
+        ));
+        assert!(matches!(
+            ingress.state.lock().unwrap().route(2, keyed_input(4), true),
+            IngressRoute::Forward(_)
+        ));
+        ingress.begin_pause(2);
+        let state = ingress.state.lock().unwrap();
+        assert!(state.shadow.is_empty());
+        assert!(state.pending.is_empty());
+        assert_eq!(state.shadow_bytes, 0);
+    }
+
+    #[test]
+    fn handoff_stop_rechecks_admission_after_the_last_acknowledgement() {
+        let ingress = Ingress::default();
+        ingress.activate(1);
+        assert!(matches!(
+            ingress.state.lock().unwrap().route(1, keyed_input(1), true),
+            IngressRoute::Forward(_)
+        ));
+        ingress.close();
+        assert!(ingress.has_pending_input());
+        ingress.accepted(1, 1).unwrap();
+        assert!(!ingress.has_pending_input());
+    }
+
+    #[test]
     fn handoff_bounds_refuse_admission_and_unkeyed_shadow_inputs_stay_suppressed() {
         let mut state = IngressState {
             holding: true,
@@ -2356,6 +2476,34 @@ mod update_tests {
         }
         assert_eq!(state.recent.len(), RECENT_EVENTS);
         assert!(!state.recent.contains(&0));
+
+        let mut state = IngressState {
+            active: Some(1),
+            ..Default::default()
+        };
+        for id in 0..HANDOFF_EVENTS as u64 {
+            assert!(matches!(
+                state.route(2, keyed_input(id), false),
+                IngressRoute::Suppressed
+            ));
+        }
+        assert!(matches!(
+            state.route(2, keyed_input(HANDOFF_EVENTS as u64), false),
+            IngressRoute::Rejected
+        ));
+        assert!(matches!(
+            state.route(1, keyed_input(0), true),
+            IngressRoute::Forward(_)
+        ));
+        assert_eq!(state.shadow.len(), HANDOFF_EVENTS - 1);
+        assert!(matches!(
+            state.route(1, keyed_input(HANDOFF_EVENTS as u64), true),
+            IngressRoute::Held
+        ));
+        assert!(matches!(
+            state.route(2, keyed_input(HANDOFF_EVENTS as u64 + 1), false),
+            IngressRoute::Rejected
+        ));
     }
 
     #[test]

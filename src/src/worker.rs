@@ -2618,9 +2618,10 @@ impl Manager {
         expected: Option<&Arc<Generation>>,
         request: &Request,
     ) -> Result<Admission, AppError> {
-        // In the managed Shard path a ResponseGuard is already an admission
-        // permit. Pause/Drain may not revoke the dispatch reserved before it.
-        let reserved = expected.is_some() && self.gateway_admission.is_some();
+        // A ResponseGuard is already an admission permit in both the managed
+        // Shard and legacy pool paths. Pause/Drain must not revoke it or acquire
+        // another read permit behind a shutdown writer waiting on this guard.
+        let reserved = expected.is_some();
         timeout(APPLICATION_DEADLINE, async {
             loop {
                 if !reserved {

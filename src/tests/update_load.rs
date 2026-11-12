@@ -123,10 +123,53 @@ async fn unused_delivery_survives_restore_wait_and_routing_commit() {
     .expect("delivery regression deadline");
 }
 
-// 既知の未達: 無停止更新の許容基準を満たさない（docs/progress.md 参照）。修正までは手動実行:
-//   cargo test -p src --test update_load -- --ignored
+#[tokio::test]
+async fn reserved_delivery_survives_shutdown_admission_barrier() {
+    use src::worker::{ApiOutcome, DeploymentIdentity, Manager};
+    use tokio::time::timeout;
+
+    let manager = Manager::start_pool_isolated(
+        env!("CARGO_BIN_EXE_src").into(),
+        1,
+        DeploymentIdentity::parse(|_| Ok(None)).unwrap(),
+    )
+    .await
+    .unwrap();
+    let mut response = manager.begin_response_delivery(0).await.unwrap();
+    let shutdown = manager.shutdown();
+    tokio::pin!(shutdown);
+    // Poll shutdown until it waits on our outstanding reservation. The new
+    // admission failure below proves the barrier has actually closed.
+    assert!(
+        timeout(Duration::from_millis(20), &mut shutdown)
+            .await
+            .is_err()
+    );
+    assert!(manager.begin_response_delivery(0).await.is_err());
+    assert_eq!(
+        timeout(
+            Duration::from_secs(3),
+            manager.dispatch_key_with_response(&mut response, 0, "!ping".into()),
+        )
+        .await
+        .expect("reserved dispatch must not wait behind its own drain writer")
+        .unwrap()
+        .as_deref(),
+        Some("Pong! 🦀")
+    );
+    manager
+        .finish_response(response, ApiOutcome::Confirmed { status: 200 })
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(5), shutdown)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+// Keep all acceptance criteria enabled, including the ambiguous post-dispatch
+// crash. A specification limitation must fail visibly, never become a skip.
 #[test]
-#[ignore = "known failing: zero-downtime acceptance not met; run manually until fixed"]
 fn continuous_events_during_updates_and_core_crashes() {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let root = evidence_directory();
