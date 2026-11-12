@@ -5,6 +5,7 @@ pub mod drain;
 pub mod event_seq;
 pub mod failover;
 pub mod gateway_metadata;
+pub mod gateway_switch;
 pub mod identify;
 pub mod interaction_flow;
 pub mod local_control;
