@@ -78,3 +78,11 @@ Worker の双方向受信に 1 MiB、管理要求に 4095 byte（改行込み）
 - 認証付き読み取り専用ローカル制御プロトコルを匿名ストリームで検証。実プロセス配線・bootstrap・監査・CLI は未実装。
 - 配置・Identify キューのオフライン結合試験と Shard 実行設計書を追加。複数 Shard の実起動、分散 Identify・quorum/lease は未実装。
 - 今後の優先順は実 IPC 管理と応答監査、Shard 単位の Gateway/Core 分離、Identify 制御と所有権、実 Discord・Windows・障害・性能検証。未検証部分を完成扱いしない。
+
+## 2026-11-12：PM 主導の並列開発 第1弾（Codex CLI）
+- 4作業を worktree 分離で Codex に実装させ、PM が検証・統合した。Codex のサンドボックスはネットワークと .git 書込みが使えず、cargo 検証とコミットは PM が代行。
+- `ownership.rs`：OwnershipCoordinator trait、StandaloneCoordinator、ownership_epoch の単調増加と古い epoch の拒否、注入 Clock による lease/watchdog（失効後 fail closed）、QuorumCoordinator は起動拒否のみ（独自合意は実装しない）。再起動を跨ぐ epoch 永続化と実プロセス停止への接続は未実装。
+- `shard_runtime.rs`：配置計画から Shard 単位の Gateway/Core 起動仕様（token は Gateway のみ、IPC/状態/管理パスを Bot/Shard 単位で分離）を生成。実プロセス起動には未接続。
+- 認証付きローカル管理：`manage list-unknown`（読み取り専用）を匿名パイプ bootstrap で配線。解除操作・永続監査・ページ化は未実装、Windows ACL は未検証。
+- framework Cog：Ready イベント自動登録、型付き引数、既定 drain フック。実 Worker/Gateway 接続は未実施。
+- main 統合後、Linux ではなく Windows 上の Rust 1.99.0 で `cargo fmt --check`、workspace clippy（警告禁止）、workspace test が成功。Linux、Windows CI、実 Discord、複数ホスト、性能は未検証。
