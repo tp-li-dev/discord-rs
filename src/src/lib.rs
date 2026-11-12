@@ -1,3 +1,4 @@
+pub mod botref;
 mod cogs;
 pub mod drain;
 pub mod failover;
