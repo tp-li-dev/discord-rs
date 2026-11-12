@@ -1,5 +1,13 @@
 # 秘密情報とログの安全性
 
+## 現行実装の補足
+
+`fs_perms` の Windows ファイル用パス API は所有者と DACL を設定・検証する。既存ハンドル API とディレクトリは未対応で、信頼された親パス等を前提とし TOCTOU を完全には防がない。既存の全資格情報経路に自動適用されない。
+
+証明書の leaf 切替・失効、永続ポリシー、CA チェーンを扱う部品がある。`cluster_runtime::bind_raft` は mTLS Raft RPC に接続する試験経路だが、本番 Raft 起動は拒否される。証明書配布や本番運用への自動統合は未保証。過去の節は当時の個別経路の記録である。
+
+`botd` の更新操作はサーバー側 capability を principal・role・shard scope に結び付け、監査と操作 ID を使う。遠隔管理全体や再起動を跨ぐ冪等性は未完成。
+
 2026-11-12 調査・適用。基準は architecture.md §4.3 / §13.1。今回の担当範囲の現状は次節、従来の調査と検証履歴は後段に記載する。担当外の logger 等が残るため、リポジトリ全体の秘密保護完了は主張しない。progress.md / handoff.md は今回の指示に従い変更していない。
 
 ## 残課題6：今回の出力境界の修正
@@ -175,13 +183,13 @@ Windows / Rust 1.99.0 でロール×全9操作、未認証遠隔要求、確認�
 
 `manage` は loopback の管理接続で資格情報を照合し、`core.json` の資格情報に admin、別の `viewer.json` の資格情報に viewer をサーバー側で結び付ける。クライアントが要求でロールを選ぶことはできない。各ファイルには同じ形式の接続先とそれぞれ別の秘密が入るため、必要な権限を持つユーザーにだけ該当ファイルへのアクセスを許可する。Windows でこれらのファイルや監査ディレクトリの ACL の設定・検証は実装されておらず、ACL は未検証。資格情報を読める同一ユーザーのプロセスからの利用を区別する仕組みではない。
 
-認証・認可の拒否と管理操作を `runtime/audit.jsonl` に記録する。操作前の監査書き込み・同期に失敗した場合は操作を実行しない。操作後の結果記録が失敗した場合は副作用を巻き戻せず、結果不明として扱う。監査の容量、排他、改竄耐性の制約は前節に従う。受信できなかったフレームなど、要求として識別できない接続のすべてを監査できる保証はない。接続枠または処理待ちキューの飽和時も拒否を記録できない場合がある。未認証の遠隔管理を許可せず、遠隔管理ハンドラーへの mTLS・RBAC の接続は未実装。Daemon 間 Transport 単体の実装は次節の範囲に限る。
+認証・認可の拒否と管理操作を `runtime/audit.jsonl` に記録する。操作前の監査書き込み・同期に失敗した場合は操作を実行しない。操作後の結果記録が失敗した場合は副作用を巻き戻せず、結果不明として扱う。監査の容量、排他、改竄耐性の制約は前節に従う。受信できなかったフレームなど、要求として識別できない接続のすべてを監査できる保証はない。接続枠または処理待ちキューの飽和時も拒否を記録できない場合がある。未認証の遠隔管理を許可せず、遠隔管理ハンドラーへの mTLS・RBAC の接続は未実装。試験用 daemon 間通信と Raft RPC は mTLS Transport を使う。
 
 `metrics-json` と `metrics-prometheus` は管理プロセス内のメトリクススナップショットを返す。現在の registry は Gateway / Worker の観測に接続されていないため、表示値を実環境の状態や健全性の証明に使えない。Windows ACL、Linux 実機、実 Discord や遠隔管理を通じた動作は未検証。
 
 ## botd / botctl のローカル管理境界
 
-`botd` は loopback のみで受け付け、匿名 stdin で渡された非ゼロの32バイト共有資格情報を要求と定数時間比較してから操作を管理キューに渡す。`botctl` は bootstrap 情報を読みこの資格情報を送信する。これは `manage` の viewer / admin と別の経路で、`botd` 側に RBAC / `AuditedExecutor` の接続はなく、共有資格情報を持つ利用者ごとの役割分離・永続監査を提供しない。資格情報や bootstrap ファイルを閲覧可能な主体から保護する必要がある。`--force` の確認は権限認証の代替ではない。遠隔管理や mTLS とこのローカル listener は接続されていない。`src/src/bin/botd.rs` の `authenticated_status_returns_snapshot_without_secret`、`status_is_dispatched_only_after_authentication` と `src/tests/botctl_daemon.rs` がローカル経路の一部を検証する。Windows ACL、複数ホストでの利用は未検証。
+`botd` は loopback のみで受け付け、匿名 stdin で渡された非ゼロの32バイト共有資格情報を要求と定数時間比較してから操作を管理キューに渡す。`botctl` は bootstrap 情報を読みこの資格情報を送信する。これは `manage` の viewer / admin と別の経路で、更新capabilityにはrole・shard scopeと監査が接続されるが、全操作で利用者ごとの役割分離・永続監査を提供しない。資格情報や bootstrap ファイルを閲覧可能な主体から保護する必要がある。`--force` の確認は権限認証の代替ではない。遠隔管理や mTLS とこのローカル listener は接続されていない。`src/src/bin/botd.rs` の `authenticated_status_returns_snapshot_without_secret`、`status_is_dispatched_only_after_authentication` と `src/tests/botctl_daemon.rs` がローカル経路の一部を検証する。Windows ACL、複数ホストでの利用は未検証。
 
 ## Daemon 間 mTLS TCP Transport（2026-11-12）
 
@@ -193,7 +201,7 @@ Windows / Rust 1.99.0 でロール×全9操作、未認証遠隔要求、確認�
 - `NodeId(u64)` は証明書の唯一の DNS SAN `node-<10進整数>.cluster` から取り出す（例: `NodeId(7)` は `node-7.cluster`）。先頭ゼロ、符号、ワイルドカード、末尾ドット、大文字への置換、複数 SAN、DNS 以外の SAN を受理しない。SAN がない場合だけ、UTF8String / PrintableString の唯一の CN に同形式を許す。SAN と CN が両方あれば完全一致が必要で、曖昧な名前や CN への暗黙の逃げ道を認めない。
 - CN 単独の場合は、提示チェーンが leaf 1枚だけで、設定したすべての trust anchor に NameConstraints がない場合に限定する。DNS の名前制約は CN に適用されないため、中間 CA や制約付き root を使う場合は SAN を必須にする。SAN の名前制約は webpki が検査する。SAN/CN 抽出用の小さな DER リーダーは境界・長さ・タグを検査するが、X.509 の署名・期限検証を代替しない。
 - 発信時はルート表の期待ノード ID とサーバー証明書を照合し、受信時はクライアント証明書とフレームの送信元を照合する。宛先 ID と接続開始時の受信側 incarnation も一致させる。別の許可ノードへのなりすましを防ぐ。payload 内の提案や ACK を実行する権限・現在の epoch の妥当性は、上位の合意・fencing 層で別途確認する。
-- TLS 再開と 0-RTT は無効。接続ごとに証明書を再検証する。証明書失効（CRL / OCSP）と自動ローテーション・オンラインの信頼一覧更新は**未実装**。置換時は Transport を停止して新設定で作成する。[rustls のチェーン検証 API](https://docs.rs/rustls/0.23.46/rustls/client/fn.verify_server_cert_signed_by_trust_anchor.html) は失効検査を含まない。設定した CA の秘密鍵と発行権限は運用側で管理する。
+- TLS 再開と 0-RTT は無効。接続ごとに証明書を再検証する。失効リストとleaf証明書の重複期間付きローテーションは後に実装された。OCSPと証明書配布・本番運用への自動統合は未完成。[rustls のチェーン検証 API](https://docs.rs/rustls/0.23.46/rustls/client/fn.verify_server_cert_signed_by_trust_anchor.html) は失効検査を含まない。設定した CA の秘密鍵と発行権限は運用側で管理する。
 
 ### 起動・制限・配送契約
 
@@ -229,4 +237,4 @@ cargo fmt --all --check
 git diff --check
 ```
 
-Linux 実行、IPv6実通信、複数ホスト/Tailscale、実 Discord、OS suspend・時計ずれ、本番 quorum/lease、負荷性能、証明書失効・ローテーション、永続監査との接続は未検証または未実装。既存制約文書・進捗の統合更新は PM に引き継ぎ、`docs/progress.md` は変更しない。
+Linux 実行、IPv6実通信、複数ホスト/Tailscale、実 Discord、OS suspend・時計ずれ、本番 quorum/lease、負荷性能、当時の証明書失効・ローテーション、永続監査との接続は未検証または未実装だった。既存制約文書・進捗の統合更新は PM に引き継ぎ、`docs/progress.md` は変更しない。

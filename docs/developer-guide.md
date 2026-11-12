@@ -1,6 +1,6 @@
 ﻿# 開発者ガイド（現在のAPI）
 
-[architecture.md](architecture.md) は目標仕様です。ここでは `src/framework`、`src/framework-macros` と実Workerのコード・テストに存在するAPIを説明します。実Discordでの動作は未検証です。未達は [known-limitations.md](known-limitations.md) を参照してください。
+[architecture.md](architecture.md) は目標仕様です。ここでは `src/framework`、`src/framework-macros` と実Workerのコード・テストに存在するAPIを説明します。実Discordの確認はユーザーが実施していますが、APIや障害時の保証を網羅した検証ではありません。未達は [known-limitations.md](known-limitations.md) を参照してください。
 
 ## Cogなしのコマンド
 
@@ -103,9 +103,9 @@ StateMapは具体型ごとに `Send + Sync + 'static` の値を保持し、`Cont
 
 `framework/src/interactions.rs` のRegistryと `#[component]` / `#[modal]` はButton・Select・Modalの名前空間付きルートに対応し、`wait_for` とSubscriptionの型もあります。通信非依存のAPIで、Discordや実Workerへの配送は未接続です。ルートやcustom IDだけでユーザー認可・再送防止はできません。
 
-`src/state_store.rs` はTTL・容量制限・CAS・schema検査を伴う非同期StateStoreとメモリ実装を提供します。メモリ状態はプロセス停止で失われ、外部DB・永続Subscriptionへの接続はありません。`src/supervisor.rs` のTaskManager / Supervisorは追跡・取消・drain・再起動方針の基盤で、Workerの要求タスクに一部接続されています。任意のCog・外部副作用を含む全資源のdrainを保証しません。
+`src/state_store.rs` はTTL・容量制限・CAS・schema検査を伴う非同期StateStoreを提供します。メモリ状態はプロセス停止で失われます。ファイル永続backendと耐久backendを要求するsubscription APIもありますが、実Discord配送やWorkerへの統合を意味しません。`durable_jobs.rs` も永続ジョブ用のライブラリ基盤です。`src/supervisor.rs` のTaskManager / Supervisorは追跡・取消・drain・再起動方針の基盤で、Workerの要求タスクに一部接続されています。任意のCog・外部副作用を含む全資源のdrainを保証しません。
 
-`src/tls_transport.rs` は相互TLS transport、`src/cluster.rs` は決定的なネットワーク模擬を提供します。実daemonの分散合意・leaseに接続された本番クラスタではありません。
+`src/tls_transport.rs` は相互TLSと証明書更新、`cert_policy.rs` は認証付きpolicy保存を提供します。`raft_quorum` のOpenRaft、mTLS Raft RPC、`cluster_runtime::bind_raft` は試験経路として接続されていますが、本番backendのbotd起動は拒否されます。`child_recovery` はdaemonのGateway監視とWorker復旧に接続され、`metrics_feed` はdaemon未接続です。いずれも本番の分散安全性を証明しません。
 
 Discord不要のサンプルは `src/` から次で実行できます。
 
@@ -129,3 +129,9 @@ frameworkの `hybrid` / `typed_macro` / `cog_extensions` / `state` / `events` �
 ## 過去の検証記録
 
 2026-11-12、Windows / Rust 1.99.0で `cargo test --offline --workspace`、`cargo fmt --all --check`、`cargo clippy --offline --workspace --all-targets -- -D warnings` が成功しました。掲載した3つのRustブロックを一時ディレクトリへ抽出し、既存workspaceのビルド成果物に対してrustcでコンパイルしました。Cog・Ready・状態共有サンプルは1テスト成功、フリー関数のコマンド・イベント例もコンパイル成功です。リポジトリのコードは変更していません。実Discord・Linux・複数ホストの再検証は行っていません。
+
+## CIと追加の検証対象
+
+`.github/workflows/ci.yml` はpushとpull requestで実行されます。`stress.yml` は手動実行でOSごと1〜20回、suiteを選択します。`bench.yml` も手動のLinux測定です。workflowの存在は今回の実行成功を意味しません。更新負荷試験の無停止条件は既知の未達で `#[ignore]` です。測定条件と結果は [benchmarks.md](benchmarks.md) を参照してください。
+
+`discord_smoke` は読み取り専用REST補助で、Gateway/Coreを起動しません。`FrameworkStateStore` のアダプター、ファイル永続StateStore、subscriptionとdurable jobsはライブラリAPIとして利用条件を確認してください。実Workerの自動永続化や外部副作用のexactly-onceを保証しません。
