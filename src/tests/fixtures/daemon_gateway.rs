@@ -63,6 +63,7 @@ fn main() {
     });
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut shutdown_at = None;
+    let mut waiting_for_release = false;
     loop {
         // Independent test teardown, also used after an assertion or daemon crash.
         if management.with_extension("fixture-exit").exists() {
@@ -78,13 +79,15 @@ fn main() {
             let mode = std::fs::read_to_string(management.with_extension("fixture-mode"))
                 .unwrap_or_default();
             match mode.trim() {
-                "slow" => shutdown_at = Some(Instant::now() + Duration::from_millis(1500)),
+                "slow" => waiting_for_release = true,
                 "ignore" => {}
                 "fail-stop" => std::process::exit(23),
                 _ => shutdown_at = Some(Instant::now()),
             }
         }
-        if shutdown_at.is_some_and(|at| Instant::now() >= at) {
+        if shutdown_at.is_some_and(|at| Instant::now() >= at)
+            || (waiting_for_release && management.with_extension("fixture-release").exists())
+        {
             std::fs::write(management.with_extension(format!("drained-{pid}")), b"true").unwrap();
             return;
         }

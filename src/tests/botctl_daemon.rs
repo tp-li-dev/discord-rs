@@ -518,6 +518,17 @@ async fn client_timeout_keeps_operation_queryable_and_other_bot_control_availabl
         "Running"
     );
     succeeded(&fixture.json(&["restart", "second"], true).await);
+    for shard in 0..2 {
+        std::fs::write(
+            fixture
+                .spec(ALPHA, shard)
+                .gateway
+                .management_path
+                .with_extension("fixture-release"),
+            "",
+        )
+        .unwrap();
+    }
     bounded(async {
         loop {
             let response = fixture
