@@ -18,6 +18,10 @@ use twilight_model::{
     http::interaction::{InteractionResponse, InteractionResponseType},
 };
 
+fn configured_shard(deployment: &worker::DeploymentIdentity) -> ShardId {
+    ShardId::new(deployment.shard.id(), deployment.shard.total())
+}
+
 fn slash_input(
     name: &str,
     kind: CommandType,
@@ -55,8 +59,11 @@ where
     matches!(tokio::time::timeout(deadline, request).await, Ok(Ok(_)))
 }
 
-// Current executable runs one bot and one shard only. This queue is process-local.
-async fn single_shard_queue<F>(metadata: F) -> Result<InMemoryQueue, &'static str>
+// One configured shard per executable. This queue is process-local, not distributed.
+async fn single_shard_queue<F>(
+    total_shards: u32,
+    metadata: F,
+) -> Result<InMemoryQueue, &'static str>
 where
     F: std::future::Future<Output = Result<(u32, SessionStartLimit), ()>>,
 {
@@ -64,10 +71,8 @@ where
         .await
         .map_err(|_| "gateway metadata timed out")?
         .map_err(|_| "gateway metadata unavailable")?;
-    if recommended != 1 {
-        return Err(
-            "this executable supports only one shard; Discord recommends a different count",
-        );
+    if recommended > total_shards {
+        return Err("configured shard count is below Discord recommendation");
     }
     let mut registry = src::identify::IdentifyRegistry::default();
     // A private key for the only bot in this process, not a Discord bot ID.
@@ -89,9 +94,11 @@ async fn main() -> Result<(), AppError> {
         None
     };
     let _ = rustls::crypto::ring::default_provider().install_default();
+    let deployment = worker::DeploymentIdentity::from_env()?;
+    let shard_id = configured_shard(&deployment);
     let token = env::var("DISCORD_TOKEN")?;
     let http = Arc::new(Client::new(token.clone()));
-    let queue = single_shard_queue(async {
+    let queue = single_shard_queue(deployment.shard.total(), async {
         let response = http.gateway().authed().await.map_err(|_| ())?;
         let metadata = response.model().await.map_err(|_| ())?;
         Ok((metadata.shards, metadata.session_start_limit))
@@ -100,8 +107,9 @@ async fn main() -> Result<(), AppError> {
     let config = ConfigBuilder::new(token, Intents::GUILD_MESSAGES | Intents::MESSAGE_CONTENT)
         .queue(queue)
         .build();
-    let mut shard = Shard::with_config(ShardId::ONE, config);
-    let manager = worker::Manager::start(env::current_exe()?).await?;
+    let mut shard = Shard::with_config(shard_id, config);
+    let manager =
+        worker::Manager::start_pool_with_identity(env::current_exe()?, 2, deployment).await?;
     if let Some(bootstrap) = bootstrap {
         let control_manager = manager.clone();
         tokio::spawn(async move {
@@ -303,20 +311,42 @@ mod tests {
             reset_after: 10_000,
             total: 1,
         };
-        assert!(single_shard_queue(async { Err(()) }).await.is_err());
+        assert!(single_shard_queue(1, async { Err(()) }).await.is_err());
         assert!(
-            single_shard_queue(async { Ok((2, valid.clone())) })
+            single_shard_queue(1, async { Ok((2, valid.clone())) })
                 .await
                 .is_err()
         );
         let mut invalid = valid.clone();
         invalid.max_concurrency = 0;
         assert!(
-            single_shard_queue(async { Ok((1, invalid)) })
+            single_shard_queue(1, async { Ok((1, invalid)) })
                 .await
                 .is_err()
         );
-        assert!(single_shard_queue(async { Ok((1, valid)) }).await.is_ok());
+        assert!(
+            single_shard_queue(1, async { Ok((1, valid.clone())) })
+                .await
+                .is_ok()
+        );
+        assert!(
+            single_shard_queue(4, async { Ok((4, valid)) })
+                .await
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn gateway_uses_configured_shard() {
+        let deployment = worker::DeploymentIdentity::parse(|key| {
+            Ok(match key {
+                "SHARD_ID" => Some("2".into()),
+                "TOTAL_SHARDS" => Some("4".into()),
+                _ => None,
+            })
+        })
+        .unwrap();
+        assert_eq!(configured_shard(&deployment), ShardId::new(2, 4));
     }
 
     #[test]
