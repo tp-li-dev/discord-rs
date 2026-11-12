@@ -1,4 +1,4 @@
-//! Deterministic, in-process control-plane **simulation**, not a consensus backend.
+//! Control-plane **test fixtures**, not a production consensus backend.
 //!
 //! `TestQuorumCoordinator` counts transported ACKs from a fixed membership and
 //! serializes decisions through one test oracle backed by `StandaloneCoordinator`.
@@ -14,6 +14,11 @@
 //! of a separate Gateway/Core pair per (bot, shard), without spawning processes.
 //! Node restart retains only the oracle, modelling durable control-plane history;
 //! real crash recovery and loss of that history remain unimplemented.
+//!
+//! `TestOnlyQuorumCoordinator` is the separate, explicitly gated loopback process
+//! fixture: each node counts authenticated ACKs and holds exclusive voter leases.
+//! It has no shared standalone oracle. Its local-clock, bounded-stop and reboot
+//! quarantine assumptions are documented on the type and are not Raft guarantees.
 
 use crate::{
     failover::{self, Event, Failover, State},
@@ -170,6 +175,460 @@ pub enum ControlMessage {
         granted: bool,
         current: Option<OwnershipRecord>,
     },
+    /// Experimental loopback process tests only; never a production consensus API.
+    TestOnly(TestOnlyMessage),
+}
+
+/// Canonical, non-secret deployment description supplied by the runtime. Every
+/// test message binds membership, placement and timing to this exact string.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TestOnlyMessage {
+    pub configuration: String,
+    pub payload: TestOnlyPayload,
+}
+
+/// No timestamps cross the transport: each participant uses its own monotonic
+/// clock. These fields describe test claims, not remotely usable lease grants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TestOnlyClaim {
+    pub key: OwnershipKey,
+    pub owner: NodeId,
+    pub incarnation: u64,
+    pub epoch: OwnershipEpoch,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TestOnlyRequest {
+    pub id: u64,
+    pub key: OwnershipKey,
+    pub requester: NodeId,
+    pub incarnation: u64,
+    pub epoch: OwnershipEpoch,
+    pub renew: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TestOnlyPayload {
+    Heartbeat {
+        sequence: u64,
+        ownership: Vec<TestOnlyClaim>,
+    },
+    Request(TestOnlyRequest),
+    Vote {
+        request: TestOnlyRequest,
+        granted: bool,
+        highest_epoch: OwnershipEpoch,
+    },
+}
+
+/// Test-only fixed-membership lease experiment. There is no election, log,
+/// persistence, membership change, Byzantine tolerance or production consensus.
+/// The caller must separately require its explicit unsafe-test startup flag,
+/// loopback mTLS and mock Discord, and enforce local process-stop deadlines.
+pub struct TestOnlyQuorumConfig {
+    pub node: NodeId,
+    pub incarnation: u64,
+    pub members: Vec<NodeId>,
+    pub keys: Vec<OwnershipKey>,
+    pub configuration: String,
+    pub vote_ttl: Duration,
+    /// The requester stops before voters may approve another owner. Includes
+    /// watchdog scheduling and process termination allowance in the test model.
+    pub stop_margin: Duration,
+}
+
+struct TestOnlyHold {
+    request: TestOnlyRequest,
+    deadline: Duration,
+}
+
+struct TestOnlyPending {
+    request: TestOnlyRequest,
+    deadline: Duration,
+    ack_deadline: Duration,
+    acks: BTreeSet<NodeId>,
+}
+
+/// Counts exact, authenticated ACKs from an immutable majority. Unlike the older
+/// simulation oracle this does not delegate authority to StandaloneCoordinator.
+/// Each voter holds an exclusive (node, incarnation, epoch) grant for vote_ttl;
+/// the requester uses a shorter deadline fixed BEFORE sending any request. ACK
+/// delay never extends it. Duplicate votes count once and duplicate requests do
+/// not extend a voter's hold. A fresh process cannot vote for one full vote_ttl.
+///
+/// These are test-fixture assumptions, NOT a general distributed safety proof:
+/// clocks advance at the same rate, the host is not suspended, all participants
+/// follow the protocol, and the independent process watchdog stops in the margin.
+/// In particular epochs are not durable across loss of all participants.
+pub struct TestOnlyQuorumCoordinator<C> {
+    clock: C,
+    config: TestOnlyQuorumConfig,
+    members: BTreeSet<NodeId>,
+    keys: BTreeSet<Key>,
+    quarantine_until: Duration,
+    last_now: Duration,
+    clock_failed: bool,
+    sequence: u64,
+    highest: BTreeMap<Key, u64>,
+    holds: BTreeMap<Key, TestOnlyHold>,
+    pending: BTreeMap<Key, TestOnlyPending>,
+    leases: BTreeMap<Key, Lease>,
+}
+
+impl<C: Clock> TestOnlyQuorumCoordinator<C> {
+    pub fn new(clock: C, config: TestOnlyQuorumConfig) -> Result<Self, SimulationError> {
+        let members: BTreeSet<_> = config.members.iter().copied().collect();
+        let keys: BTreeSet<_> = config.keys.iter().copied().map(index).collect();
+        if members.len() < 3
+            || members.len() > 31
+            || members.len() != config.members.len()
+            || !members.contains(&config.node)
+            || config.incarnation == 0
+            || keys.is_empty()
+            || keys.len() > 4096
+            || keys.len() != config.keys.len()
+            || config.configuration.is_empty()
+            || config.configuration.len() > 64 * 1024
+            || config.vote_ttl.is_zero()
+            || config.vote_ttl > Duration::from_secs(300)
+            || config.stop_margin.is_zero()
+            || config.stop_margin >= config.vote_ttl
+        {
+            return Err(SimulationError::InvalidConfig);
+        }
+        let now = clock.now();
+        let quarantine_until = plus(now, config.vote_ttl)?;
+        Ok(Self {
+            clock,
+            config,
+            members,
+            keys,
+            quarantine_until,
+            last_now: now,
+            clock_failed: false,
+            sequence: 0,
+            highest: BTreeMap::new(),
+            holds: BTreeMap::new(),
+            pending: BTreeMap::new(),
+            leases: BTreeMap::new(),
+        })
+    }
+
+    fn now(&mut self) -> Result<Duration, OwnershipError> {
+        let now = self.clock.now();
+        if self.clock_failed || now < self.last_now {
+            self.clock_failed = true;
+            self.leases.clear();
+            self.pending.clear();
+            return Err(OwnershipError::ClockRegressed);
+        }
+        self.last_now = now;
+        Ok(now)
+    }
+
+    pub fn majority(&self) -> usize {
+        self.members.len() / 2 + 1
+    }
+
+    pub fn local_lease(&self, key: OwnershipKey) -> Option<Lease> {
+        let now = self.clock.now();
+        if self.clock_failed || now < self.last_now {
+            return None;
+        }
+        self.leases
+            .get(&index(key))
+            .filter(|lease| now < lease.expires_at)
+            .copied()
+    }
+
+    pub fn has_pending(&self, key: OwnershipKey) -> bool {
+        let now = self.clock.now();
+        !self.clock_failed
+            && now >= self.last_now
+            && self
+                .pending
+                .get(&index(key))
+                .is_some_and(|p| now < p.ack_deadline)
+    }
+
+    /// Revokes local admission and cancels pending ACK aggregation. Voter holds
+    /// deliberately survive; neither an unauthenticated release nor a local
+    /// process-stop claim may shorten another participant's exclusion deadline.
+    pub fn cancel(&mut self, key: OwnershipKey) {
+        self.pending.remove(&index(key));
+        self.leases.remove(&index(key));
+    }
+
+    pub fn heartbeat(&self, sequence: u64) -> TestOnlyMessage {
+        TestOnlyMessage {
+            configuration: self.config.configuration.clone(),
+            payload: TestOnlyPayload::Heartbeat {
+                sequence,
+                ownership: self
+                    .config
+                    .keys
+                    .iter()
+                    .filter_map(|&key| self.local_lease(key))
+                    .map(|lease| TestOnlyClaim {
+                        key: lease.key,
+                        owner: self.config.node,
+                        incarnation: self.config.incarnation,
+                        epoch: lease.epoch,
+                    })
+                    .collect(),
+            },
+        }
+    }
+
+    /// Starts one exact request per key. The caller transports it to every peer;
+    /// local ACK processing obeys the same quarantine/hold rules as remote ACKs.
+    pub fn begin(
+        &mut self,
+        key: OwnershipKey,
+        renew: bool,
+    ) -> Result<TestOnlyMessage, SimulationError> {
+        let now = self.now()?;
+        let idx = index(key);
+        if !self.keys.contains(&idx) || self.has_pending(key) {
+            return Err(SimulationError::InvalidConfig);
+        }
+        let epoch = if renew {
+            self.local_lease(key).ok_or(OwnershipError::Expired)?.epoch
+        } else {
+            // A live local grant must be renewed or cancelled explicitly.
+            if self.local_lease(key).is_some() {
+                return Err(OwnershipError::Fenced.into());
+            }
+            let next = self
+                .highest
+                .get(&idx)
+                .copied()
+                .unwrap_or(0)
+                .checked_add(1)
+                .ok_or(OwnershipError::EpochExhausted)?;
+            self.highest.insert(idx, next);
+            OwnershipEpoch(next)
+        };
+        self.sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or(SimulationError::CounterExhausted)?;
+        let request = TestOnlyRequest {
+            id: self.sequence,
+            key,
+            requester: self.config.node,
+            incarnation: self.config.incarnation,
+            epoch,
+            renew,
+        };
+        let deadline = plus(now, self.config.vote_ttl - self.config.stop_margin)?;
+        let ack_deadline = if renew {
+            deadline.min(
+                self.local_lease(key)
+                    .ok_or(OwnershipError::Expired)?
+                    .expires_at,
+            )
+        } else {
+            deadline
+        };
+        self.pending.insert(
+            idx,
+            TestOnlyPending {
+                request,
+                deadline,
+                ack_deadline,
+                acks: BTreeSet::new(),
+            },
+        );
+        let vote = self.vote(request, now)?;
+        self.record_vote(self.config.node, request, vote.0, vote.1, now);
+        Ok(TestOnlyMessage {
+            configuration: self.config.configuration.clone(),
+            payload: TestOnlyPayload::Request(request),
+        })
+    }
+
+    fn vote(
+        &mut self,
+        request: TestOnlyRequest,
+        now: Duration,
+    ) -> Result<(bool, OwnershipEpoch), SimulationError> {
+        let idx = index(request.key);
+        let highest = self.highest.get(&idx).copied().unwrap_or(0);
+        let mut granted = false;
+        if now >= self.quarantine_until {
+            if let Some(hold) = self.holds.get_mut(&idx).filter(|hold| now < hold.deadline) {
+                if hold.request == request {
+                    // Retransmission is idempotent and cannot extend exclusion.
+                    granted = true;
+                } else if request.renew
+                    && request.requester == hold.request.requester
+                    && request.incarnation == hold.request.incarnation
+                    && request.epoch == hold.request.epoch
+                    && request.id > hold.request.id
+                {
+                    hold.deadline = plus(now, self.config.vote_ttl)?;
+                    hold.request = request;
+                    granted = true;
+                }
+            } else if !request.renew
+                && (request.epoch.0 > highest
+                    // begin reserves its own epoch before calling the voter.
+                    || (request.requester == self.config.node
+                        && request.incarnation == self.config.incarnation
+                        && request.epoch.0 == highest
+                        && self.pending.get(&idx).is_some_and(|p| p.request == request)))
+            {
+                self.holds.insert(
+                    idx,
+                    TestOnlyHold {
+                        request,
+                        deadline: plus(now, self.config.vote_ttl)?,
+                    },
+                );
+                self.highest.insert(idx, request.epoch.0);
+                granted = true;
+            }
+        }
+        Ok((
+            granted,
+            OwnershipEpoch(self.highest.get(&idx).copied().unwrap_or(0)),
+        ))
+    }
+
+    fn record_vote(
+        &mut self,
+        from: NodeId,
+        request: TestOnlyRequest,
+        granted: bool,
+        highest_epoch: OwnershipEpoch,
+        now: Duration,
+    ) {
+        let idx = index(request.key);
+        let majority = self.majority();
+        let Some(pending) = self.pending.get_mut(&idx) else {
+            return;
+        };
+        if pending.request != request || now >= pending.ack_deadline {
+            return;
+        }
+        self.highest
+            .entry(idx)
+            .and_modify(|epoch| *epoch = (*epoch).max(highest_epoch.0))
+            .or_insert(highest_epoch.0);
+        if granted {
+            pending.acks.insert(from);
+        }
+        if pending.acks.len() >= majority {
+            let lease = Lease {
+                key: request.key,
+                epoch: request.epoch,
+                expires_at: pending.deadline,
+            };
+            self.pending.remove(&idx);
+            self.leases.insert(idx, lease);
+        }
+    }
+
+    /// `from` and `incarnation` must come from the mutually authenticated
+    /// transport envelope, never from an unauthenticated request body.
+    pub fn receive(
+        &mut self,
+        from: NodeId,
+        incarnation: u64,
+        message: &TestOnlyMessage,
+    ) -> Result<Option<TestOnlyMessage>, SimulationError> {
+        let now = self.now()?;
+        if !self.members.contains(&from)
+            || incarnation == 0
+            || message.configuration != self.config.configuration
+        {
+            return Ok(None);
+        }
+        match message.payload {
+            TestOnlyPayload::Heartbeat { .. } => Ok(None),
+            TestOnlyPayload::Request(request) => {
+                if request.requester != from
+                    || request.incarnation != incarnation
+                    || request.id == 0
+                    || request.epoch.0 == 0
+                    || !self.keys.contains(&index(request.key))
+                {
+                    return Ok(None);
+                }
+                let (granted, highest_epoch) = self.vote(request, now)?;
+                Ok(Some(TestOnlyMessage {
+                    configuration: self.config.configuration.clone(),
+                    payload: TestOnlyPayload::Vote {
+                        request,
+                        granted,
+                        highest_epoch,
+                    },
+                }))
+            }
+            TestOnlyPayload::Vote {
+                request,
+                granted,
+                highest_epoch,
+            } => {
+                if request.requester == self.config.node
+                    && request.incarnation == self.config.incarnation
+                {
+                    self.record_vote(from, request, granted, highest_epoch, now);
+                }
+                Ok(None)
+            }
+        }
+    }
+}
+
+impl<C: Clock> OwnershipCoordinator for TestOnlyQuorumCoordinator<C> {
+    /// Synchronous callers cannot create authority. Use begin/receive and inspect
+    /// the approved local lease; this prevents accidental standalone fallback.
+    fn acquire(&mut self, _: OwnershipKey, _: Duration) -> Result<Lease, OwnershipError> {
+        Err(OwnershipError::QuorumUnavailable)
+    }
+    fn renew(
+        &mut self,
+        _: OwnershipKey,
+        _: OwnershipEpoch,
+        _: Duration,
+    ) -> Result<Lease, OwnershipError> {
+        Err(OwnershipError::QuorumUnavailable)
+    }
+    fn release(&mut self, key: OwnershipKey, epoch: OwnershipEpoch) -> Result<(), OwnershipError> {
+        self.check(key, epoch)?;
+        self.cancel(key);
+        Ok(())
+    }
+    fn check(&mut self, key: OwnershipKey, epoch: OwnershipEpoch) -> Result<(), OwnershipError> {
+        let now = self.now()?;
+        let lease = self
+            .leases
+            .get(&index(key))
+            .ok_or(OwnershipError::NotOwned)?;
+        if lease.epoch != epoch {
+            return Err(OwnershipError::Fenced);
+        }
+        if now >= lease.expires_at {
+            return Err(OwnershipError::Expired);
+        }
+        Ok(())
+    }
+    fn watchdog(&mut self) -> Result<Vec<OwnershipKey>, OwnershipError> {
+        let now = self.now()?;
+        self.pending.retain(|_, p| now < p.ack_deadline);
+        let expired: Vec<_> = self
+            .leases
+            .values()
+            .filter(|lease| now >= lease.expires_at)
+            .map(|lease| lease.key)
+            .collect();
+        for key in &expired {
+            self.leases.remove(&index(*key));
+        }
+        Ok(expired)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1252,6 +1711,9 @@ impl<C: Clock + Clone> ClusterSimulation<C> {
             sequence: packet.sequence,
         });
         match packet.message {
+            // The deterministic oracle and the real-process lease fixture are
+            // intentionally separate protocols; neither upgrades the other.
+            ControlMessage::TestOnly(_) => {}
             ControlMessage::Heartbeat(hb) => {
                 let old_incarnation = self.nodes[&id]
                     .peers
@@ -1518,6 +1980,521 @@ impl<C: Clock + Clone> ClusterSimulation<C> {
             }
         }
         self.assert_single_active()
+    }
+}
+
+#[cfg(test)]
+mod test_only_quorum_tests {
+    use super::*;
+    use crate::protocol::BotId;
+
+    const KEY: OwnershipKey = OwnershipKey {
+        bot_id: BotId(101),
+        shard_id: 0,
+    };
+    const OTHER: OwnershipKey = OwnershipKey {
+        bot_id: BotId(202),
+        shard_id: 0,
+    };
+    type Coordinator = TestOnlyQuorumCoordinator<ManualClock>;
+
+    fn config(node: u64, incarnation: u64) -> TestOnlyQuorumConfig {
+        TestOnlyQuorumConfig {
+            node: NodeId(node),
+            incarnation,
+            members: vec![NodeId(1), NodeId(2), NodeId(3)],
+            keys: vec![KEY, OTHER],
+            configuration: "test-only|members=1,2,3|ttl=1000|margin=200".into(),
+            vote_ttl: Duration::from_millis(1000),
+            stop_margin: Duration::from_millis(200),
+        }
+    }
+
+    struct World {
+        clock: ManualClock,
+        nodes: Vec<Coordinator>,
+    }
+    impl World {
+        fn cold() -> Self {
+            let clock = ManualClock::default();
+            Self {
+                nodes: (1..=3)
+                    .map(|id| Coordinator::new(clock.clone(), config(id, 100 + id)).unwrap())
+                    .collect(),
+                clock,
+            }
+        }
+        fn new() -> Self {
+            let world = Self::cold();
+            world.advance(1000);
+            world
+        }
+        fn advance(&self, millis: u64) {
+            self.clock.advance(Duration::from_millis(millis)).unwrap();
+        }
+        fn request(
+            &mut self,
+            from: usize,
+            to: usize,
+            message: &TestOnlyMessage,
+        ) -> TestOnlyMessage {
+            let id = self.nodes[from].config.node;
+            let incarnation = self.nodes[from].config.incarnation;
+            self.nodes[to]
+                .receive(id, incarnation, message)
+                .unwrap()
+                .unwrap()
+        }
+        fn ack(&mut self, from: usize, to: usize, message: &TestOnlyMessage) {
+            let id = self.nodes[from].config.node;
+            let incarnation = self.nodes[from].config.incarnation;
+            assert!(
+                self.nodes[to]
+                    .receive(id, incarnation, message)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        fn exchange(&mut self, from: usize, to: usize, message: &TestOnlyMessage) {
+            let reply = self.request(from, to, message);
+            self.ack(to, from, &reply);
+        }
+        fn grant(&mut self, node: usize, key: OwnershipKey) -> Lease {
+            let request = self.nodes[node].begin(key, false).unwrap();
+            self.exchange(node, (node + 1) % 3, &request);
+            self.nodes[node].local_lease(key).unwrap()
+        }
+    }
+
+    fn granted(message: &TestOnlyMessage) -> bool {
+        matches!(message.payload, TestOnlyPayload::Vote { granted: true, .. })
+    }
+
+    #[test]
+    fn test_only_requires_distinct_fixed_members_known_keys_and_valid_timing() {
+        for change in 0..10 {
+            let mut c = config(1, 101);
+            match change {
+                0 => c.members.pop().map(|_| ()).unwrap(),
+                1 => c.members[1] = NodeId(1),
+                2 => c.node = NodeId(9),
+                3 => c.incarnation = 0,
+                4 => c.keys.clear(),
+                5 => c.keys.push(KEY),
+                6 => c.configuration.clear(),
+                7 => c.vote_ttl = Duration::ZERO,
+                8 => c.stop_margin = Duration::ZERO,
+                9 => c.stop_margin = c.vote_ttl,
+                _ => unreachable!(),
+            }
+            assert!(
+                Coordinator::new(ManualClock::default(), c).is_err(),
+                "case {change}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_only_boot_quarantine_refuses_every_vote_for_full_hold_interval() {
+        let mut w = World::cold();
+        let request = w.nodes[0].begin(KEY, false).unwrap();
+        let reply = w.request(0, 1, &request);
+        assert!(!granted(&reply));
+        w.ack(1, 0, &reply);
+        assert!(w.nodes[0].local_lease(KEY).is_none());
+        w.advance(999);
+        let request = w.nodes[0].begin(KEY, false).unwrap();
+        assert!(!granted(&w.request(0, 1, &request)));
+        w.advance(1);
+        assert!(granted(&w.request(0, 1, &request)));
+        // The own vote was refused before quarantine: a single remote vote is
+        // still not a quorum; no retrospective self-vote is fabricated.
+        w.exchange(0, 1, &request);
+        assert!(w.nodes[0].local_lease(KEY).is_none());
+    }
+
+    #[test]
+    fn test_only_majority_never_shrinks_when_peers_disappear() {
+        let mut w = World::new();
+        assert_eq!(w.nodes[0].majority(), 2);
+        w.nodes[0].begin(KEY, false).unwrap();
+        assert!(w.nodes[0].local_lease(KEY).is_none());
+        w.advance(800);
+        assert!(w.nodes[0].local_lease(KEY).is_none());
+        w.nodes[0].watchdog().unwrap();
+        w.nodes[0].begin(KEY, false).unwrap();
+        assert!(w.nodes[0].local_lease(KEY).is_none());
+        assert_eq!(
+            w.nodes[0].acquire(KEY, Duration::from_millis(800)),
+            Err(OwnershipError::QuorumUnavailable)
+        );
+    }
+
+    #[test]
+    fn test_only_late_duplicate_and_foreign_ack_do_not_extend_deadline() {
+        let mut w = World::new();
+        let request = w.nodes[0].begin(KEY, false).unwrap();
+        let reply = w.request(0, 1, &request);
+        w.advance(700);
+        w.nodes[0].receive(NodeId(99), 99, &reply).unwrap();
+        assert!(w.nodes[0].local_lease(KEY).is_none());
+        w.ack(1, 0, &reply);
+        let lease = w.nodes[0].local_lease(KEY).unwrap();
+        assert_eq!(lease.expires_at, Duration::from_millis(1800));
+        w.advance(99);
+        w.ack(1, 0, &reply);
+        assert_eq!(w.nodes[0].local_lease(KEY), Some(lease));
+        w.advance(1);
+        w.ack(1, 0, &reply);
+        assert!(w.nodes[0].local_lease(KEY).is_none());
+        assert_eq!(w.nodes[0].watchdog().unwrap(), vec![KEY]);
+        assert!(w.nodes[0].watchdog().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_only_ack_at_boundary_is_rejected() {
+        let mut w = World::new();
+        let request = w.nodes[0].begin(KEY, false).unwrap();
+        let reply = w.request(0, 1, &request);
+        w.advance(800);
+        w.ack(1, 0, &reply);
+        assert!(w.nodes[0].local_lease(KEY).is_none());
+    }
+
+    #[test]
+    fn test_only_duplicate_request_does_not_extend_voter_hold() {
+        let mut w = World::new();
+        let request = w.nodes[0].begin(KEY, false).unwrap();
+        assert!(granted(&w.request(0, 1, &request)));
+        w.advance(700);
+        assert!(granted(&w.request(0, 1, &request)));
+        assert_eq!(
+            w.nodes[1].holds[&index(KEY)].deadline,
+            Duration::from_millis(2000)
+        );
+        w.advance(300);
+        assert!(!granted(&w.request(0, 1, &request)));
+    }
+
+    #[test]
+    fn test_only_quorum_intersection_prevents_overlapping_owners_and_bot_mixups() {
+        let mut w = World::new();
+        let old = w.grant(0, KEY);
+        let other = w.grant(2, OTHER);
+        assert_eq!(other.key, OTHER);
+        let attempt = w.nodes[2].begin(KEY, false).unwrap();
+        w.exchange(2, 0, &attempt);
+        w.exchange(2, 1, &attempt);
+        assert!(w.nodes[2].local_lease(KEY).is_none());
+        assert_eq!(w.nodes[0].local_lease(KEY), Some(old));
+        w.advance(800);
+        assert!(w.nodes[0].local_lease(KEY).is_none());
+        let attempt = w.nodes[2].begin(KEY, false).unwrap();
+        assert!(!granted(&w.request(2, 1, &attempt)));
+        // Even after local admission expires, the full voter hold is respected.
+        w.advance(200);
+        w.exchange(2, 0, &attempt);
+        w.exchange(2, 1, &attempt);
+        assert!(w.nodes[2].local_lease(KEY).is_some());
+        assert!(w.nodes[0].local_lease(KEY).is_none());
+    }
+
+    #[test]
+    fn test_only_renew_requires_quorum_and_keeps_epoch() {
+        let mut w = World::new();
+        let first = w.grant(0, KEY);
+        w.advance(300);
+        let request = w.nodes[0].begin(KEY, true).unwrap();
+        assert_eq!(w.nodes[0].local_lease(KEY), Some(first));
+        w.exchange(0, 1, &request);
+        let renewed = w.nodes[0].local_lease(KEY).unwrap();
+        assert_eq!(renewed.epoch, first.epoch);
+        assert_eq!(renewed.expires_at, Duration::from_millis(2100));
+        assert_eq!(
+            w.nodes[1].holds[&index(KEY)].deadline,
+            Duration::from_millis(2300)
+        );
+    }
+
+    #[test]
+    fn test_only_pending_renew_cannot_resurrect_an_expired_local_lease() {
+        let mut w = World::new();
+        w.grant(0, KEY);
+        w.advance(700);
+        let request = w.nodes[0].begin(KEY, true).unwrap();
+        let reply = w.request(0, 1, &request);
+        w.advance(100);
+        w.ack(1, 0, &reply);
+        assert!(w.nodes[0].local_lease(KEY).is_none());
+        assert!(!w.nodes[0].has_pending(KEY));
+    }
+
+    #[test]
+    fn test_only_release_cancels_pending_without_shortening_remote_exclusion() {
+        let mut w = World::new();
+        let old = w.grant(0, KEY);
+        w.advance(100);
+        let renewal = w.nodes[0].begin(KEY, true).unwrap();
+        let reply = w.request(0, 1, &renewal);
+        w.nodes[0].release(KEY, old.epoch).unwrap();
+        w.ack(1, 0, &reply);
+        assert!(w.nodes[0].local_lease(KEY).is_none());
+        let request = w.nodes[2].begin(KEY, false).unwrap();
+        assert!(!granted(&w.request(2, 1, &request)));
+        assert_eq!(
+            w.nodes[1].holds[&index(KEY)].deadline,
+            Duration::from_millis(2100)
+        );
+    }
+
+    #[test]
+    fn test_only_restart_loses_votes_but_waits_out_all_precrash_holds() {
+        let mut w = World::new();
+        w.grant(0, KEY);
+        w.advance(200);
+        w.nodes[1] = Coordinator::new(w.clock.clone(), config(2, 1)).unwrap();
+        // A smaller random incarnation is valid but never skips quarantine.
+        let request = w.nodes[2].begin(KEY, false).unwrap();
+        assert!(!granted(&w.request(2, 1, &request)));
+        w.advance(999);
+        let request = w.nodes[2].begin(KEY, false).unwrap();
+        assert!(!granted(&w.request(2, 1, &request)));
+        w.advance(1);
+        assert!(granted(&w.request(2, 1, &request)));
+        assert!(w.nodes[0].local_lease(KEY).is_none());
+    }
+
+    #[test]
+    fn test_only_unbound_config_identity_and_unknown_keys_are_ignored() {
+        let mut w = World::new();
+        let message = w.nodes[0].begin(KEY, false).unwrap();
+        let mut invalid = message.clone();
+        invalid.configuration.push('!');
+        assert!(
+            w.nodes[1]
+                .receive(NodeId(1), 101, &invalid)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            w.nodes[1]
+                .receive(NodeId(2), 101, &message)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            w.nodes[1]
+                .receive(NodeId(1), 102, &message)
+                .unwrap()
+                .is_none()
+        );
+        let TestOnlyPayload::Request(mut request) = message.payload else {
+            panic!()
+        };
+        request.key.shard_id = 99;
+        invalid = TestOnlyMessage {
+            configuration: message.configuration,
+            payload: TestOnlyPayload::Request(request),
+        };
+        assert!(
+            w.nodes[1]
+                .receive(NodeId(1), 101, &invalid)
+                .unwrap()
+                .is_none()
+        );
+        assert!(w.nodes[1].holds.is_empty());
+    }
+
+    #[test]
+    fn test_only_vote_matches_complete_request_and_distinct_voter() {
+        let mut w = World::new();
+        let message = w.nodes[0].begin(KEY, false).unwrap();
+        let reply = w.request(0, 1, &message);
+        let mut forged = reply.clone();
+        let TestOnlyPayload::Vote { request, .. } = &mut forged.payload else {
+            panic!()
+        };
+        request.epoch.0 += 1;
+        w.ack(1, 0, &forged);
+        assert!(w.nodes[0].local_lease(KEY).is_none());
+        // Re-labelling a reply as the already-counted self identity is no extra vote.
+        w.nodes[0].receive(NodeId(1), 101, &reply).unwrap();
+        assert!(w.nodes[0].local_lease(KEY).is_none());
+        w.ack(1, 0, &reply);
+        assert!(w.nodes[0].local_lease(KEY).is_some());
+    }
+
+    #[test]
+    fn test_only_independent_clock_origins_do_not_cross_as_remote_timestamps() {
+        let a_clock = ManualClock::default();
+        let b_clock = ManualClock::default();
+        a_clock.set(Duration::from_secs(10)).unwrap();
+        b_clock.set(Duration::from_secs(1_000_000)).unwrap();
+        let mut a = Coordinator::new(a_clock.clone(), config(1, 101)).unwrap();
+        let mut b = Coordinator::new(b_clock.clone(), config(2, 102)).unwrap();
+        a_clock.advance(Duration::from_secs(1)).unwrap();
+        b_clock.advance(Duration::from_secs(1)).unwrap();
+        let request = a.begin(KEY, false).unwrap();
+        let vote = b.receive(NodeId(1), 101, &request).unwrap().unwrap();
+        a.receive(NodeId(2), 102, &vote).unwrap();
+        assert_eq!(
+            a.local_lease(KEY).unwrap().expires_at,
+            Duration::from_millis(11_800)
+        );
+        assert_eq!(
+            b.holds[&index(KEY)].deadline,
+            Duration::from_secs(1_000_002)
+        );
+    }
+
+    #[test]
+    fn test_only_clock_regression_permanently_fails_closed() {
+        let mut w = World::new();
+        let lease = w.grant(0, KEY);
+        *w.clock.0.lock().unwrap() = Duration::ZERO;
+        assert!(w.nodes[0].local_lease(KEY).is_none());
+        assert_eq!(
+            w.nodes[0].check(KEY, lease.epoch),
+            Err(OwnershipError::ClockRegressed)
+        );
+        w.advance(2000);
+        assert_eq!(w.nodes[0].watchdog(), Err(OwnershipError::ClockRegressed));
+        assert!(w.nodes[0].begin(KEY, false).is_err());
+    }
+
+    #[test]
+    fn test_only_heartbeat_contains_only_live_owner_claims_and_local_fencing_works() {
+        let mut w = World::new();
+        let lease = w.grant(0, KEY);
+        assert_eq!(
+            w.nodes[0].check(KEY, OwnershipEpoch(99)),
+            Err(OwnershipError::Fenced)
+        );
+        assert_eq!(w.nodes[0].check(KEY, lease.epoch), Ok(()));
+        let TestOnlyPayload::Heartbeat {
+            sequence,
+            ownership,
+        } = w.nodes[0].heartbeat(42).payload
+        else {
+            panic!()
+        };
+        assert_eq!(sequence, 42);
+        assert_eq!(
+            ownership,
+            vec![TestOnlyClaim {
+                key: KEY,
+                owner: NodeId(1),
+                incarnation: 101,
+                epoch: lease.epoch
+            }]
+        );
+        w.advance(800);
+        let TestOnlyPayload::Heartbeat { ownership, .. } = w.nodes[0].heartbeat(43).payload else {
+            panic!()
+        };
+        assert!(ownership.is_empty());
+    }
+
+    #[test]
+    fn test_only_seeded_delays_duplicates_partitions_and_reboots_keep_single_lease() {
+        // Exercise the actual per-node coordinator, with no shared authority.
+        // Old process leases survive coordinator replacement until their own
+        // deadline; this models the separate guardian's last approved lease.
+        let mut grant_count = 0;
+        for seed in 1..=64u64 {
+            let mut w = World::new();
+            w.grant(0, KEY);
+            let mut random = seed;
+            let mut packets: Vec<(Duration, usize, usize, u64, TestOnlyMessage)> = Vec::new();
+            let mut orphans: Vec<Lease> = Vec::new();
+            let mut observed_grants = BTreeSet::new();
+            let mut incarnation = 1000;
+            for _ in 0..512 {
+                random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+                w.advance((random >> 32) % 71);
+                let node = (random as usize) % 3;
+                let action = (random >> 8) % 31;
+                if action <= 2 && !w.nodes[node].has_pending(KEY) {
+                    let renew = w.nodes[node].local_lease(KEY).is_some();
+                    let message = w.nodes[node].begin(KEY, renew).unwrap();
+                    for peer in 0..3 {
+                        if peer != node {
+                            let at = w.clock.now()
+                                + Duration::from_millis((random >> (16 + peer * 8)) % 450);
+                            packets.push((
+                                at,
+                                node,
+                                peer,
+                                w.nodes[node].config.incarnation,
+                                message.clone(),
+                            ));
+                        }
+                    }
+                } else if action == 3 {
+                    if let Some(lease) = w.nodes[node].local_lease(KEY) {
+                        orphans.push(lease);
+                    }
+                    incarnation += 1;
+                    w.nodes[node] =
+                        Coordinator::new(w.clock.clone(), config(node as u64 + 1, incarnation))
+                            .unwrap();
+                } else if action == 4 && !packets.is_empty() {
+                    let packet = packets[(random as usize) % packets.len()].clone();
+                    packets.push(packet); // authentic retransmission, not an extra voter
+                }
+                // Bounded loss/queue model: a directed partition is a dropped
+                // request or reply; delayed traffic retains original incarnation.
+                if packets.len() > 200 {
+                    packets.drain(..packets.len() - 200);
+                }
+                let due = packets.iter().position(|p| p.0 <= w.clock.now());
+                if let Some(index) = due {
+                    let (_, from, to, from_incarnation, packet) = packets.remove(index);
+                    if action != 5
+                        && let Some(reply) = w.nodes[to]
+                            .receive(NodeId(from as u64 + 1), from_incarnation, &packet)
+                            .unwrap()
+                    {
+                        packets.push((
+                            w.clock.now() + Duration::from_millis((random >> 40) % 450),
+                            to,
+                            from,
+                            w.nodes[to].config.incarnation,
+                            reply,
+                        ));
+                    }
+                }
+                orphans.retain(|lease| w.clock.now() < lease.expires_at);
+                let live = w
+                    .nodes
+                    .iter()
+                    .filter(|node| node.local_lease(KEY).is_some())
+                    .count()
+                    + orphans.len();
+                assert!(
+                    live <= 1,
+                    "seed {seed}, time {:?}: {live} live grants",
+                    w.clock.now()
+                );
+                for node in &w.nodes {
+                    if let Some(lease) = node.local_lease(KEY) {
+                        observed_grants.insert((
+                            node.config.node,
+                            node.config.incarnation,
+                            lease.epoch.0,
+                        ));
+                    }
+                }
+                for node in &mut w.nodes {
+                    node.watchdog().unwrap();
+                }
+            }
+            grant_count += observed_grants.len();
+        }
+        assert!(
+            grant_count > 128,
+            "fault scan must exercise new grants, got {grant_count}"
+        );
     }
 }
 

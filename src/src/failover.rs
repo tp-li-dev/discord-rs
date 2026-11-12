@@ -272,6 +272,21 @@ impl<C: Clock> Failover<C> {
     pub fn config(&self) -> Config {
         self.config
     }
+    /// Read-only handoff eligibility. Call `handle(Tick)` first so discontinuous
+    /// heartbeats and clock failures are reflected in the state. This is policy
+    /// only: callers still need ownership approval and process-stop fencing.
+    pub fn failback_ready(&self) -> bool {
+        let now = self.clock.now();
+        !self.clock_failed
+            && now >= self.last_now
+            && self.state == State::FailbackWaiting
+            && self.quorum
+            && self.eligible
+            && now.saturating_sub(self.last_heartbeat) < self.config.suspect_after
+            && self
+                .stable_since
+                .is_some_and(|since| now.saturating_sub(since) >= self.config.stable_for)
+    }
     fn next_attempt(&mut self) -> Result<(), Error> {
         self.attempt = self.attempt.checked_add(1).ok_or(Error::AttemptExhausted)?;
         Ok(())

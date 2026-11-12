@@ -18,11 +18,14 @@
 //! Heartbeat/proposal payload times retain their caller-provided clock domain.
 //! Existing simulation policy requires a shared injected clock; do not interpret
 //! these values as safe cross-host lease deadlines.
+//! The separate `TestOnly` payload has no remote deadlines: its quorum fixture
+//! measures request/hold deadlines locally and binds an exact test configuration.
 
 use crate::{
     cluster::{
         ControlMessage, Envelope, Heartbeat, NodeId, OwnershipProposal, OwnershipRecord,
-        ProposalKind, SimulationError, Transport,
+        ProposalKind, SimulationError, TestOnlyClaim, TestOnlyMessage, TestOnlyPayload,
+        TestOnlyRequest, Transport,
     },
     ownership::{Lease, OwnershipKey},
     protocol::{BotId, OwnershipEpoch},
@@ -1059,7 +1062,8 @@ fn certificate_identity(cert: &CertificateDer<'_>) -> Result<CertificateIdentity
 
 // Versioned binary wire schema: fixed-width BE integers, tagged messages and a
 // bounded record array. No generic untrusted nesting or claimed-length allocation.
-// The only variable-sized field is Heartbeat.ownership (40 bytes per record).
+// Test-only traffic also carries a bounded canonical deployment string and a
+// bounded claim list. Neither contains credentials or peer clock timestamps.
 struct Writer {
     bytes: Vec<u8>,
     max: usize,
@@ -1124,6 +1128,55 @@ impl Writer {
         self.duration(p.expires_at)?;
         self.duration(p.ack_deadline)
     }
+    fn test_request(&mut self, request: TestOnlyRequest) -> Result<(), TransportError> {
+        self.u64(request.id)?;
+        self.key(request.key)?;
+        self.u64(request.requester.0)?;
+        self.u64(request.incarnation)?;
+        self.u64(request.epoch.0)?;
+        self.u8(u8::from(request.renew))
+    }
+    fn test_message(&mut self, message: &TestOnlyMessage) -> Result<(), TransportError> {
+        if message.configuration.is_empty() || message.configuration.len() > 64 * 1024 {
+            return Err(TransportError::InvalidFrame);
+        }
+        self.u32(message.configuration.len() as u32)?;
+        self.put(message.configuration.as_bytes())?;
+        match &message.payload {
+            TestOnlyPayload::Heartbeat {
+                sequence,
+                ownership,
+            } => {
+                if ownership.len() > 4096 {
+                    return Err(TransportError::FrameTooLarge);
+                }
+                self.u8(0)?;
+                self.u64(*sequence)?;
+                self.u32(ownership.len() as u32)?;
+                for claim in ownership {
+                    self.key(claim.key)?;
+                    self.u64(claim.owner.0)?;
+                    self.u64(claim.incarnation)?;
+                    self.u64(claim.epoch.0)?;
+                }
+            }
+            TestOnlyPayload::Request(request) => {
+                self.u8(1)?;
+                self.test_request(*request)?;
+            }
+            TestOnlyPayload::Vote {
+                request,
+                granted,
+                highest_epoch,
+            } => {
+                self.u8(2)?;
+                self.test_request(*request)?;
+                self.u8(u8::from(*granted))?;
+                self.u64(highest_epoch.0)?;
+            }
+        }
+        Ok(())
+    }
 }
 fn encode(envelope: &Envelope, max: usize) -> Result<Vec<u8>, TransportError> {
     let mut w = Writer {
@@ -1168,6 +1221,10 @@ fn encode(envelope: &Envelope, max: usize) -> Result<Vec<u8>, TransportError> {
             if let Some(record) = current {
                 w.record(*record)?;
             }
+        }
+        ControlMessage::TestOnly(message) => {
+            w.u8(4)?;
+            w.test_message(message)?;
         }
     }
     Ok(w.bytes)
@@ -1258,6 +1315,58 @@ impl<'a> Reader<'a> {
             ack_deadline: self.duration()?,
         })
     }
+    fn test_request(&mut self) -> Result<TestOnlyRequest, TransportError> {
+        Ok(TestOnlyRequest {
+            id: self.u64()?,
+            key: self.key()?,
+            requester: NodeId(self.u64()?),
+            incarnation: self.u64()?,
+            epoch: OwnershipEpoch(self.u64()?),
+            renew: self.boolean()?,
+        })
+    }
+    fn test_message(&mut self) -> Result<TestOnlyMessage, TransportError> {
+        let length = self.u32()? as usize;
+        if length == 0 || length > 64 * 1024 {
+            return Err(TransportError::InvalidFrame);
+        }
+        let configuration = std::str::from_utf8(self.take(length)?)
+            .map_err(|_| TransportError::InvalidFrame)?
+            .to_owned();
+        let payload = match self.u8()? {
+            0 => {
+                let sequence = self.u64()?;
+                let count = self.u32()? as usize;
+                if count > 4096 || count > self.0.len() / 36 {
+                    return Err(TransportError::InvalidFrame);
+                }
+                let mut ownership = Vec::with_capacity(count);
+                for _ in 0..count {
+                    ownership.push(TestOnlyClaim {
+                        key: self.key()?,
+                        owner: NodeId(self.u64()?),
+                        incarnation: self.u64()?,
+                        epoch: OwnershipEpoch(self.u64()?),
+                    });
+                }
+                TestOnlyPayload::Heartbeat {
+                    sequence,
+                    ownership,
+                }
+            }
+            1 => TestOnlyPayload::Request(self.test_request()?),
+            2 => TestOnlyPayload::Vote {
+                request: self.test_request()?,
+                granted: self.boolean()?,
+                highest_epoch: OwnershipEpoch(self.u64()?),
+            },
+            _ => return Err(TransportError::InvalidFrame),
+        };
+        Ok(TestOnlyMessage {
+            configuration,
+            payload,
+        })
+    }
 }
 fn decode(bytes: &[u8]) -> Result<Envelope, TransportError> {
     let mut r = Reader(bytes);
@@ -1309,6 +1418,7 @@ fn decode(bytes: &[u8]) -> Result<Envelope, TransportError> {
                 current,
             }
         }
+        4 => ControlMessage::TestOnly(r.test_message()?),
         _ => return Err(TransportError::InvalidFrame),
     };
     if !r.0.is_empty() {
@@ -1387,6 +1497,95 @@ mod tests {
             invalid_duration[offset..offset + 4].copy_from_slice(&1_000_000_000u32.to_be_bytes());
             assert_eq!(decode(&invalid_duration), Err(TransportError::InvalidFrame));
         }
+    }
+
+    #[test]
+    fn test_only_wire_roundtrip_truncation_and_exact_frame_limits() {
+        let request = TestOnlyRequest {
+            id: 9,
+            key: OwnershipKey {
+                bot_id: BotId(101),
+                shard_id: 2,
+            },
+            requester: NodeId(1),
+            incarnation: 7,
+            epoch: OwnershipEpoch(11),
+            renew: true,
+        };
+        for payload in [
+            TestOnlyPayload::Heartbeat {
+                sequence: 1,
+                ownership: vec![TestOnlyClaim {
+                    key: request.key,
+                    owner: request.requester,
+                    incarnation: request.incarnation,
+                    epoch: request.epoch,
+                }],
+            },
+            TestOnlyPayload::Request(request),
+            TestOnlyPayload::Vote {
+                request,
+                granted: true,
+                highest_epoch: OwnershipEpoch(13),
+            },
+            TestOnlyPayload::Vote {
+                request,
+                granted: false,
+                highest_epoch: OwnershipEpoch(15),
+            },
+        ] {
+            let mut envelope = sample();
+            envelope.message = ControlMessage::TestOnly(TestOnlyMessage {
+                configuration: "explicit-test-only-deployment".into(),
+                payload,
+            });
+            let bytes = encode(&envelope, MAX_FRAME).unwrap();
+            assert_eq!(decode(&bytes).unwrap(), envelope);
+            assert_eq!(encode(&envelope, bytes.len()).unwrap(), bytes);
+            assert_eq!(
+                encode(&envelope, bytes.len() - 1),
+                Err(TransportError::FrameTooLarge)
+            );
+            for length in 0..bytes.len() {
+                assert_eq!(decode(&bytes[..length]), Err(TransportError::InvalidFrame));
+            }
+            let mut trailing = bytes.clone();
+            trailing.push(0);
+            assert_eq!(decode(&trailing), Err(TransportError::InvalidFrame));
+        }
+    }
+
+    #[test]
+    fn test_only_wire_rejects_untrusted_configuration_and_claim_lengths() {
+        let mut envelope = sample();
+        envelope.message = ControlMessage::TestOnly(TestOnlyMessage {
+            configuration: "x".into(),
+            payload: TestOnlyPayload::Heartbeat {
+                sequence: 1,
+                ownership: Vec::new(),
+            },
+        });
+        let bytes = encode(&envelope, MAX_FRAME).unwrap();
+        // Fixed envelope = 58 bytes, tag at 58, then configuration u32 + bytes.
+        for length in [0, 65_537, u32::MAX] {
+            let mut invalid = bytes.clone();
+            invalid[59..63].copy_from_slice(&length.to_be_bytes());
+            assert_eq!(decode(&invalid), Err(TransportError::InvalidFrame));
+        }
+        let mut invalid_utf8 = bytes.clone();
+        invalid_utf8[63] = 0xff;
+        assert_eq!(decode(&invalid_utf8), Err(TransportError::InvalidFrame));
+        let mut oversized_claims = bytes;
+        oversized_claims[73..77].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(decode(&oversized_claims), Err(TransportError::InvalidFrame));
+        let ControlMessage::TestOnly(message) = &mut envelope.message else {
+            panic!()
+        };
+        message.configuration = "x".repeat(65_537);
+        assert_eq!(
+            encode(&envelope, MAX_FRAME),
+            Err(TransportError::InvalidFrame)
+        );
     }
 
     #[test]

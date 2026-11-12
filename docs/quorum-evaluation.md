@@ -161,3 +161,46 @@ backend の選定・実装・fsync 耐久性・復旧は **未検証**。追加�
 
 次の採用判断には、永続 backend の crash/recovery 試験、認証済み transport、lease/watchdog/fencing の統合、Linux/Windows・複数プロセス/ホスト障害試験を条件とする。
 それまではメイン QuorumCoordinator の起動拒否を解除する根拠にしない。
+
+## 2026-11-12 追記：複数 botd の試験専用 ACK / lease 接続
+
+`src/src/cluster_runtime.rs` と `cluster::TestOnlyQuorumCoordinator` を、loopback 上の複数 botd / 実 Gateway・Worker プロセス試験用に接続した。これは上記 OpenRaft 評価スパイクとも、既存シミュレーションの `TestQuorumCoordinator` とも別の試験用アダプタである。**OpenRaft、選挙、複製ログ、永続合意、動的 membership は実装していない。本番利用不可**で、既存 `ownership::QuorumCoordinator` の起動拒否は維持する。
+
+`botd --allow-test-quorum --mock-discord <loopback collector>` の両方を明示しない限り、この実行経路は証明書読込・bind・子プロセス起動前に拒否する。通常の `[cluster].mode = "quorum"` だけでは起動しない。listen と全 peer は loopback の非ゼロ port に限定し、通常 Gateway へのフォールバックは行わない。
+
+配置 TOML は既存 `[cluster]` / `[node]` / `[failover]` / `[[bots]]` に次の拡張を追加する。`[cluster].mode = "quorum"`、`[node].id = "node-a"` とし、Bot ID は正規の十進 u64、Shard 数は固定値、全 Shard の明示配置を必要とする。`[node].remote_bind` は許可しない。
+
+```toml
+[test_cluster]
+node_id = 1
+listen = "127.0.0.1:18431"
+cert_path = "node-a-cert.der"
+key_path = "node-a-key.der"
+ca_path = "test-ca.der"
+lease_ms = 1500
+stop_margin_ms = 500
+
+[[test_cluster.peers]]
+id = 2
+name = "node-b"
+address = "127.0.0.1:18432"
+
+[[test_cluster.peers]]
+id = 3
+name = "node-c"
+address = "127.0.0.1:18433"
+```
+
+証明書は `node-<node_id>.cluster` identity を持つ DER leaf、秘密鍵は DER、CA は DER の1 trust anchor。相対パスは配置 TOML の親ディレクトリ基準で解決する。TOML 本体、鍵、証明書、ライブラリの任意エラー本文を診断へコピーしない。E2E は実行ごとに試験用 CA / 鍵を生成し、実運用の認証情報を使わない。秘密鍵のローテーション・失効対応や Windows ACL の包括検証を追加したわけではない。
+
+固定 membership の各投票者は `(bot, shard)` の同時所有者を1組 `(node, incarnation, epoch)` に制限し、受信時から `lease_ms` の間、別所有者への ACK を拒否する。候補は同一要求の過半数 ACK を受け取った場合だけ、**要求開始時刻 + lease_ms − stop_margin_ms** までのローカル lease を得る。遅延 ACK で deadline を後ろへずらさず、重複 ACK を票数に足さず、期限切れ・旧要求・別設定の ACK を採用しない。再起動した投票者はメモリ状態を失うため、最初の `lease_ms` は投票しない。ローカル cancel / process-exit は、他候補を早く許可する根拠にならず、既存の投票保持期限を短縮しない。
+
+メッセージには cluster ID、全 member ID/name、全 Bot/Shard 配置、heartbeat/failover/lease 設定の正規化済み記述を含め、設定の異なる相手の票・heartbeat を採用しない。試験用 TCP proxy の経路と各ノード固有の証明書パスはこの比較から除く。mTLS の TLS ACK は受信キューへの投入確認にすぎず、所有権 ACK と区別する。peer の経過時間を lease deadline に変換せず、各ノードの `Instant` を使う。incarnation が変わった場合は以前の incarnation の heartbeat を再採用せず、過剰な再起動履歴は有限上限で fail closed とする。
+
+`Failover` が元ノードの heartbeat 途絶、代理候補順位、quorum、復帰安定待機を判定する。代理は安定待機が成立した時点で `Draining` に入り、lease の更新をやめて停止する。元ノードの取得は旧投票保持期限と新たな過半数 ACK を待つため、この cold 切替には停止期間があり得る。元ノード側も起動または quorum 回復から `failback_stable_ms` の連続した過半数ヘルスを確認する。**試験モードの初回 primary 起動にも同じ安定待機が適用される**。代理の lease 途絶だけで元ノードが早期に取得することを避けるための保守的な条件である。実 Gateway と Worker の Ready は guardian が観測し、単なる spawn 成功を `TemporaryActive` 完了と扱わない。
+
+実プロセスの期限は botd とは別の guardian が監視する。停止余裕 `stop_margin_ms` は、候補の実行期限と投票者の排他保持期限の間に確保する。**任意の OS suspend、VM pause、時計ジャンプ、scheduler 長期停止、停止不能な Gateway、複数ホストの時計・遅延条件に対する証明ではない**。特に「過半数 ACK だけで本番の分散合意が完成した」「任意障害でも二重副作用がない」「exactly once」と解釈してはいけない。epoch の全台再起動を跨ぐ単調性や耐久性も保証しない。
+
+この追記の runtime 単体検証は Windows / Rust 1.99.0 で `cargo test --offline --lib cluster_runtime::tests` の12件、既存 failover / ownership 接続試験は `cargo test --offline --test failover --test failover_ownership` の19件が成功した。`cargo clippy --offline --lib -- -D warnings` も成功した。3プロセス E2E の最終結果は PM が統合する。Linux、実 Discord、実ホスト間障害、本番コンセンサスの保証は追加しない。
+
+省略時の試験用 lease 設定は `lease_ms = 4000`、`stop_margin_ms = 1000`。既存 `[failover]` の既定 heartbeat 500 ms と組み合わせて安全余裕の設定検査を通る値とし、両方の timing 指定を省略した場合の回帰試験を追加した。上の 1500 / 500 ms は短縮 E2E 用の明示設定例である。
