@@ -23,7 +23,7 @@ import time
 import uuid
 
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-CASES = ("core_series", "gateway_switch", "crash_old_core", "crash_new_core")
+CASES = ("core_series", "gateway_switch", "crash_old_core", "crash_new_core", "crash_new_core_after_handler")
 OPERATION_ERRORS = {"Gateway control acknowledgement identity mismatch", "Gateway acknowledgement state mismatch",
                     "local authority expired", "local lease expired", "Gateway or its control connection exited",
                     "Gateway process exited", "Gateway exited abnormally before stop", "Gateway recovery requires operator review",
@@ -485,9 +485,12 @@ class Run:
             before = len(self.sent)
             started = time.monotonic_ns()
             old = gateway.status["workers"][0]["pid"]
-            mode = "hold-restore" if self.options.case == "crash_old_core" else "crash-dispatch"
+            mode = {"crash_old_core": "hold-restore", "crash_new_core": "crash-restore",
+                    "crash_new_core_after_handler": "crash-dispatch"}[self.options.case]
             path = self.relay("fault-core", mode)
             status = self.publish(gateway, path)
+            if mode == "crash-restore":
+                crashed = eventually(lambda: list(self.root.glob(path.name + ".*.crashed")))
             restored = eventually(lambda: list(self.root.glob(path.name + ".*.restored")))
             self.discover_relays()
             if mode == "hold-restore":
@@ -497,11 +500,12 @@ class Run:
                                     "stage": "candidate_restore_before_commit"})
                 Path(str(path) + ".release").touch()
             else:
-                crashed = eventually(lambda: list(self.root.glob(path.name + ".*.crashed")))
+                if mode != "crash-restore":
+                    crashed = eventually(lambda: list(self.root.glob(path.name + ".*.crashed")))
                 marker = Path(str(crashed[0]).removesuffix(".crashed") + ".started")
                 identity = json.loads(marker.read_text())
                 self.faults.append({"target": "new_worker_relay", **identity, "ns": time.monotonic_ns(),
-                                    "stage": "first_dispatch_after_restore", "restores": len(restored)})
+                                    "stage": "before_restore_reply" if mode == "crash-restore" else "after_handler_before_result", "restores": len(restored)})
             eventually(lambda: status.exists() and status.read_text() == str(path))
             self.changes.append({"kind": "legacy_worker_pool", "revision": 1,
                                  "start_ns": started, "end_ns": time.monotonic_ns(), "events_during": len(self.sent) - before})
