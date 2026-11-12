@@ -18,7 +18,7 @@ pub struct Config {
     pub bots: Vec<BotPlacement>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Cluster {
     pub id: String,
@@ -32,7 +32,7 @@ pub enum ClusterMode {
     Quorum,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Node {
     pub id: String,
@@ -110,7 +110,7 @@ pub enum AutoShardCount {
     Auto,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BotPlacement {
     pub name: String,
@@ -124,7 +124,7 @@ pub struct BotPlacement {
     pub shard_placement: Vec<ShardPlacement>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShardPlacement {
     pub shard_id: u32,
@@ -133,11 +133,11 @@ pub struct ShardPlacement {
     pub failover: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PlacementError(pub String);
 impl fmt::Display for PlacementError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&crate::redact::redact(&self.0))
     }
 }
 impl std::error::Error for PlacementError {}
@@ -212,7 +212,7 @@ pub fn validate(
 }
 
 /// An intent only. It is neither a lease nor permission to launch a process.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct LocalShardIntent {
     pub bot_id: String,
     pub shard_id: u32,
@@ -366,5 +366,67 @@ mod tests {
         assert!(serde_json::from_str::<BotPlacement>(json).is_err());
         let json = r#"{"name":"x","bot_id":"i","application_id":"1","token_env":"TOKEN","total_shards":1,"token":"secret"}"#;
         assert!(serde_json::from_str::<BotPlacement>(json).is_err());
+    }
+}
+
+impl fmt::Debug for Cluster {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Cluster")
+            .field("id", &crate::redact::Secret::new(&self.id))
+            .field("mode", &self.mode)
+            .finish()
+    }
+}
+
+impl fmt::Debug for Node {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Node")
+            .field("id", &crate::redact::Secret::new(&self.id))
+            .field("remote_bind", &self.remote_bind)
+            .finish()
+    }
+}
+
+impl fmt::Debug for BotPlacement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BotPlacement")
+            .field("name", &crate::redact::Secret::new(&self.name))
+            .field("bot_id", &crate::redact::Secret::new(&self.bot_id))
+            .field(
+                "application_id",
+                &crate::redact::Secret::new(&self.application_id),
+            )
+            .field("token_env", &crate::redact::Secret::new(&self.token_env))
+            .field("total_shards", &self.total_shards)
+            .field("prefix", &crate::redact::Secret::new(&self.prefix))
+            .field("shard_placement", &self.shard_placement)
+            .finish()
+    }
+}
+
+impl fmt::Debug for ShardPlacement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ShardPlacement")
+            .field("shard_id", &self.shard_id)
+            .field("primary", &crate::redact::Secret::new(&self.primary))
+            .field("failover", &crate::redact::Secret::new(&self.failover))
+            .finish()
+    }
+}
+
+impl fmt::Debug for LocalShardIntent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LocalShardIntent")
+            .field("bot_id", &crate::redact::Secret::new(&self.bot_id))
+            .field("shard_id", &self.shard_id)
+            .field("total_shards", &self.total_shards)
+            .field("token_env", &crate::redact::Secret::new(&self.token_env))
+            .finish()
+    }
+}
+
+impl fmt::Debug for PlacementError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
     }
 }

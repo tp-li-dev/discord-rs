@@ -1,3 +1,4 @@
+use src::redact::redact;
 use std::{
     env,
     error::Error,
@@ -8,7 +9,14 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("reload: {}", redact(&error.to_string()));
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = env::args().skip(1).collect();
     if args != ["general"] {
         return Err("使い方: cargo run --bin reload -- general".into());
@@ -23,15 +31,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     let target = root.join("target").join("reload-build");
     let id = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let build = format!("build-{id}");
-    println!("Workerをビルドしています: {build}");
+    println!("Workerをビルドしています: {}", redact(&build));
     let status = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
         .current_dir(&root)
         .env("DISCORD_BUILD_ID", &build)
         .env_remove("DISCORD_TOKEN")
         .args(["build", "--release", "--bin", "src", "--target-dir"])
         .arg(&target)
-        .status()?;
-    if !status.success() {
+        .output()?;
+    print!("{}", redact(&String::from_utf8_lossy(&status.stdout)));
+    eprint!("{}", redact(&String::from_utf8_lossy(&status.stderr)));
+    if !status.status.success() {
         return Err("ビルドに失敗しました。稼働中のWorkerは変更していません".into());
     }
     let workers = root.join("workers");
@@ -63,14 +73,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         if fs::read_to_string(&status_path)
             .is_ok_and(|value| value.trim() == binary.to_string_lossy())
         {
-            println!("更新しました！ Workerのビルド: {build}");
+            println!("更新しました！ Workerのビルド: {}", redact(&build));
             return Ok(());
         }
         if let Ok(content) = fs::read_to_string(&error_path)
             && let Ok(value) = serde_json::from_str::<serde_json::Value>(&content)
             && value["path"].as_str() == Some(binary.to_string_lossy().as_ref())
         {
-            let reason = value["error"].as_str().unwrap_or("不明なエラー");
+            let reason = redact(value["error"].as_str().unwrap_or("不明なエラー"));
             return Err(format!(
                 "Worker更新に失敗しました: {reason}（更新要求は残っており、コアが再試行します）"
             )

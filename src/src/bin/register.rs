@@ -1,5 +1,6 @@
 //! Explicit, one-command registration. The default is a dry run.
 use bot_framework::arguments::{ArgumentKind, ArgumentSchema};
+use src::redact::{Secret, redact};
 use std::{env, num::NonZeroU64};
 use twilight_http::Client;
 use twilight_model::application::command::{CommandOption, CommandOptionType};
@@ -8,7 +9,7 @@ use twilight_model::id::{
     marker::{ApplicationMarker, GuildMarker},
 };
 
-#[derive(Debug, PartialEq)]
+#[derive(PartialEq)]
 struct Plan {
     app: NonZeroU64,
     guild: Option<NonZeroU64>,
@@ -79,7 +80,14 @@ fn discord_options(args: &[ArgumentSchema]) -> Vec<CommandOption> {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), src::AppError> {
+async fn main() {
+    if let Err(error) = run().await {
+        eprintln!("register: {}", redact(&error.to_string()));
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<(), src::AppError> {
     let plan = parse(&env::args().skip(1).collect::<Vec<_>>())?;
     let commands = src::registered_commands()?;
     let command = commands
@@ -91,13 +99,13 @@ async fn main() -> Result<(), src::AppError> {
     }
     println!(
         "command={} description={} scope={}",
-        command.name,
-        command.description,
+        redact(command.name),
+        redact(command.description),
         plan.guild
             .map_or_else(|| "global".to_owned(), |guild| format!("guild:{guild}"))
     );
     let options = discord_options(command.arguments);
-    println!("options={}", serde_json::to_string(&options)?);
+    println!("options={}", redact(&serde_json::to_string(&options)?));
     println!(
         "Only this command name is upserted; an existing command with the same name and scope is overwritten."
     );
@@ -105,9 +113,11 @@ async fn main() -> Result<(), src::AppError> {
         println!("Dry run: no request sent. Pass --apply to register.");
         return Ok(());
     }
-    let token = env::var("DISCORD_TOKEN")?;
+    let token = Secret::new(
+        env::var("DISCORD_TOKEN").map_err(|_| "DISCORD_TOKEN is unavailable or invalid")?,
+    );
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let client = Client::new(token);
+    let client = Client::new(token.into_inner());
     let application = Id::<ApplicationMarker>::new(plan.app.get());
     let commands = client.interaction(application);
     let request = async {
@@ -174,5 +184,16 @@ mod tests {
         ] {
             assert!(parse(&strings(args)).is_err());
         }
+    }
+}
+
+impl std::fmt::Debug for Plan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Plan")
+            .field("app", &self.app)
+            .field("guild", &self.guild)
+            .field("name", &Secret::new(&self.name))
+            .field("apply", &self.apply)
+            .finish()
     }
 }
