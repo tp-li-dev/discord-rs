@@ -16,6 +16,7 @@ pub mod metrics;
 pub mod ownership;
 pub mod placement;
 pub mod protocol;
+pub mod raft_quorum;
 pub mod rbac_audit;
 pub mod redact;
 pub mod response_drain;
