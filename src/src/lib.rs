@@ -10,6 +10,7 @@ pub mod local_control;
 pub mod ownership;
 pub mod placement;
 pub mod protocol;
+pub mod rbac_audit;
 pub mod redact;
 pub mod response_drain;
 pub mod rest_budget;

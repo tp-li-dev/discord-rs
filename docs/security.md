@@ -74,3 +74,48 @@ Windows での検証結果：
 - `cargo test --offline --test redact` は既存テストと同じ出力先を並行使用したため、実行中 exe の削除が Windows のアクセス拒否で失敗。別出力先による `cargo test --offline --test redact --target-dir target-redact` は5件すべて成功。検証後の出力物は既存の無視対象 `target/redact-verification` に移動した。
 - `cargo clippy --offline --lib --test redact -- -D warnings`、新規 Rust ファイルの `rustfmt --check --edition 2024`、`git diff --check` は成功。
 - Linux、実 Discord、実運用ログ収集、性能・ファジングは未検証。
+
+## RBAC と追記専用監査 API（2026-11-12）
+
+`src/src/rbac_audit.rs` に管理操作を認可・監査してから実行する `AuditedExecutor` を追加した。上記の過去調査にある「RBAC・永続監査未実装」は既存管理経路についての記述であり、この独立 API はまだ `manage` / `botctl` / 遠隔 Daemon のハンドラーへ接続していない。T20 の未認証要求の拒否・監査を API 境界で試験しているが、実 CLI から遠隔通信を通した T20 全体の完了は主張しない。認証通信、quorum、lease、fencing の代替ではなく、それらを迂回する実装も追加していない。
+
+### 許可表と確認
+
+| 操作 | viewer | updater | admin | 追加確認 |
+|---|---|---|---|---|
+| status / inspect / logs | 許可 | 許可 | 許可 | なし |
+| update / rollback | 拒否 | 許可 | 許可 | なし |
+| stop / shutdown | 拒否 | 拒否 | 許可 | なし（§4.1 の graceful stop とその別名） |
+| force / ownership-switch | 拒否 | 拒否 | 許可 | 明示オプションと肯定確認の両方が必須 |
+
+ロール・操作名は表の小文字の完全一致のみ受理する。未認証、不明ロール、不明操作、権限不足、空の主体、不正な対象は拒否する。ローカル要求にも認証・認可が必要。`remote` は監査属性であり認証の代わりにならない。`status` / `logs` は全体参照として Bot 未指定を許す。他の操作には Bot が必要で、Shard 指定時には必ず Bot も要求する。Bot の実在・正規 ID の解決、主体の対象 Bot/Shard へのアクセス範囲は呼出側で検証する。
+
+危険操作の `Confirmation::Interactive` は `explicit` と `accepted`、非 TTY の `NonInteractive` は `explicit` と `yes` の両方を要求する。確認で不足権限を補うことはできない。管理アダプターは確認を今回の操作と対象に結び付け、非 TTY に対話確認を流用しないこと。
+
+`Principal::authenticated(subject, role)` は認証成功を表す**信頼済みアダプター専用**の入口であり、認証処理自体は行わない。主体は検証済みのローカル OS / mTLS 等の identity、ロールはサーバー側の対応表から取得する。クライアント送信の role や authenticated フラグをここへ直結しない。Principal / Request に Deserialize・Debug は実装していない。未認証は `Principal::unauthenticated()` として同じ実行 API へ渡す。
+
+### 監査と失敗時の動作
+
+`AuditedExecutor::open(path, AuditConfig)` と `execute(&request, closure)` を使用する（コンパイル検査する使用例はモジュールの rustdoc）。closure は要求の操作・対象と一致する実処理を一度だけ行い、`Result<T, String>` を返す。同期ファイル I/O を行うため、Gateway の Heartbeat・イベント処理から分離した管理用タスク等で実行する。
+
+- JSON Lines に `timestamp_unix_ms`（UTC Unix ミリ秒）、`request_id`、`subject`、`role`、`operation`、`bot_id`、`shard_id`、`remote`、`result`、`reason` を保存する。未認証主体は `anonymous`。時刻は OS の壁時計で、時計補正を跨ぐ単調性は保証しない。要求 ID は既存ログから再開し、開始と終了は同じ ID を使う。
+- 拒否は `denied` と固定の拒否理由を記録する。許可時は `started` を `write_all` / `sync_all` してから closure を呼ぶ。終了時は `succeeded` / `failed`、panic 時は本文を保存せず `panicked` を追記し panic を再送出する。アプリの panic hook の出力は別の保護境界であり、この API はマスクしない。
+- 主体・ロール・操作・Bot・結果理由の文字列を既存 `redact.rs` に通してから serde JSON へ変換する。CR/LF・引用符等は JSON エスケープされ、入力で別の JSONL レコードを注入できない。失敗理由はマスク後に UTF-8 境界で最大512バイトまで切り詰め、印を付ける。レコード上限を超える結果理由は固定の `omitted` に置き換える。マスクのヒューリスティックの限界は上記の制約が引き続き適用される。資格情報自体を要求・理由へ入れないこと。
+- 操作前の監査書き込み失敗では closure を呼ばず `ExecuteError::Audit` を返す。書き込み・同期・ローテーション失敗後の writer は利用不能にし、後続操作も拒否する。結果レコードの最大サイズ分の容量を事前予約するため、予測可能な容量不足でも操作前に拒否する。
+- 操作が既に行われた後の媒体障害・外部変更による結果記録失敗は `AuditAfterExecution` として区別する。外部副作用の取消や「操作されなかった」ことは保証できない。クラッシュ等で終了記録のない `started` も結果不明として照合し、自動再試行しない。監査と外部操作を単一トランザクションにする保証はない。
+
+### ファイル権限・容量・ローテーション
+
+新規ファイルは Unix で作成モード0600を指定し、既存ファイルに group/other 権限があれば拒否する。新規作成後はファイルと Unix の親ディレクトリを同期する。Windows は親ディレクトリの ACL を継承するだけで、ACL の設定・検証は行っていない。Windows ACL、電源断を含む永続化保証は未検証であり、運用側で専用ディレクトリへのアクセスを制限する必要がある。
+
+パスはクライアント指定を使用せず、事前作成した private な安定したディレクトリ内の固定パスを使う。通常ファイル以外・symlink、Unix の複数 hardlink を拒否するが、標準ライブラリによる検査と open の間の競合や親ディレクトリの差替えを完全には防がない。信頼できないユーザーに親ディレクトリの変更権限を与えないこと。ベースファイルの OS 排他ロックを writer 生存中ずっと保持し、同じログへの協調する複数 writer を拒否する。Unix ロックは advisory であり、OS 管理者・同一ユーザーによる改竄への耐性や署名付き監査は提供しない。
+
+既定値は1ファイル8 MiB、1レコード16 KiB（どちらも末尾 LF 込み）、追加ファイル16個。満杯時は `audit.jsonl.1`、`.2` の順に `create_new` で新規ファイルへ切り替え、過去ファイルを削除・上書き・truncate しない。最大ファイル数は `1 + max_archives`。容量枠を使い切れば操作を拒否するため、運用時には残量監視と停止中の保管・別ログ系列への切替手順が必要。結果ログの保守的な容量予約により、空きが残っていても実行を拒否する場合がある。
+
+再開時は既存 JSONL をレコード上限付きで読み、不正 JSON・未終端・サイズ超過・連番ファイルの欠番・要求 ID の逆行を拒否し、自動修復や履歴削除はしない。通常ログの読み取り・ローテーション設定の変更は writer 停止中に行う。監査不能な過大メタデータは操作を実行せずエラーで返し、その要求を監査できたとは扱わない。
+
+### 今回の検証範囲
+
+Windows / Rust 1.99.0 でロール×全9操作、未認証遠隔要求、確認の全組合せ、成功・失敗・panic、秘密マスク、改行注入、サイズ上限、容量予約、履歴を維持するローテーション・再開・排他・破損拒否を試験した。実際の読み取り専用 OS ハンドルへの書き込み失敗で操作が走らないことと、操作後の外部 truncate を結果不明として返して後続操作を拒否することも試験した。実管理通信への接続、Linux実行、Unix0600試験の実行、Windows ACL、実媒体障害・強制終了・電源断・負荷時性能は未検証。`docs/progress.md` は依頼どおり変更せず、PM に最終報告で引き継ぐ。
+
+`src/` から `cargo test --offline --lib --test rbac_audit --test redact` が73件、`cargo test --offline --doc` が3件成功した（新規 RBAC/監査の実行試験33件と使用例1件を含む）。Unix限定2件はWindowsでは実行されない。`cargo clippy --offline --lib --test rbac_audit -- -D warnings`、`rustfmt --check --edition 2024 src/rbac_audit.rs tests/rbac_audit.rs src/lib.rs`、`git diff --check` も成功。workspace 全パッケージ・全統合テストの再実行は今回の検証範囲に含めていない。
