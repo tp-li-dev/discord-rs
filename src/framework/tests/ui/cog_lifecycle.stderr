@@ -1,0 +1,13 @@
+error[E0053]: method `drain` has an incompatible type for trait
+ --> tests/ui/cog_lifecycle.rs:4:14
+  |
+4 |     fn drain(&mut self) -> CommandFuture<'_> { Box::pin(async { Ok(()) }) }
+  |              ^^^^^^^^^ types differ in mutability
+  |
+  = note: expected signature `fn(&Service) -> Pin<Box<dyn Future<Output = Result<(), Box<(dyn std::error::Error + Send + Sync + 'static)>>> + Send>>`
+             found signature `fn(&mut Service) -> Pin<Box<dyn Future<Output = Result<(), Box<(dyn std::error::Error + Send + Sync + 'static)>>> + Send>>`
+help: change the self-receiver type to match the trait
+  |
+4 -     fn drain(&mut self) -> CommandFuture<'_> { Box::pin(async { Ok(()) }) }
+4 +     fn drain(&self) -> CommandFuture<'_> { Box::pin(async { Ok(()) }) }
+  |

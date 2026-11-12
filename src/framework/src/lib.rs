@@ -57,11 +57,18 @@ impl StateMap {
 }
 
 /// Optional grouping of shared services and lifecycle hooks. Methods have defaults.
-/// Automatic command discovery on Cog methods is not implemented yet.
+/// `#[cog]` discovers command and ReadyEvent methods on linked implementations.
 pub trait Cog: Send + Sync + 'static {
     fn start(&self) -> CommandFuture<'_> {
         Box::pin(async { Ok(()) })
     }
+    /// Wait for Cog-owned work before stopping. The default has no work to wait for.
+    /// The host must stop admission first and track in-flight handlers and tasks.
+    /// This hook alone does not establish that a Worker has drained.
+    fn drain(&self) -> CommandFuture<'_> {
+        Box::pin(async { Ok(()) })
+    }
+    /// Release resources after drain succeeds. Defaults to no cleanup.
     fn stop(&self) -> CommandFuture<'_> {
         Box::pin(async { Ok(()) })
     }
@@ -89,7 +96,9 @@ impl CogSet {
         Ok(cog)
     }
 
-    /// Stop before removing; a failing stop leaves the Cog registered for retry.
+    /// Drain then stop before removing; either failure leaves the Cog registered for retry.
+    /// The caller must stop admission and wait for in-flight handlers before removal.
+    /// Retried hooks must be idempotent; cancellation also leaves registration intact.
     pub async fn remove<T: Cog>(&mut self, states: &mut StateMap) -> BotResult<()> {
         let cog = self
             .cogs
@@ -100,6 +109,7 @@ impl CogSet {
         if !Arc::ptr_eq(cog, &state_as_cog) {
             return Err(format!("cog state replaced: {}", type_name::<T>()).into());
         }
+        cog.drain().await?;
         cog.stop().await?;
         self.cogs.remove(&TypeId::of::<T>());
         states.remove::<Arc<T>>();
