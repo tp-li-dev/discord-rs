@@ -22,7 +22,7 @@
 //! Windows PowerShell and icacls from the trusted `SystemRoot` installation are
 //! required. Child processes receive no inherited application environment or
 //! secret bytes. icacls disables inheritance, removes old ACEs and grants only
-//! the current process user SID full control. Both its displayed ACL and the
+//! the current process user SID full control. Both its saved SDDL ACL and the
 //! security descriptor are checked; the owner must also be that SID. Unknown
 //! tool/output formats fail closed with `Unsupported`.
 //!
@@ -30,7 +30,9 @@
 //! paths. Holding handles reduces replacement races, but does not prove path
 //! identity against drive remapping, filesystem/filter behavior, hard links,
 //! privileged actors or concurrent DACL changes. All ancestors, drive mappings,
-//! the process environment and Windows tools must be trusted. Rechecking cannot
+//! the process environment, temporary directory and Windows tools must be trusted.
+//! ACL verification briefly writes an ACL-only UTF-16 snapshot to a random,
+//! create-new temporary file and removes it before returning. Rechecking cannot
 //! eliminate TOCTOU or revoke existing mappings/access; administrators and the
 //! current user are not isolated. Hostile/shared directories are unsupported by
 //! this contract. No filesystem-wide confidentiality guarantee is made.
@@ -280,81 +282,186 @@ mod platform {
         Ok(handles)
     }
 
-    // Static script: paths are environment data, never PowerShell source. Native
-    // output is captured, not logged; errors never include a path, SID or bytes.
-    // Get-Acl verifies protection/owner/raw ACEs independently of localized
-    // icacls display text. The display is also parsed, not merely exit-checked.
+    // Pure parsers shared by production and sample tests. /save writes UTF-16
+    // SDDL, including numeric SIDs (and well-known SDDL SID aliases). Unlike the
+    // console display, neither account-name translation nor an OEM code page is
+    // needed. RawSecurityDescriptor expands aliases to SecurityIdentifier.Value.
+    const ACL_PARSER: &str = r#"
+function Test-PrivateDacl($raw, [string] $sid) {
+    if (($raw.ControlFlags -band [Security.AccessControl.ControlFlags]::DiscretionaryAclPresent) -eq 0 -or
+        ($raw.ControlFlags -band [Security.AccessControl.ControlFlags]::DiscretionaryAclProtected) -eq 0 -or
+        $null -eq $raw.DiscretionaryAcl -or $raw.DiscretionaryAcl.Count -ne 1) { return $false }
+    $ace = $raw.DiscretionaryAcl[0]
+    return ($ace.AceType -eq [Security.AccessControl.AceType]::AccessAllowed -and
+        $ace.AceFlags -eq [Security.AccessControl.AceFlags]::None -and
+        $ace.AccessMask -eq 2032127 -and $ace.SecurityIdentifier.Value -ceq $sid)
+}
+function Test-IcaclsSave([string[]] $lines, [string] $name, [string] $sid) {
+    # One non-recursive /save record: literal basename followed by its DACL.
+    if ($lines.Count -ne 2 -or
+        -not [string]::Equals($lines[0], $name, [StringComparison]::OrdinalIgnoreCase) -or
+        -not $lines[1].StartsWith('D:', [StringComparison]::Ordinal)) { return 'saved-acl-format' }
+    try {
+        $raw = [Security.AccessControl.RawSecurityDescriptor]::new($lines[1])
+        if (-not (Test-PrivateDacl $raw $sid)) { return 'saved-acl-rejected' }
+    } catch { return 'saved-acl-format' }
+    return 'verified'
+}
+"#;
+
+    // Static script: paths are environment data, never PowerShell source. No
+    // native output or exception messages leave the child. Get-Acl checks the
+    // actual owner/DACL before and after independently parsing icacls /save.
+    // The temporary snapshot contains ACL metadata only, never secret contents;
+    // its parent is held just like the target's ancestors. Only a successfully
+    // created file is deleted. The caller must also trust this temporary directory.
     const ACL_SCRIPT: &str = r#"
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+$stage = 'tool-unavailable'
+$exitCode = 77
+$result = 'tool-unavailable'
+$snapshotCreated = $false
 try {
     $path = $env:FS_PERMS_PATH
     $icacls = [IO.Path]::Combine($env:SystemRoot, 'System32\icacls.exe')
-    if (-not [IO.File]::Exists($icacls)) { exit 77 }
+    if (-not [IO.File]::Exists($icacls)) { throw 'unavailable' }
+    $stage = 'token-sid-unavailable'
+    # WindowsIdentity reads the process access token through Windows APIs. Do
+    # not translate to NTAccount or consult whoami/USERNAME/USERPROFILE.
     $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
-    $account = $sid.Translate([Security.Principal.NTAccount]).Value
+    if ($null -eq $sid -or -not $sid.Value.StartsWith('S-1-')) { throw 'unavailable' }
     function Read-Acl {
         Microsoft.PowerShell.Security\Get-Acl -LiteralPath $path
     }
     function Run-Icacls([string[]] $options) {
-        $captured = @(& $icacls $path @options /L 2>$null)
-        if ($LASTEXITCODE -ne 0) { exit 13 }
-        return $captured
+        # Windows PowerShell otherwise turns native stderr into a terminating
+        # NativeCommandError before LASTEXITCODE can classify an ACL rejection.
+        $ErrorActionPreference = 'Continue'
+        $null = & $icacls $path @options /L 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            $script:exitCode = 13
+            throw 'icacls failed'
+        }
     }
     if ($env:FS_PERMS_RESTRICT -eq '1') {
+        $stage = 'set-owner'
         $null = Run-Icacls @('/setowner', ('*' + $sid.Value))
+        $stage = 'disable-inheritance'
         $null = Run-Icacls @('/inheritance:r', '/grant:r', ('*' + $sid.Value + ':(F)'))
+        $stage = 'read-acl'
         $acl = Read-Acl
         $identities = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) |
             ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique)
+        $stage = 'remove-other-aces'
         foreach ($identity in $identities) {
             if ($identity -ne $sid.Value) {
                 $null = Run-Icacls @('/remove', ('*' + $identity))
             }
         }
+        $stage = 'remove-deny'
         $null = Run-Icacls @('/remove:d', ('*' + $sid.Value))
+        $stage = 'grant-current-user'
         $null = Run-Icacls @('/grant:r', ('*' + $sid.Value + ':(F)'))
     }
     function Assert-PrivateAcl {
         $acl = Read-Acl
         $raw = [Security.AccessControl.RawSecurityDescriptor]::new($acl.GetSecurityDescriptorBinaryForm(), 0)
-        if (-not $acl.AreAccessRulesProtected -or $raw.Owner.Value -ne $sid.Value -or
-            $null -eq $raw.DiscretionaryAcl -or $raw.DiscretionaryAcl.Count -ne 1) { exit 13 }
-        $ace = $raw.DiscretionaryAcl[0]
-        if ($ace.AceType -ne [Security.AccessControl.AceType]::AccessAllowed -or
-            $ace.AceFlags -ne [Security.AccessControl.AceFlags]::None -or
-            $ace.AccessMask -ne 2032127 -or $ace.SecurityIdentifier.Value -ne $sid.Value) { exit 13 }
+        if (-not $acl.AreAccessRulesProtected -or $raw.Owner.Value -cne $sid.Value -or
+            -not (Test-PrivateDacl $raw $sid.Value)) {
+            $script:exitCode = 13
+            throw 'ACL rejected'
+        }
     }
+    $stage = 'verify-acl'
     Assert-PrivateAcl
-    $lines = @(Run-Icacls @())
-    # A single unflagged Full Control entry; do not depend on localized summary text.
-    if ($lines.Count -lt 1 -or $lines[0].TrimEnd() -cne ($path + ' ' + $account + ':(F)')) { exit 77 }
-    foreach ($line in $lines | Select-Object -Skip 1) {
-        if ($line -match ':\(') { exit 77 }
+    $stage = 'create-acl-snapshot'
+    $snapshotPath = $env:FS_PERMS_SNAPSHOT_PATH
+    $snapshot = [IO.File]::Open($snapshotPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write)
+    $snapshotCreated = $true
+    $snapshot.Dispose()
+    $stage = 'save-acl'
+    $null = Run-Icacls @('/save', $snapshotPath)
+    $stage = 'read-saved-acl'
+    $lines = [IO.File]::ReadAllLines($snapshotPath, [Text.Encoding]::Unicode)
+    $stage = Test-IcaclsSave $lines ([IO.Path]::GetFileName($path)) $sid.Value
+    if ($stage -ne 'verified') {
+        if ($stage -eq 'saved-acl-rejected') { $exitCode = 13 }
+        throw 'saved ACL rejected'
     }
+    $stage = 'verify-acl'
     Assert-PrivateAcl
-    [Console]::Out.Write('verified')
-    exit 0
-} catch { exit 77 }
+    $result = 'verified'
+    $exitCode = 0
+} catch {
+    $result = $stage
+} finally {
+    if ($snapshotCreated) {
+        try { [IO.File]::Delete($snapshotPath) }
+        catch { $result = 'cleanup-acl-snapshot'; $exitCode = 77 }
+    }
+}
+[Console]::Out.Write($result)
+exit $exitCode
 "#;
 
-    fn acl(path: &Path, restrict: bool) -> io::Result<()> {
-        let root = std::env::var_os("SystemRoot").ok_or_else(unsupported)?;
+    fn acl_failure(output: &std::process::Output) -> io::Error {
+        // Whitelist child responses. Never forward arbitrary stdout/stderr,
+        // exception messages, paths, account names, SIDs or native tool output.
+        let reason = match output.stdout.as_slice() {
+            b"tool-unavailable" => "trusted icacls executable is unavailable",
+            b"token-sid-unavailable" => "current process token SID is unavailable",
+            b"set-owner" => "icacls owner assignment failed",
+            b"disable-inheritance" => "icacls inheritance removal failed",
+            b"read-acl" => "security descriptor read failed",
+            b"remove-other-aces" => "icacls removal of other principals failed",
+            b"remove-deny" => "icacls deny ACE removal failed",
+            b"grant-current-user" => "icacls current user grant failed",
+            b"verify-acl" => "owner or protected single-user DACL verification failed",
+            b"create-acl-snapshot" => "ACL snapshot creation failed in trusted temporary directory",
+            b"save-acl" => "icacls SDDL export failed",
+            b"read-saved-acl" => "icacls UTF-16 SDDL snapshot read failed",
+            b"saved-acl-format" => "unrecognized icacls UTF-16 SDDL record",
+            b"saved-acl-rejected" => "icacls SDDL is not a protected single-user DACL",
+            b"cleanup-acl-snapshot" => "ACL snapshot cleanup failed",
+            _ => "unrecognized ACL helper response",
+        };
+        let kind = if output.status.code() == Some(13) {
+            io::ErrorKind::PermissionDenied
+        } else {
+            io::ErrorKind::Unsupported
+        };
+        io::Error::new(
+            kind,
+            format!(
+                "secret ACL operation failed: {reason} (helper exit {:?})",
+                output.status.code()
+            ),
+        )
+    }
+
+    fn powershell_command() -> io::Result<Command> {
+        let root = std::env::var_os("SystemRoot").ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "secret ACL: SystemRoot is unavailable",
+            )
+        })?;
         let drive = match Path::new(&root).components().next() {
             Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_)) => {
                 prefix.as_os_str()
             }
-            _ => return Err(unsupported()),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "secret ACL: SystemRoot is not a local drive path",
+                ));
+            }
         };
         let system = Path::new(&root).join("System32");
-        let output = Command::new(system.join("WindowsPowerShell/v1.0/powershell.exe"))
-            .args([
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                ACL_SCRIPT,
-            ])
+        let mut command = Command::new(system.join("WindowsPowerShell/v1.0/powershell.exe"));
+        command
+            .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
             .env_clear()
             .env("SystemRoot", &root)
             .env("WINDIR", &root)
@@ -368,20 +475,55 @@ try {
                 "PSModulePath",
                 system.join("WindowsPowerShell/v1.0/Modules"),
             )
-            .env("FS_PERMS_PATH", path)
-            .env("FS_PERMS_RESTRICT", if restrict { "1" } else { "0" })
             .creation_flags(CREATE_NO_WINDOW)
             .stdin(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::null());
+        Ok(command)
+    }
+
+    fn acl(path: &Path, restrict: bool) -> io::Result<()> {
+        // Do not require write access to an existing secret's parent just to
+        // check it. Use a random, create-new metadata file in the caller's trusted
+        // temporary directory, with the same reparse/ancestor checks as the target.
+        let mut random = [0_u8; 16];
+        getrandom::fill(&mut random).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "secret ACL: snapshot name randomness is unavailable",
+            )
+        })?;
+        let name: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+        let snapshot = local_path(&std::env::temp_dir().join(format!("fs-perms-acl-{name}")))
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    "secret ACL: temporary snapshot path is unsupported",
+                )
+            })?;
+        let _snapshot_ancestors = hold_ancestors(&snapshot).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                "secret ACL: temporary snapshot ancestor verification failed",
+            )
+        })?;
+        let output = powershell_command()?
+            .arg(format!("{ACL_PARSER}\n{ACL_SCRIPT}"))
+            .env("FS_PERMS_PATH", path)
+            .env("FS_PERMS_SNAPSHOT_PATH", &snapshot)
+            .env("FS_PERMS_RESTRICT", if restrict { "1" } else { "0" })
             .output()
-            .map_err(|_| unsupported())?;
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!(
+                        "secret ACL: trusted PowerShell launch failed ({:?})",
+                        error.kind()
+                    ),
+                )
+            })?;
         match output.status.code() {
             Some(0) if output.stdout == b"verified" => Ok(()),
-            Some(13) => Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "secret ACL rejected",
-            )),
-            _ => Err(unsupported()),
+            _ => Err(acl_failure(&output)),
         }
     }
 
@@ -411,6 +553,82 @@ try {
 
     pub fn create_secret_file(path: &Path) -> io::Result<File> {
         prepare(path, true, true)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn icacls_saved_samples_are_sid_based_and_fail_closed() {
+            // These are /save records, not the lossy/localized console display.
+            // Parsing is pure: no account lookup, token query or filesystem I/O.
+            let samples = r#"
+function Assert-Sample($label, $lines, $name, $sid, $expected) {
+    $actual = Test-IcaclsSave $lines $name $sid
+    if ($actual -cne $expected) { [Console]::Out.Write($label); exit 1 }
+}
+$admin = 'S-1-5-21-111-222-333-500'
+$runner = 'S-1-5-21-444-555-666-1001'
+$name = "runneradmin 日本語 ' `$() ; [secret].txt"
+# Administrator and runneradmin need no reverse lookup to a display account name.
+Assert-Sample 'Administrator' @('secret.txt', "D:PAI(A;;FA;;;$admin)") 'secret.txt' $admin 'verified'
+Assert-Sample 'runneradmin' @($name, "D:PAI(A;;FA;;;$runner)") $name $runner 'verified'
+Assert-Sample 'numeric-mask' @($name, "D:P(A;;0x1f01ff;;;$runner)") $name $runner 'verified'
+Assert-Sample 'different-user' @($name, "D:P(A;;FA;;;$admin)") $name $runner 'saved-acl-rejected'
+# Display equivalents: NT AUTHORITY\SYSTEM:(I)(F), BUILTIN\Administrators:(I)(OI)(CI)(F).
+Assert-Sample 'inherited-SYSTEM' @($name, "D:PAI(A;;FA;;;$runner)(A;ID;FA;;;SY)") $name $runner 'saved-acl-rejected'
+Assert-Sample 'inherited-Administrators' @($name, "D:PAI(A;;FA;;;$runner)(A;OICIID;FA;;;BA)") $name $runner 'saved-acl-rejected'
+Assert-Sample 'explicit-SYSTEM' @($name, "D:P(A;;FA;;;$runner)(A;;FA;;;S-1-5-18)") $name $runner 'saved-acl-rejected'
+Assert-Sample 'explicit-Administrators' @($name, "D:P(A;;FA;;;$runner)(A;;FA;;;S-1-5-32-544)") $name $runner 'saved-acl-rejected'
+Assert-Sample 'inherited-current-user' @($name, "D:P(A;ID;FA;;;$runner)") $name $runner 'saved-acl-rejected'
+Assert-Sample 'inherit-only-current-user' @($name, "D:P(A;OIIO;FA;;;$runner)") $name $runner 'saved-acl-rejected'
+Assert-Sample 'unprotected' @($name, "D:AI(A;;FA;;;$runner)") $name $runner 'saved-acl-rejected'
+Assert-Sample 'deny' @($name, "D:P(D;;FA;;;$runner)") $name $runner 'saved-acl-rejected'
+Assert-Sample 'read-only' @($name, "D:P(A;;FR;;;$runner)") $name $runner 'saved-acl-rejected'
+Assert-Sample 'duplicate' @($name, "D:P(A;;FA;;;$runner)(A;;FA;;;$runner)") $name $runner 'saved-acl-rejected'
+Assert-Sample 'empty-DACL' @($name, 'D:P') $name $runner 'saved-acl-rejected'
+Assert-Sample 'null-DACL' @($name, 'D:NO_ACCESS_CONTROL') $name $runner 'saved-acl-rejected'
+Assert-Sample 'malformed' @($name, 'D:invalid') $name $runner 'saved-acl-format'
+Assert-Sample 'missing' @() $name $runner 'saved-acl-format'
+Assert-Sample 'extra-record' @($name, "D:P(A;;FA;;;$runner)", 'other.txt', 'D:P') $name $runner 'saved-acl-format'
+Assert-Sample 'wrong-path' @('other.txt', "D:P(A;;FA;;;$runner)") $name $runner 'saved-acl-format'
+# A UTF-16 roundtrip preserves names that an English OEM console renders as '?'.
+$record = $name + "`r`nD:P(A;;FA;;;$runner)`r`n"
+$roundtrip = [Text.Encoding]::Unicode.GetString([Text.Encoding]::Unicode.GetBytes($record))
+Assert-Sample 'utf16-roundtrip' ($roundtrip.TrimEnd("`r", "`n") -split "`r`n") $name $runner 'verified'
+[Console]::Out.Write('verified')
+"#;
+            let output = powershell_command()
+                .unwrap()
+                .arg(format!("{ACL_PARSER}\n{samples}"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "sample failed: {:?}",
+                output.stdout
+            );
+            assert_eq!(output.stdout, b"verified");
+        }
+
+        #[test]
+        fn acl_helper_errors_explain_stage_without_forwarding_output() {
+            use std::os::windows::process::ExitStatusExt;
+            let mut output = std::process::Output {
+                status: std::process::ExitStatus::from_raw(77),
+                stdout: b"token-sid-unavailable".to_vec(),
+                stderr: b"private test fixture data".to_vec(),
+            };
+            let error = acl_failure(&output);
+            assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+            assert!(error.to_string().contains("current process token SID"));
+            output.stdout = b"private test fixture data".to_vec();
+            assert!(!acl_failure(&output).to_string().contains("fixture"));
+            output.status = std::process::ExitStatus::from_raw(13);
+            output.stdout = b"saved-acl-rejected".to_vec();
+            assert_eq!(acl_failure(&output).kind(), io::ErrorKind::PermissionDenied);
+        }
     }
 }
 
