@@ -3,6 +3,7 @@ use crate::{
     redact::redact,
     response_drain::{ResponseDrain, ResponseOperation},
 };
+use bot_framework::interactions::InteractionKind;
 use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
@@ -27,7 +28,11 @@ const EVENT_REPLAY_CAPABILITY: &str = "event-replay-v1";
 const HELLO_CAPABILITY: &str = "hello-v1";
 const CONCURRENT_DRAIN_CAPABILITY: &str = "concurrent-drain-v1";
 const API_RESULT_CAPABILITY: &str = "api-result-v1";
+const INTERACTION_CAPABILITY: &str = "interaction-state-v1";
+const DRAIN_SIGNAL_CAPABILITY: &str = "drain-signal-v1";
 const OPTIONAL_CAPABILITIES: &[&str] = &[
+    INTERACTION_CAPABILITY,
+    DRAIN_SIGNAL_CAPABILITY,
     API_RESULT_CAPABILITY,
     CONCURRENT_DRAIN_CAPABILITY,
     EVENT_SEQ_CAPABILITY,
@@ -47,6 +52,7 @@ pub struct DeploymentIdentity {
     pub shard: crate::protocol::Shard,
     generation: Option<std::sync::atomic::AtomicU64>,
     core_launch: Option<crate::shard_runtime::test_switch::CoreLaunch>,
+    interaction_state: Option<InteractionStateConfig>,
 }
 impl DeploymentIdentity {
     pub fn from_env() -> Result<Self, AppError> {
@@ -87,7 +93,15 @@ impl DeploymentIdentity {
             shard: crate::protocol::Shard::new(id, total).map_err(failure)?,
             generation,
             core_launch: None,
+            interaction_state: None,
         })
+    }
+
+    /// Trusted launch configuration, retained across replacement and recovery.
+    /// The independent signing key travels only on the child's anonymous pipe.
+    pub fn with_interaction_state(mut self, config: InteractionStateConfig) -> Self {
+        self.interaction_state = Some(config);
+        self
     }
 
     fn next_identity(&self) -> Result<crate::protocol::Identity, AppError> {
@@ -104,6 +118,93 @@ impl DeploymentIdentity {
             generation_id: crate::protocol::GenerationId(generation),
             ownership_epoch: crate::protocol::OwnershipEpoch(0),
         })
+    }
+}
+
+/// Optional local application state, never a Bot token. Keep the key in the
+/// caller's protected configuration across Manager restarts; it is not saved
+/// in the state journal or child environment. No Debug implementation exposes it.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InteractionStateConfig {
+    path: PathBuf,
+    namespace: crate::state_store::PublicLabel,
+    signing_key: [u8; 32],
+    supported_versions: Vec<u16>,
+    schema: crate::state_store::SchemaVersion,
+    max_entries: usize,
+    max_bytes: usize,
+    max_value_bytes: usize,
+    max_journal_bytes: u64,
+}
+impl InteractionStateConfig {
+    pub fn file(
+        path: PathBuf,
+        namespace: crate::state_store::PublicLabel,
+        signing_key: [u8; 32],
+        supported_versions: Vec<u16>,
+        schema: crate::state_store::SchemaVersion,
+    ) -> Self {
+        Self {
+            path,
+            namespace,
+            signing_key,
+            supported_versions,
+            schema,
+            max_entries: 4096,
+            max_bytes: 16 * 1024 * 1024,
+            max_value_bytes: 64 * 1024,
+            max_journal_bytes: 64 * 1024 * 1024,
+        }
+    }
+
+    pub fn with_limits(
+        mut self,
+        limits: crate::state_store::StoreLimits,
+        journal_bytes: u64,
+    ) -> Self {
+        self.max_entries = limits.max_entries;
+        self.max_bytes = limits.max_bytes;
+        self.max_value_bytes = limits.max_value_bytes;
+        self.max_journal_bytes = journal_bytes;
+        self
+    }
+
+    async fn adapter(
+        self,
+        identity: &crate::protocol::Identity,
+        backend: Option<Arc<dyn crate::state_store::StateStore>>,
+    ) -> Result<crate::state_store::FrameworkStateStore, AppError> {
+        use crate::state_store::{
+            FileStateStore, FrameworkStateStore, StoreLimits, StoreScope, SystemClock,
+        };
+        let store = match backend {
+            Some(store) => store,
+            None => Arc::new(
+                FileStateStore::open(
+                    &self.path,
+                    StoreLimits {
+                        max_entries: self.max_entries,
+                        max_bytes: self.max_bytes,
+                        max_value_bytes: self.max_value_bytes,
+                    },
+                    self.max_journal_bytes,
+                    Arc::new(SystemClock),
+                )
+                .await?,
+            ),
+        };
+        Ok(FrameworkStateStore::new(
+            store,
+            StoreScope {
+                bot_id: identity.bot_id,
+                shard_id: identity.shard.id(),
+            },
+            self.namespace,
+            self.signing_key,
+            self.supported_versions,
+            self.schema,
+        )?)
     }
 }
 
@@ -204,6 +305,16 @@ pub fn error_file(file: &Path) -> PathBuf {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Request {
+    ConfigureInteractions {
+        config: InteractionStateConfig,
+    },
+    /// One-way control notification, read independently of application work.
+    BeginDrain,
+    Interaction {
+        kind: InteractionKind,
+        custom_id: String,
+        values: Vec<String>,
+    },
     Hello {
         hello: crate::protocol::Hello,
     },
@@ -252,6 +363,7 @@ impl Request {
         matches!(
             self,
             Self::Dispatch { .. }
+                | Self::Interaction { .. }
                 | Self::Command { .. }
                 | Self::SlashCommand { .. }
                 | Self::ReadyEvent { .. }
@@ -271,7 +383,7 @@ impl Request {
                 let name = content.split_whitespace().next().unwrap_or("");
                 matches!(name, "!count" | "!job")
             }
-            Self::Command { .. } | Self::SlashCommand { .. } => false,
+            Self::Command { .. } | Self::SlashCommand { .. } | Self::Interaction { .. } => false,
             _ => true,
         }
     }
@@ -279,6 +391,7 @@ impl Request {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Response {
+    InteractionsConfigured,
     ApiResultAccepted {
         operation_id: u64,
         outcome: ApiOutcome,
@@ -426,7 +539,7 @@ struct TransferState {
 
 struct Process {
     _child: Child,
-    input: Option<ChildStdin>,
+    input: Arc<Mutex<Option<ChildStdin>>>,
     output: BufReader<ChildStdout>,
     broken: bool,
     transfer: Arc<StdMutex<TransferState>>,
@@ -451,8 +564,15 @@ impl Process {
     ) -> Result<Self, AppError> {
         let identity = deployment.next_identity()?;
         let mut hello = local_hello(identity.clone());
+        if deployment.interaction_state.is_none() {
+            // Existing command-only peers and relays keep their EOF drain
+            // contract. Negotiate new wire controls only when configured.
+            hello
+                .optional_capabilities
+                .retain(|cap| cap != INTERACTION_CAPABILITY && cap != DRAIN_SIGNAL_CAPABILITY);
+        }
         let mut command = Command::new(path);
-        if policy.isolated {
+        if policy.isolated || deployment.interaction_state.is_some() {
             command.env_clear();
         }
         if let Some(core) = &deployment.core_launch {
@@ -480,7 +600,7 @@ impl Process {
         );
         let mut process = Self {
             _child: child,
-            input: Some(input),
+            input: Arc::new(Mutex::new(Some(input))),
             output,
             broken: false,
             transfer: Arc::new(StdMutex::new(TransferState {
@@ -512,6 +632,8 @@ impl Process {
                     EVENT_REPLAY_CAPABILITY,
                     CONCURRENT_DRAIN_CAPABILITY,
                     API_RESULT_CAPABILITY,
+                    INTERACTION_CAPABILITY,
+                    DRAIN_SIGNAL_CAPABILITY,
                 ] {
                     if !supported_capabilities.iter().any(|value| value == cap) {
                         hello.optional_capabilities.retain(|value| value != cap);
@@ -542,6 +664,8 @@ impl Process {
                             cap != EVENT_SEQ_CAPABILITY
                                 && cap != CONCURRENT_DRAIN_CAPABILITY
                                 && cap != API_RESULT_CAPABILITY
+                                && cap != INTERACTION_CAPABILITY
+                                && cap != DRAIN_SIGNAL_CAPABILITY
                         })
                         .collect();
                 }
@@ -561,6 +685,26 @@ impl Process {
                 }
                 if process.supports(API_RESULT_CAPABILITY) && process._child.id() != Some(pid) {
                     return Err(failure("worker API result process identity mismatch"));
+                }
+                if let Some(config) = &deployment.interaction_state {
+                    if !process.supports(INTERACTION_CAPABILITY)
+                        || !process.supports(DRAIN_SIGNAL_CAPABILITY)
+                        || !process.supports(CONCURRENT_DRAIN_CAPABILITY)
+                        || process.identity.is_none()
+                    {
+                        return Err(failure("worker lacks interaction state capabilities"));
+                    }
+                    match process
+                        .request(&Request::ConfigureInteractions {
+                            config: config.clone(),
+                        })
+                        .await?
+                    {
+                        Response::InteractionsConfigured => {}
+                        _ => {
+                            return Err(failure("worker interaction state configuration rejected"));
+                        }
+                    }
                 }
                 if process.supports(CONCURRENT_DRAIN_CAPABILITY) {
                     // Establish a confirmed initial snapshot, including custom
@@ -643,7 +787,8 @@ impl Process {
                 return Err(failure("worker request exceeds frame limit"));
             }
             timeout(DEADLINE, async {
-                let input = self.input.as_mut().ok_or_else(|| {
+                let mut writer = self.input.lock().await;
+                let input = writer.as_mut().ok_or_else(|| {
                     std::io::Error::new(std::io::ErrorKind::BrokenPipe, "worker input is closed")
                 })?;
                 input.write_all(&data).await?;
@@ -689,7 +834,17 @@ impl Process {
             serde_json::from_slice(&frame).map_err(|_| failure("invalid worker response"))
         })
         .await
-        .map_err(|_| failure("worker timed out"))
+        .map_err(|_| {
+            failure(match request {
+                Request::Health => "worker health timed out",
+                Request::Hello { .. } => "worker hello timed out",
+                Request::ConfigureInteractions { .. } => {
+                    "worker interaction configuration timed out"
+                }
+                Request::Snapshot => "worker snapshot timed out",
+                _ => "worker timed out",
+            })
+        })
         .and_then(|result| result);
         if result.is_ok() {
             self.broken = false;
@@ -793,9 +948,33 @@ struct Generation {
     state_barrier: Arc<RwLock<()>>,
     work: Arc<RwLock<()>>,
     responses: ResponseDrain,
+    drain: tokio::sync::watch::Sender<bool>,
+    drain_task: Mutex<Option<tokio::task::JoinHandle<Result<(), AppError>>>>,
 }
 impl Generation {
     fn new(path: PathBuf, process: Process) -> Arc<Self> {
+        let (drain, mut receiver) = tokio::sync::watch::channel(false);
+        let drain_task = if process.supports(DRAIN_SIGNAL_CAPABILITY) {
+            let input = process.input.clone();
+            Some(tokio::spawn(async move {
+                if receiver.changed().await.is_err() || !*receiver.borrow() {
+                    return Ok(());
+                }
+                timeout(DEADLINE, async {
+                    let mut writer = input.lock().await;
+                    let input = writer
+                        .as_mut()
+                        .ok_or_else(|| failure("worker input is closed"))?;
+                    input.write_all(b"{\"type\":\"begin_drain\"}\n").await?;
+                    input.flush().await?;
+                    Ok(())
+                })
+                .await
+                .map_err(|_| failure("worker drain notification timed out"))?
+            }))
+        } else {
+            None
+        };
         Arc::new(Self {
             path,
             transfer: process.transfer.clone(),
@@ -808,7 +987,27 @@ impl Generation {
             state_barrier: Arc::new(RwLock::new(())),
             work: Arc::new(RwLock::new(())),
             responses: ResponseDrain::new(1024),
+            drain,
+            drain_task: Mutex::new(drain_task),
         })
+    }
+    fn start_drain(&self) {
+        self.responses.start_drain();
+        self.drain.send_replace(true);
+    }
+    async fn wait_drain_notification(&self) -> Result<(), AppError> {
+        let mut task = self.drain_task.lock().await;
+        if let Some(handle) = task.as_mut() {
+            let result = handle
+                .await
+                .map_err(|_| failure("worker drain notification failed"));
+            // Completion consumes a JoinHandle even on failure. Remove it
+            // before propagating errors so a retry cannot poll it twice.
+            // Cancellation while awaiting still leaves the handle retained.
+            task.take();
+            result??;
+        }
+        Ok(())
     }
     fn needs_barrier(&self, request: &Request) -> bool {
         request.state_barrier()
@@ -1186,7 +1385,7 @@ impl Manager {
 
     fn install(&self, index: usize, active: &mut Arc<Generation>, next: Arc<Generation>) {
         // No await between closing admission, registration and routing commit.
-        active.responses.start_drain();
+        active.start_drain();
         let mut generations = self.generations.lock().unwrap();
         for entry in generations.iter_mut() {
             if Arc::ptr_eq(&entry.generation, active) {
@@ -1223,6 +1422,7 @@ impl Manager {
             .map(|entry| entry.generation.clone())
             .collect();
         for generation in retired {
+            generation.wait_drain_notification().await?;
             // This also waits for external response guards. Cancellation leaves
             // the registered generation available for later drain/reconciliation.
             let _work = timeout(DRAIN_DEADLINE, generation.work.write())
@@ -1477,6 +1677,28 @@ impl Manager {
         };
         self.execute_with_response(response, key, request).await
     }
+    /// The caller supplies authenticated, authorized component/modal input.
+    /// Tokens and initial Discord ACKs remain with the Gateway. Preserve this
+    /// guard through sending the reply and finish_response on the issuing Core.
+    pub async fn dispatch_interaction_with_response(
+        &self,
+        response: &mut ResponseGuard,
+        key: u64,
+        kind: InteractionKind,
+        custom_id: String,
+        values: Vec<String>,
+    ) -> Result<Option<String>, AppError> {
+        self.execute_with_response(
+            response,
+            key,
+            Request::Interaction {
+                kind,
+                custom_id,
+                values,
+            },
+        )
+        .await
+    }
     async fn execute_with_response(
         &self,
         response: &mut ResponseGuard,
@@ -1606,7 +1828,10 @@ impl Manager {
                 .map(|entry| entry.generation.clone())
                 .collect();
             for generation in &generations {
-                generation.responses.start_drain();
+                generation.start_drain();
+            }
+            for generation in &generations {
+                generation.wait_drain_notification().await?;
             }
             let mut work = Vec::with_capacity(generations.len());
             let mut unknown = false;
@@ -1616,7 +1841,7 @@ impl Manager {
             }
             // Close every pipe before waiting for any child to exit.
             for generation in &generations {
-                generation.process.lock().await.input.take();
+                generation.process.lock().await.input.lock().await.take();
             }
             let mut pids = Vec::with_capacity(generations.len());
             let mut failed = false;
@@ -1641,6 +1866,26 @@ impl Manager {
     }
     pub async fn dispatch(&self, content: String) -> Result<Option<String>, AppError> {
         self.dispatch_key(0, content).await
+    }
+    /// Dispatch admitted input on this Manager's trusted Bot/Shard scope.
+    /// The ID never selects a backend or changes the scope. Use the guarded
+    /// variant when an external response must be attributed across a switch.
+    pub async fn dispatch_interaction(
+        &self,
+        key: u64,
+        kind: InteractionKind,
+        custom_id: String,
+        values: Vec<String>,
+    ) -> Result<Option<String>, AppError> {
+        self.execute(
+            self.worker_index(key),
+            Request::Interaction {
+                kind,
+                custom_id,
+                values,
+            },
+        )
+        .await
     }
     pub async fn dispatch_key(
         &self,
@@ -1806,6 +2051,7 @@ impl Manager {
             Request::Command { .. } => Some("command-dispatch-v1"),
             Request::SlashCommand { .. } => Some("slash-arguments-v1"),
             Request::ReadyEvent { .. } => Some("ready-event-v1"),
+            Request::Interaction { .. } => Some(INTERACTION_CAPABILITY),
             _ => None,
         };
         if capability.is_some_and(|cap| !process.supports(cap)) {
@@ -2205,8 +2451,59 @@ fn credential_free_environment() -> bool {
     })
 }
 
+/// Worker process entry point. Call once and exit the process after completion
+/// or cancellation; a blocked reader may retain stdin until process exit.
 pub async fn run() -> Result<(), AppError> {
-    let mut input = BufReader::new(tokio::io::stdin());
+    run_with_backend(None).await
+}
+
+/// An application may supply its own async StateStore implementation instead
+/// of the local file backend. Configuration and scope still come from the
+/// trusted startup pipe; a backend must document its own durability/fencing.
+/// This is a once-per-process entry point, with the same stdin lifetime as run.
+pub async fn run_with_state_store(
+    store: Arc<dyn crate::state_store::StateStore>,
+) -> Result<(), AppError> {
+    run_with_backend(Some(store)).await
+}
+
+// The bounded reader keeps drain/EOF observable while the serial application
+// slot is awaiting a handler. It never dispatches application work itself.
+struct WorkerReader {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+impl Drop for WorkerReader {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take()
+            && thread.is_finished()
+        {
+            let _ = thread.join();
+        }
+        // A blocking stdin read cannot be portably interrupted. On protocol
+        // failure this process entry point returns and the OS closes the pipe.
+        // Unlike Tokio's stdin blocking task, this owned OS thread cannot hold
+        // runtime shutdown open while a peer is waiting for our stdout EOF.
+    }
+}
+
+fn read_blocking_frame<R: std::io::BufRead>(reader: &mut R) -> Result<Option<Vec<u8>>, AppError> {
+    let mut frame = Vec::new();
+    let mut limited = std::io::Read::take(reader, MAX_FRAME_BYTES + 1);
+    std::io::BufRead::read_until(&mut limited, b'\n', &mut frame)?;
+    if frame.is_empty() {
+        return Ok(None);
+    }
+    if frame.len() as u64 > MAX_FRAME_BYTES || frame.last() != Some(&b'\n') {
+        return Err(failure("invalid or oversized worker frame"));
+    }
+    Ok(Some(frame))
+}
+
+async fn run_with_backend(
+    backend: Option<Arc<dyn crate::state_store::StateStore>>,
+) -> Result<(), AppError> {
     let mut output = tokio::io::stdout();
     let mut state = crate::cogs::State::default();
     let runtime = Arc::new(crate::cogs::FrameworkRuntime::default());
@@ -2224,11 +2521,61 @@ pub async fn run() -> Result<(), AppError> {
     let mut sequenced_events = false;
     let mut replay_events = false;
     let mut api_results = false;
+    let mut interaction_state = false;
+    let mut adapter = None;
+    let mut interaction_registry = None;
+    let mut application_started = false;
+    let drain_enabled = Arc::new(AtomicBool::new(false));
+    let (drain, _) = tokio::sync::watch::channel(false);
+    let (requests, mut input) = tokio::sync::mpsc::channel(1);
+    let reader_drain = drain.clone();
+    let reader_enabled = drain_enabled.clone();
+    let reader_stop = Arc::new(AtomicBool::new(false));
+    let stopped = reader_stop.clone();
+    let reader = std::thread::Builder::new()
+        .name("worker-input".into())
+        .spawn(move || {
+            let stdin = std::io::stdin();
+            let mut reader = std::io::BufReader::new(stdin.lock());
+            loop {
+                if stopped.load(Ordering::Acquire) {
+                    break;
+                }
+                let next = match read_blocking_frame(&mut reader) {
+                    Ok(Some(frame)) => serde_json::from_slice::<Request>(&frame)
+                        .map_err(|error| Box::new(error) as AppError),
+                    Ok(None) => break,
+                    Err(error) => Err(error),
+                };
+                match next {
+                    Ok(Request::BeginDrain) if reader_enabled.load(Ordering::Acquire) => {
+                        reader_drain.send_replace(true);
+                    }
+                    Ok(Request::BeginDrain) => {
+                        let _ = requests
+                            .blocking_send(Err(failure("worker drain signal was not negotiated")));
+                        break;
+                    }
+                    request => {
+                        let failed = request.is_err();
+                        if requests.blocking_send(request).is_err() || failed {
+                            break;
+                        }
+                    }
+                }
+            }
+            // Parent loss cancels local waits even when no control message arrived.
+            reader_drain.send_replace(true);
+        })?;
+    let _reader = WorkerReader {
+        stop: reader_stop,
+        thread: Some(reader),
+    };
     let mut pending_results = std::collections::HashSet::new();
     let mut event_stream_initialized = false;
     let mut receiver = crate::event_seq::Receiver::new(0);
-    while let Some(frame) = read_frame(&mut input).await? {
-        let request = serde_json::from_slice(&frame)?;
+    while let Some(request) = input.recv().await {
+        let request = request?;
         let (request, operation) = match request {
             Request::ResponseDispatch {
                 operation_id,
@@ -2242,6 +2589,7 @@ pub async fn run() -> Result<(), AppError> {
                         Request::Dispatch { .. }
                             | Request::Command { .. }
                             | Request::SlashCommand { .. }
+                            | Request::Interaction { .. }
                     )
                 {
                     return Err(failure("invalid response-bearing dispatch"));
@@ -2272,6 +2620,25 @@ pub async fn run() -> Result<(), AppError> {
             request => request,
         };
         let response = match request {
+            Request::BeginDrain => unreachable!("reader consumes one-way drain signals"),
+            Request::ConfigureInteractions { config } => {
+                if !interaction_state || adapter.is_some() || application_started || *drain.borrow()
+                {
+                    return Err(failure("worker interaction configuration not permitted"));
+                }
+                let id = identity
+                    .as_ref()
+                    .ok_or_else(|| failure("missing worker identity"))?;
+                interaction_registry =
+                    Some(Arc::new(bot_framework::interactions::Registry::new()?));
+                adapter = Some(Arc::new(
+                    config
+                        .adapter(id, backend.clone())
+                        .await
+                        .map_err(|_| failure("worker interaction state unavailable"))?,
+                ));
+                Response::InteractionsConfigured
+            }
             Request::ResponseDispatch { .. } => unreachable!(),
             Request::ApiResult {
                 operation_id,
@@ -2312,6 +2679,16 @@ pub async fn run() -> Result<(), AppError> {
                     let hello = local_hello(identity);
                     match hello.negotiate(&peer) {
                         Ok((_, capabilities)) => {
+                            // A drain signal is permanent for this generation;
+                            // renegotiation must never reset its state.
+                            interaction_state =
+                                capabilities.iter().any(|cap| cap == INTERACTION_CAPABILITY);
+                            drain_enabled.store(
+                                capabilities
+                                    .iter()
+                                    .any(|cap| cap == DRAIN_SIGNAL_CAPABILITY),
+                                Ordering::Release,
+                            );
                             sequenced_events =
                                 capabilities.iter().any(|cap| cap == EVENT_SEQ_CAPABILITY);
                             replay_events = capabilities
@@ -2344,6 +2721,8 @@ pub async fn run() -> Result<(), AppError> {
                     "command-dispatch-v1".into(),
                     "ready-event-v1".into(),
                     "slash-arguments-v1".into(),
+                    INTERACTION_CAPABILITY.into(),
+                    DRAIN_SIGNAL_CAPABILITY.into(),
                 ],
                 // No values are inspected, serialized or logged. Windows may
                 // supply SystemRoot even to a process launched with env_clear.
@@ -2351,11 +2730,73 @@ pub async fn run() -> Result<(), AppError> {
                 build: crate::cogs::build_id().to_owned(),
                 pid: std::process::id(),
             },
+            Request::Interaction {
+                kind,
+                custom_id,
+                values,
+            } => {
+                application_started = true;
+                match (&adapter, &interaction_registry) {
+                    (Some(adapter), Some(registry)) if interaction_state && !*drain.borrow() => {
+                        let adapter = adapter.clone();
+                        let registry = registry.clone();
+                        let signal = drain.subscribe();
+                        let snapshot = serde_json::to_value(&state)?;
+                        tasks
+                            .request(async move {
+                                let replies = StdMutex::new(Vec::new());
+                                let result = registry
+                                    .dispatch_with_drain(
+                                        adapter.as_ref(),
+                                        kind,
+                                        &custom_id,
+                                        &values,
+                                        &replies,
+                                        signal,
+                                    )
+                                    .await;
+                                // Safe framework errors remain distinct, especially
+                                // ambiguous writes; never retry the application here.
+                                let content = match result {
+                                    Ok(()) => {
+                                        let replies = replies.into_inner().map_err(|_| {
+                                            failure("interaction reply sink failed")
+                                        })?;
+                                        if replies.is_empty() {
+                                            None
+                                        } else {
+                                            Some(replies.join("\n"))
+                                        }
+                                    }
+                                    Err(error) => Some(error.response().to_owned()),
+                                };
+                                let response = Response::Result {
+                                    content,
+                                    state: snapshot,
+                                };
+                                if serde_json::to_vec(&response)?.len() >= MAX_FRAME_BYTES as usize
+                                {
+                                    return Ok(Response::Rejected {
+                                        reason: "state or response exceeds worker frame limit"
+                                            .into(),
+                                    });
+                                }
+                                Ok::<_, AppError>(response)
+                            })
+                            .await
+                            .map_err(|_| failure("managed interaction failed"))??
+                    }
+                    _ => Response::Rejected {
+                        reason: "interaction state unavailable or draining".into(),
+                    },
+                }
+            }
             command @ (Request::Dispatch { .. }
             | Request::Command { .. }
             | Request::SlashCommand { .. }
             | Request::ReadyEvent { .. }
             | Request::Tick) => {
+                application_started = true;
                 let previous = state.clone();
                 let owned = std::mem::take(&mut state);
                 match tasks
