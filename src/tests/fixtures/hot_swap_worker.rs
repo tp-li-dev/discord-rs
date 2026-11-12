@@ -75,7 +75,7 @@ fn event(executable: &Path, value: &str) -> Result<()> {
 }
 
 fn wait_release(executable: &Path) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(20);
     while !sidecar(executable, ".release").exists() {
         if Instant::now() >= deadline {
             event(executable, "gate-timeout")?;
@@ -234,6 +234,9 @@ fn run() -> Result<u8> {
         }
         if kind == "restore" && response.contains("\"type\":\"restored\"") {
             event(&executable, "restore-completed")?;
+        }
+        if kind == "snapshot" && response.contains("\"type\":\"snapshot\"") {
+            event(&executable, "snapshot-completed")?;
         }
         if slow {
             event(&executable, "slow-completed")?;

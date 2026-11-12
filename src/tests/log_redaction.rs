@@ -2,9 +2,64 @@ use src::placement::{Config, PlacementError};
 use std::{
     io::{BufRead, BufReader, Write},
     net::TcpListener,
-    process::{Command, Stdio},
-    time::Duration,
+    path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
+    time::{Duration, Instant},
 };
+
+const DEADLINE: Duration = Duration::from_secs(30);
+
+fn directory(label: &str) -> PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "{label}-{}-{:016x}",
+        std::process::id(),
+        getrandom::u64().unwrap()
+    ));
+    std::fs::create_dir(&path).unwrap();
+    path
+}
+
+struct CoreGuard {
+    child: Child,
+    fixture_exit: PathBuf,
+}
+
+impl Drop for CoreGuard {
+    fn drop(&mut self) {
+        // The fixture also exits if an assertion panics before graceful shutdown.
+        let _ = std::fs::write(&self.fixture_exit, b"exit");
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn ready_port(directory: &Path, child: &mut Child) -> u16 {
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "management core exited before readiness"
+        );
+        let endpoint = |name| {
+            std::fs::read(directory.join(name))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .and_then(|value| value["port"].as_u64())
+                .and_then(|port| u16::try_from(port).ok())
+                .filter(|port| *port != 0)
+        };
+        if let Some(port) = endpoint("core.json")
+            && endpoint("viewer.json") == Some(port)
+        {
+            return port;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "management endpoint readiness deadline"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
 
 #[test]
 fn placement_debug_hides_even_short_unlabelled_text() {
@@ -24,10 +79,7 @@ fn placement_debug_hides_even_short_unlabelled_text() {
 
 #[test]
 fn management_reply_errors_and_log_display_are_masked() {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join(format!("redaction-test-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = directory("redaction-test");
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     std::fs::write(
@@ -39,6 +91,8 @@ fn management_reply_errors_and_log_display_are_masked() {
     let server = std::thread::spawn(move || {
         for ok in [true, false] {
             let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(DEADLINE)).unwrap();
+            socket.set_write_timeout(Some(DEADLINE)).unwrap();
             let mut line = String::new();
             BufReader::new(socket.try_clone().unwrap())
                 .read_line(&mut line)
@@ -71,7 +125,7 @@ fn management_reply_errors_and_log_display_are_masked() {
     let fixture_binary = dir.join(format!("fixture{}", std::env::consts::EXE_SUFFIX));
     std::fs::write(
         &fixture_source,
-        "fn main() { loop { std::thread::sleep(std::time::Duration::from_secs(1)); } }",
+        "fn main() { let exit = std::env::var_os(\"FIXTURE_EXIT\").unwrap(); while !std::path::Path::new(&exit).exists() { std::thread::sleep(std::time::Duration::from_millis(10)); } }",
     )
     .unwrap();
     assert!(
@@ -83,24 +137,22 @@ fn management_reply_errors_and_log_display_are_masked() {
             .unwrap()
             .success()
     );
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    let mut core = Command::new(env!("CARGO_BIN_EXE_manage"))
+    let fixture_exit = dir.join("fixture-exit");
+    let child = Command::new(env!("CARGO_BIN_EXE_manage"))
         .arg("__core")
         .arg(&fixture_binary)
         .env("DISCORD_CORE_DIR", &dir)
-        .env("DISCORD_CORE_PORT", port.to_string())
+        .env("DISCORD_CORE_PORT", "0")
+        .env("FIXTURE_EXIT", &fixture_exit)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    for _ in 0..100 {
-        if dir.join("core.json").exists() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let mut core = CoreGuard {
+        child,
+        fixture_exit,
+    };
+    let port = ready_port(&dir, &mut core.child);
     std::fs::write(dir.join("core.log"), "old token=fake-log-capability\n").unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_manage"))
         .arg("logs")
@@ -121,7 +173,7 @@ fn management_reply_errors_and_log_display_are_masked() {
             .unwrap()
             .success()
     );
-    assert!(core.wait().unwrap().success());
+    assert!(core.child.wait().unwrap().success());
     let audit = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap();
     let records: Vec<serde_json::Value> = audit
         .lines()
@@ -133,20 +185,22 @@ fn management_reply_errors_and_log_display_are_masked() {
             && r["result"] == "succeeded")
     );
     assert!(!audit.contains("fake-log-capability"));
-    for file in ["core.log", "audit.jsonl", "fixture.rs"] {
-        std::fs::remove_file(dir.join(file)).unwrap();
+    drop(core);
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                assert!(Instant::now() < deadline, "fixture cleanup deadline");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => panic!("fixture cleanup failed: {:?}", error.kind()),
+        }
     }
-    std::fs::remove_file(fixture_binary).unwrap();
-    #[cfg(windows)]
-    std::fs::remove_file(dir.join("fixture.pdb")).unwrap();
-    std::fs::remove_dir(dir).unwrap();
 }
 #[test]
 fn reload_masks_child_build_stdout_and_stderr() {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join(format!("redaction-build-test-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = directory("redaction-build-test");
     #[cfg(windows)]
     let script = dir.join("fake-cargo.cmd");
     #[cfg(windows)]

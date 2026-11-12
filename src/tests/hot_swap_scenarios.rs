@@ -1,6 +1,10 @@
 //! Process scenarios for architecture §6 / T04–T06 / T19.
 //! The relay runs the production Worker; only fault timing and build labels change.
 //! These are Worker-manager tests, not proof of Shard/Discord hot swapping.
+#[path = "support/fixture_build.rs"]
+mod fixture_build;
+
+use fixture_build::unique_directory;
 use src::worker::{DeploymentIdentity, Manager, error_file, status_file};
 use std::{
     future::Future,
@@ -11,7 +15,9 @@ use std::{
 };
 use tokio::{task::JoinHandle, time::timeout};
 
-const BUDGET: Duration = Duration::from_secs(30);
+// Harness watchdogs must leave room for production's own 30s request deadline
+// to report its failure. They are not application latency requirements.
+const BUDGET: Duration = Duration::from_secs(60);
 const PONG: &str = "Pong! 🦀";
 
 async fn bounded<T>(future: impl Future<Output = T>) -> T {
@@ -22,20 +28,6 @@ fn sidecar(path: &Path, suffix: &str) -> PathBuf {
     let mut value = path.as_os_str().to_owned();
     value.push(suffix);
     value.into()
-}
-
-fn unique_directory(label: &str) -> PathBuf {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join("hot-swap-scenarios");
-    std::fs::create_dir_all(&root).unwrap();
-    let path = root.join(format!(
-        "{label}-{}-{:016x}",
-        std::process::id(),
-        getrandom::u64().unwrap()
-    ));
-    std::fs::create_dir(&path).unwrap();
-    path
 }
 
 fn relay_binary() -> &'static Path {
@@ -59,58 +51,14 @@ fn relay_binary() -> &'static Path {
     })
 }
 
-fn application_worker_binary() -> &'static Path {
-    static BINARY: OnceLock<PathBuf> = OnceLock::new();
-    BINARY.get_or_init(|| {
-        let output = unique_directory("application-build")
-            .join(format!("application{}", std::env::consts::EXE_SUFFIX));
-        let test_executable = std::env::current_exe().unwrap();
-        let dependencies = test_executable.parent().unwrap();
-        let mut command = Command::new("rustc");
-        command
-            .args(["--edition=2024", "-Dwarnings"])
-            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hot_swap_handler.rs"))
-            .arg("-L")
-            .arg(dependencies);
-        // `cargo check`/clippy can leave additional .rmeta files beside the
-        // built libraries. Link only the actual rlibs used by executable tests.
-        for name in ["src", "bot_framework", "tokio"] {
-            let prefix = format!("lib{name}-");
-            let library = std::fs::read_dir(dependencies)
-                .unwrap()
-                .map(|entry| entry.unwrap().path())
-                .filter(|path| {
-                    path.file_name()
-                        .and_then(|file| file.to_str())
-                        .is_some_and(|file| file.starts_with(&prefix) && file.ends_with(".rlib"))
-                })
-                .max_by_key(|path| {
-                    path.metadata()
-                        .and_then(|metadata| metadata.modified())
-                        .expect("read fixture library modification time")
-                })
-                .unwrap_or_else(|| panic!("need a compiled {name} rlib for fixture linking"));
-            let mut external = std::ffi::OsString::from(format!("{name}="));
-            external.push(&library);
-            command.arg("--extern").arg(external);
-        }
-        let result = command
-            .arg("-o")
-            .arg(&output)
-            .env_remove("DISCORD_TOKEN")
-            .output()
-            .expect("compile production Worker with an async application handler");
-        assert!(
-            result.status.success(),
-            "application fixture compilation failed: {result:?}"
-        );
-        output
-    })
-}
-
 struct Scenario(PathBuf);
 impl Scenario {
-    fn new(label: &str) -> Self {
+    async fn new(label: &str) -> Self {
+        // Compile/wait for the shared relay before any process deadline starts,
+        // without blocking this scenario's Tokio executor on rustc/OnceLock.
+        tokio::task::spawn_blocking(relay_binary)
+            .await
+            .expect("relay preparation panicked");
         Self(unique_directory(label))
     }
 
@@ -158,17 +106,22 @@ fn events(path: &Path) -> Vec<String> {
     }
 }
 
-async fn wait_for(mut condition: impl FnMut() -> bool) {
-    bounded(async {
+async fn wait_for(description: &str, mut condition: impl FnMut() -> bool) {
+    timeout(BUDGET, async {
         while !condition() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
-    .await;
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {description}"));
 }
 
 async fn wait_event(path: &Path, event: &str) {
-    wait_for(|| events(path).iter().any(|value| value == event)).await;
+    wait_for(
+        &format!("relay event {event} at {}", path.display()),
+        || events(path).iter().any(|value| value == event),
+    )
+    .await;
 }
 
 fn release(path: &Path) {
@@ -195,7 +148,7 @@ async fn wait_active(manager: &Manager, build: &str) {
     // The old relay remains gated until release(), so observing the new route
     // never depends on beating an application-completion sleep. Keep this
     // watchdog below the fixture's gate timeout; it is not a latency target.
-    timeout(Duration::from_secs(8), async {
+    timeout(Duration::from_secs(15), async {
         loop {
             if manager
                 .describe_workers()
@@ -221,7 +174,7 @@ fn read_error(file: &Path) -> Option<serde_json::Value> {
 
 async fn wait_error(file: &Path, candidate: &Path) -> serde_json::Value {
     let mut observed = None;
-    wait_for(|| {
+    wait_for("complete management error record", || {
         if let Some(value) = read_error(file)
             && value["path"].as_str() == candidate.to_str()
         {
@@ -236,7 +189,7 @@ async fn wait_error(file: &Path, candidate: &Path) -> serde_json::Value {
 }
 
 async fn wait_success(file: &Path, candidate: &Path) {
-    wait_for(|| {
+    wait_for("successful update status", || {
         std::fs::read_to_string(status_file(file))
             .is_ok_and(|value| value == candidate.to_string_lossy())
             && !error_file(file).exists()
@@ -246,7 +199,7 @@ async fn wait_success(file: &Path, candidate: &Path) {
 
 #[tokio::test]
 async fn t05_candidate_crashes_before_ready_while_v1_keeps_its_process_and_state() {
-    let scenario = Scenario::new("t05");
+    let scenario = Scenario::new("t05").await;
     let old = scenario.worker("v1");
     let candidate = scenario.worker("crash-before-ready");
     let healthy = scenario.worker("v2");
@@ -291,7 +244,7 @@ async fn t05_candidate_crashes_before_ready_while_v1_keeps_its_process_and_state
 }
 
 async fn rejected_hello(mode: &str, expected_error: &str) {
-    let scenario = Scenario::new(mode);
+    let scenario = Scenario::new(mode).await;
     let candidate = scenario.worker(mode);
     let healthy = scenario.worker("v2");
     let manager = manager(scenario.worker("v1")).await;
@@ -352,7 +305,7 @@ async fn crash_child(scenario: &Scenario) -> Output {
 
 #[tokio::test]
 async fn t06_crash_after_commit_restarts_v2_without_replaying_the_failed_request() {
-    let scenario = Scenario::new("t06-recovery");
+    let scenario = Scenario::new("t06-recovery").await;
     let result = crash_child(&scenario).await;
     let stderr = String::from_utf8(result.stderr).unwrap();
     assert!(stderr.contains("Workerを再起動しました"), "{stderr}");
@@ -418,7 +371,7 @@ async fn t06_process_driver() {
     assert_ne!(recovered, committed);
     assert!(recovered.contains("crash-once / PID:"));
     // Restored is flushed before the relay appends its completion marker.
-    wait_for(|| {
+    wait_for("both checkpoint restores", || {
         events(&candidate)
             .iter()
             .filter(|event| *event == "restore-completed")
@@ -469,7 +422,7 @@ async fn t06_process_driver() {
 async fn t06_post_commit_unknown_outcome_is_recorded_for_management() {
     // The management-file convention is an observability extension, not a
     // claim that §6 prescribes this persistence format or a rollback to v1.
-    let scenario = Scenario::new("t06-record");
+    let scenario = Scenario::new("t06-record").await;
     crash_child(&scenario).await;
     let candidate = scenario
         .0
@@ -488,7 +441,7 @@ async fn t06_post_commit_unknown_outcome_is_recorded_for_management() {
 
 #[tokio::test]
 async fn t04_inflight_response_and_checkpoint_survive_cutover() {
-    let scenario = Scenario::new("t04-checkpoint");
+    let scenario = Scenario::new("t04-checkpoint").await;
     let old = scenario.worker("v1");
     let candidate = scenario.worker("v2");
     let manager = manager(old.clone()).await;
@@ -540,7 +493,7 @@ async fn t04_five_second_v1_response_completes_during_update() {
     // The production demo has no five-second handler. Delay its actual ping at
     // the IPC relay: this reproduces the same total-request deadline boundary,
     // without claiming application-task or Discord REST drain was exercised.
-    let scenario = Scenario::new("t04-five-seconds");
+    let scenario = Scenario::new("t04-five-seconds").await;
     let old = scenario.worker("v1");
     let candidate = scenario.worker("v2");
     let manager = manager(old.clone()).await;
@@ -581,7 +534,7 @@ async fn t04_five_second_v1_response_completes_during_update() {
 
 #[tokio::test]
 async fn t04_new_requests_reach_v2_before_v1_is_released() {
-    let scenario = Scenario::new("t04-concurrent-drain");
+    let scenario = Scenario::new("t04-concurrent-drain").await;
     let old = scenario.worker("v1");
     let candidate = scenario.worker("v2");
     let manager = manager(old.clone()).await;
@@ -633,7 +586,7 @@ async fn t04_new_requests_reach_v2_before_v1_is_released() {
 
 #[tokio::test]
 async fn t04_external_response_stays_with_v1_while_v2_accepts_new_work() {
-    let scenario = Scenario::new("t04-external-response");
+    let scenario = Scenario::new("t04-external-response").await;
     let old = scenario.worker("v1");
     let candidate = scenario.worker("v2");
     let manager = manager(old.clone()).await;
@@ -694,7 +647,7 @@ async fn t04_external_response_stays_with_v1_while_v2_accepts_new_work() {
 
 #[tokio::test]
 async fn t04_unknown_old_response_blocks_followup_updates_until_reconciled() {
-    let scenario = Scenario::new("t04-unknown-response");
+    let scenario = Scenario::new("t04-unknown-response").await;
     let old = scenario.worker("v1");
     let candidate = scenario.worker("v2");
     let manager = manager(old).await;
@@ -757,7 +710,7 @@ async fn t04_unknown_old_response_blocks_followup_updates_until_reconciled() {
 
 #[tokio::test]
 async fn t04_cancelling_retirement_keeps_old_response_and_new_routing() {
-    let scenario = Scenario::new("t04-cancel-retirement");
+    let scenario = Scenario::new("t04-cancel-retirement").await;
     let old = scenario.worker("v1");
     let candidate = scenario.worker("v2");
     let manager = manager(old.clone()).await;
@@ -789,7 +742,7 @@ async fn t04_cancelling_retirement_keeps_old_response_and_new_routing() {
 
 #[tokio::test]
 async fn t04_stateful_request_finishes_before_snapshot_handoff() {
-    let scenario = Scenario::new("t04-stateful-barrier");
+    let scenario = Scenario::new("t04-stateful-barrier").await;
     let old = scenario.worker("count-gated");
     let candidate = scenario.worker("v2");
     let manager = manager(old.clone()).await;
@@ -806,7 +759,7 @@ async fn t04_stateful_request_finishes_before_snapshot_handoff() {
     wait_event(&candidate, "hello").await;
     // snapshot-v3 is shared mutable demo state. Its in-flight mutation must
     // finish before v2 can be restored; read-only concurrency cannot lose it.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_event(&candidate, "snapshot-completed").await;
     assert!(!request.0.is_finished());
     assert!(!update.0.is_finished());
     assert!(
@@ -831,11 +784,15 @@ async fn t04_stateful_request_finishes_before_snapshot_handoff() {
 
 #[tokio::test]
 async fn t04_real_five_second_handler_drains_while_v2_serves_new_requests() {
-    let scenario = Scenario::new("t04-real-handler");
+    let scenario = Scenario::new("t04-real-handler").await;
     let application = scenario
         .0
         .join(format!("application{}", std::env::consts::EXE_SUFFIX));
-    std::fs::copy(application_worker_binary(), &application).unwrap();
+    std::fs::copy(
+        fixture_build::application_worker_binary().await,
+        &application,
+    )
+    .unwrap();
     let old = scenario.worker("v1");
     let candidate = scenario.worker("v2");
     std::fs::write(sidecar(&old, ".real"), application.to_str().unwrap()).unwrap();
@@ -844,7 +801,10 @@ async fn t04_real_five_second_handler_drains_while_v2_serves_new_requests() {
         let manager = manager.clone();
         async move { manager.dispatch("!five_second".into()).await }
     }));
-    wait_for(|| sidecar(&application, ".started").exists()).await;
+    wait_for("real application handler start", || {
+        sidecar(&application, ".started").exists()
+    })
+    .await;
     let mut update = Task(tokio::spawn({
         let manager = manager.clone();
         async move { manager.replace(candidate, false).await }
@@ -875,7 +835,7 @@ async fn t04_real_five_second_handler_drains_while_v2_serves_new_requests() {
 
 #[tokio::test]
 async fn t06_recovery_during_candidate_readiness_rechecks_unknown_old_outcomes() {
-    let scenario = Scenario::new("t06-readiness-recovery-race");
+    let scenario = Scenario::new("t06-readiness-recovery-race").await;
     let old = scenario.worker("crash-once");
     let candidate = scenario.worker("ready-gated");
     let manager = manager(old.clone()).await;
