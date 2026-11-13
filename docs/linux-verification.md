@@ -82,7 +82,7 @@ GitHub Actions: 未実行または run URL、commit、各 OS の結果:
 
 `.github/workflows/bench.yml` は `workflow_dispatch` のみで起動し、Rust 1.90.0 の Ubuntu ランナーでベンチを逐次実行します。ローカル手順と異なり、CI は `--locked` を使い、依存取得のため offline にはしません。自己検査と各ベンチのログ、commit・OS・CPU・メモリ・Rust・標本設定を `linux-benchmarks-<run_id>-<run_attempt>` artifact に保存します。失敗時も残りのベンチと artifact 保存を試みますが、ジョブの中断や準備失敗時には結果が欠けることがあります。ステップの成否も確認してください。
 
-このワークフローはまだ実行しておらず、Linux 計測や Actions の動作は未検証です。共有ランナーの揺らぎと各測定の対象範囲については [benchmarks.md](benchmarks.md) を参照してください。
+過去のLinux CIとベンチ実行は [progress.md](progress.md) と [benchmarks.md](benchmarks.md) に記録されています。今回の文書更新ではActionsやベンチを実行していません。共有ランナーの揺らぎと各測定の対象範囲はベンチ記録を参照してください。
 
 ## GitHub Actions での手動ストレス試験
 

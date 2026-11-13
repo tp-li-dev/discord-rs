@@ -1,5 +1,16 @@
 # 秘密情報とログの安全性
 
+## 現行実装の補足
+
+> [!NOTE]
+> 2026-11-13の決定により、**対応OSはLinux(Ubuntu)のみであり、Windowsはサポート外**（開発機での動作は保証しない。Windows固有コードは残るが保証・CI対象外）です。後述のWindows開発機での検証結果はすべて『過去の参考記録』と位置づけられ、Windows ACL未実装などの未対応事項は未解決課題ではなく『サポート外』として扱われます。実Discordでの検証はユーザーが実施する範囲です。
+
+`fs_perms` は Linux において開いたハンドルの Unix mode をファイル0600・ディレクトリ0700に設定・検証する。Windows 用パス API コードは残るが、Windows はサポート外（Windows ACL、ハンドル API、ディレクトリ保護は未解決課題ではなく『サポート外』）である。信頼された親パス等を前提とし TOCTOU を完全には防がない。既存の全資格情報経路に自動適用されない。
+
+証明書の leaf 切替・失効、永続ポリシー、CA チェーンを扱う部品がある。`cluster_runtime::bind_raft` は mTLS Raft RPC に接続する試験経路だが、本番 Raft 起動は拒否される。証明書配布や本番運用への自動統合は未保証。過去の節は当時の個別経路の記録である。
+
+`botd` の更新操作はサーバー側 capability を principal・role・shard scope に結び付け、監査と操作 ID を使う。遠隔管理全体や再起動を跨ぐ冪等性は未完成。
+
 2026-11-12 調査・適用。基準は architecture.md §4.3 / §13.1。今回の担当範囲の現状は次節、従来の調査と検証履歴は後段に記載する。担当外の logger 等が残るため、リポジトリ全体の秘密保護完了は主張しない。progress.md / handoff.md は今回の指示に従い変更していない。
 
 ## 残課題6：今回の出力境界の修正
@@ -26,9 +37,9 @@ Worker の stdout は JSON IPC 専用で、通常の content/state や設定を�
 
 新規試験は担当 Rust ファイル内に置き、自己再起動する子プロセスへ架空の token / secret / key / Authorization と短い無ラベル値を渡し、stdout/stderr と終了コードを検査する。panic の payload・スレッド名、子出力、外部 I/O/JSON エラー、管理応答・保存用失敗分類を対象とする。重い workspace 全試験、release ビルド、実Discordは実行しない。
 
-### 今回の検証結果（Windows / Rust 1.90.0）
+### 過去の参考記録: Windows / Rust 1.90.0 での検証結果
 
-`src/` から Cargo はすべて `--offline -p src --jobs 2` で実行した。対象を絞った結果は重複再実行を除き62件成功・1件失敗。子プロセス専用fixtureの4件は通常実行ではignoreされ、親の回帰試験から明示実行される。
+以下は過去のWindows開発機での検証結果である（Windowsはサポート外であり、開発機での動作は保証しない。Linuxが対象）。`src/` から Cargo はすべて `--offline -p src --jobs 2` で実行した。対象を絞った結果は重複再実行を除き62件成功・1件失敗。子プロセス専用fixtureの4件は通常実行ではignoreされ、親の回帰試験から明示実行される。
 
 | 対象 | 結果 |
 |---|---|
@@ -108,22 +119,22 @@ Worker の stdout は JSON IPC 専用で、通常の content/state や設定を�
 
 `src/tests/main_security.rs` は実バイナリの欠落・非 Unicode token、不正 Worker JSON（短い無ラベル秘密を含む）、正常 health wire を確認する。main の単体試験は、外部 Display / Debug を実行しないこと、token 読込分類、Interaction identity の HTTP 相当クロージャへの引渡しを確認する。`src/tests/worker_replay.rs` は未信頼のコマンド・restore 拒否理由の保護と、実 watch が書く失敗状態の診断文字列の保護、旧 Worker 継続を確認する。すべて架空値を使用する。実 Discord・実 HTTP の例外ログと Linux は未検証。
 
-今回の統合後、Windows / Rust 1.99.0 で `cargo test --offline --workspace` は293件（新規24件、doc-testを含む）成功。`cargo clippy --offline --workspace --all-targets -- -D warnings`、`cargo fmt --all --check`、`git diff --check` も成功した。release ビルドを伴う既存 reload / 管理 / 更新試験を含む。子 cargo も `CARGO_NET_OFFLINE=true` で実行した。これらは任意 logger・panic hook・外部ライブラリ出力の秘密保護を保証する結果ではない。
+過去の参考記録: 当時の統合後、Windows / Rust 1.99.0 で `cargo test --offline --workspace` は293件（新規24件、doc-testを含む）成功（Windowsはサポート外であり、開発機での動作は保証しない。Linuxが対象）。`cargo clippy --offline --workspace --all-targets -- -D warnings`、`cargo fmt --all --check`、`git diff --check` も成功した。release ビルドを伴う既存 reload / 管理 / 更新試験を含む。子 cargo も `CARGO_NET_OFFLINE=true` で実行した。これらは任意 logger・panic hook・外部ライブラリ出力の秘密保護を保証する結果ではない。
 
 ### 今回の回帰試験
 
 `src/tests/log_redaction.rs` は架空値のみを使用する。配置 Debug と PlacementError の整形、実 manage CLI による認証 wire 互換・成功/失敗応答・既存ログ表示、実 reload CLI と失敗する偽ビルド子の stdout/stderr を検証する。実 Discord や本番管理プロセスは起動しない。管理サーバーの last_failure 保存、更新成功、実ビルドおよび実 HTTP エラーの統合動作は未検証。
 
-Windows で `src/` から `cargo test --offline --lib --bins --test log_redaction --test redact --target-dir target/log-redaction` が50件成功（新規3件を含む）。同じ対象の `cargo clippy --offline --lib --bins --test log_redaction --test redact --target-dir target/log-redaction -- -D warnings`、変更 Rust ファイルの `rustfmt --check --edition 2024`、`git diff --check` が成功。Linux と workspace 他パッケージ全体の再試験は今回行っていない。初回は register の文書コメント位置でコンパイルが失敗したが修正後に再実行して成功した。専用 target directory を使用し、既存の実行中 exe との競合を避けた。
+過去の参考記録: 当時 Windows で `src/` から `cargo test --offline --lib --bins --test log_redaction --test redact --target-dir target/log-redaction` が50件成功（新規3件を含む）。同じ対象の `cargo clippy --offline --lib --bins --test log_redaction --test redact --target-dir target/log-redaction -- -D warnings`、変更 Rust ファイルの `rustfmt --check --edition 2024`、`git diff --check` が成功。Linux と workspace 他パッケージ全体の再試験は今回行っていない。初回は register の文書コメント位置でコンパイルが失敗したが修正後に再実行して成功した。専用 target directory を使用し、既存の実行中 exe との競合を避けた。
 
 `src/tests/redact.rs` は架空値のみで大小文字、認証方式、ラベル、URL、複数行、UTF-8、複数秘密、重複マッチ、閉じていない引用符、非秘密文、および Secret の整形を検証する。
 
-Windows での検証結果：
+過去の参考記録（当時のWindowsでの検証結果、Windowsはサポート外）：
 
 - 着手時の `cargo test --offline` はビルド・既存テストとも成功（workspace 全パッケージ指定ではない）。
 - `cargo test --offline --test redact` は既存テストと同じ出力先を並行使用したため、実行中 exe の削除が Windows のアクセス拒否で失敗。別出力先による `cargo test --offline --test redact --target-dir target-redact` は5件すべて成功。検証後の出力物は既存の無視対象 `target/redact-verification` に移動した。
 - `cargo clippy --offline --lib --test redact -- -D warnings`、新規 Rust ファイルの `rustfmt --check --edition 2024`、`git diff --check` は成功。
-- Linux、実 Discord、実運用ログ収集、性能・ファジングは未検証。
+- Linux、実 Discord（ユーザー検証範囲）、実運用ログ収集、性能・ファジングは未検証。
 
 ## RBAC と追記専用監査 API（2026-11-12）
 
@@ -156,7 +167,7 @@ Windows での検証結果：
 
 ### ファイル権限・容量・ローテーション
 
-新規ファイルは Unix で作成モード0600を指定し、既存ファイルに group/other 権限があれば拒否する。新規作成後はファイルと Unix の親ディレクトリを同期する。Windows は親ディレクトリの ACL を継承するだけで、ACL の設定・検証は行っていない。Windows ACL、電源断を含む永続化保証は未検証であり、運用側で専用ディレクトリへのアクセスを制限する必要がある。
+新規ファイルは Unix で作成モード0600を指定し、既存ファイルに group/other 権限があれば拒否する。新規作成後はファイルと Unix の親ディレクトリを同期する。Windows はサポート外（Windows ACL の設定・検証は未解決課題ではなく『サポート外』）。電源断を含む永続化保証は未検証であり、運用側で専用ディレクトリへのアクセスを制限する必要がある。
 
 パスはクライアント指定を使用せず、事前作成した private な安定したディレクトリ内の固定パスを使う。通常ファイル以外・symlink、Unix の複数 hardlink を拒否するが、標準ライブラリによる検査と open の間の競合や親ディレクトリの差替えを完全には防がない。信頼できないユーザーに親ディレクトリの変更権限を与えないこと。ベースファイルの OS 排他ロックを writer 生存中ずっと保持し、同じログへの協調する複数 writer を拒否する。Unix ロックは advisory であり、OS 管理者・同一ユーザーによる改竄への耐性や署名付き監査は提供しない。
 
@@ -164,24 +175,24 @@ Windows での検証結果：
 
 再開時は既存 JSONL をレコード上限付きで読み、不正 JSON・未終端・サイズ超過・連番ファイルの欠番・要求 ID の逆行を拒否し、自動修復や履歴削除はしない。通常ログの読み取り・ローテーション設定の変更は writer 停止中に行う。監査不能な過大メタデータは操作を実行せずエラーで返し、その要求を監査できたとは扱わない。
 
-### 今回の検証範囲
+### 過去の参考記録: Windows / Rust 1.99.0 での検証範囲
 
-Windows / Rust 1.99.0 でロール×全9操作、未認証遠隔要求、確認の全組合せ、成功・失敗・panic、秘密マスク、改行注入、サイズ上限、容量予約、履歴を維持するローテーション・再開・排他・破損拒否を試験した。実際の読み取り専用 OS ハンドルへの書き込み失敗で操作が走らないことと、操作後の外部 truncate を結果不明として返して後続操作を拒否することも試験した。この API 単体試験では実管理通信への接続、Linux実行、Unix0600試験の実行、Windows ACL、実媒体障害・強制終了・電源断・負荷時性能は未検証。`docs/progress.md` は依頼どおり変更せず、PM に最終報告で引き継ぐ。
+過去のWindows開発機（Windows / Rust 1.99.0、サポート外）でロール×全9操作、未認証遠隔要求、確認の全組合せ、成功・失敗・panic、秘密マスク、改行注入、サイズ上限、容量予約、履歴を維持するローテーション・再開・排他・破損拒否を試験した。実際の読み取り専用 OS ハンドルへの書き込み失敗で操作が走らないことと、操作後の外部 truncate を結果不明として返して後続操作を拒否することも試験した。この API 単体試験では実管理通信への接続、Linux実行、Unix0600試験の実行、実媒体障害・強制終了・電源断・負荷時性能は未検証（Windows ACL はサポート外）。`docs/progress.md` は依頼どおり変更せず、PM に最終報告で引き継ぐ。
 
 `src/` から `cargo test --offline --lib --test rbac_audit --test redact` が73件、`cargo test --offline --doc` が3件成功した（新規 RBAC/監査の実行試験33件と使用例1件を含む）。Unix限定2件はWindowsでは実行されない。`cargo clippy --offline --lib --test rbac_audit -- -D warnings`、`rustfmt --check --edition 2024 src/rbac_audit.rs tests/rbac_audit.rs src/lib.rs`、`git diff --check` も成功。workspace 全パッケージ・全統合テストの再実行は今回の検証範囲に含めていない。
 
 
 ## ローカル管理経路への適用
 
-`manage` は loopback の管理接続で資格情報を照合し、`core.json` の資格情報に admin、別の `viewer.json` の資格情報に viewer をサーバー側で結び付ける。クライアントが要求でロールを選ぶことはできない。各ファイルには同じ形式の接続先とそれぞれ別の秘密が入るため、必要な権限を持つユーザーにだけ該当ファイルへのアクセスを許可する。Windows でこれらのファイルや監査ディレクトリの ACL の設定・検証は実装されておらず、ACL は未検証。資格情報を読める同一ユーザーのプロセスからの利用を区別する仕組みではない。
+`manage` は loopback の管理接続で資格情報を照合し、`core.json` の資格情報に admin、別の `viewer.json` の資格情報に viewer をサーバー側で結び付ける。クライアントが要求でロールを選ぶことはできない。各ファイルには同じ形式の接続先とそれぞれ別の秘密が入るため、必要な権限を持つユーザーにだけ該当ファイルへのアクセスを許可する。Windows ACL はサポート外（Windows非対応）。資格情報を読める同一ユーザーのプロセスからの利用を区別する仕組みではない。
 
-認証・認可の拒否と管理操作を `runtime/audit.jsonl` に記録する。操作前の監査書き込み・同期に失敗した場合は操作を実行しない。操作後の結果記録が失敗した場合は副作用を巻き戻せず、結果不明として扱う。監査の容量、排他、改竄耐性の制約は前節に従う。受信できなかったフレームなど、要求として識別できない接続のすべてを監査できる保証はない。接続枠または処理待ちキューの飽和時も拒否を記録できない場合がある。未認証の遠隔管理を許可せず、遠隔管理ハンドラーへの mTLS・RBAC の接続は未実装。Daemon 間 Transport 単体の実装は次節の範囲に限る。
+認証・認可の拒否と管理操作を `runtime/audit.jsonl` に記録する。操作前の監査書き込み・同期に失敗した場合は操作を実行しない。操作後の結果記録が失敗した場合は副作用を巻き戻せず、結果不明として扱う。監査の容量、排他、改竄耐性の制約は前節に従う。受信できなかったフレームなど、要求として識別できない接続のすべてを監査できる保証はない。接続枠または処理待ちキューの飽和時も拒否を記録できない場合がある。未認証の遠隔管理を許可せず、遠隔管理ハンドラーへの mTLS・RBAC の接続は未実装。試験用 daemon 間通信と Raft RPC は mTLS Transport を使う。
 
-`metrics-json` と `metrics-prometheus` は管理プロセス内のメトリクススナップショットを返す。現在の registry は Gateway / Worker の観測に接続されていないため、表示値を実環境の状態や健全性の証明に使えない。Windows ACL、Linux 実機、実 Discord や遠隔管理を通じた動作は未検証。
+`metrics-json` と `metrics-prometheus` は管理プロセス内のメトリクススナップショットを返す。現在の registry は Gateway / Worker の観測に接続されていないため、表示値を実環境の状態や健全性の証明に使えない。Windows ACL はサポート外。Linux 実機、実 Discord（ユーザー検証範囲）や遠隔管理を通じた動作は未検証。
 
 ## botd / botctl のローカル管理境界
 
-`botd` は loopback のみで受け付け、匿名 stdin で渡された非ゼロの32バイト共有資格情報を要求と定数時間比較してから操作を管理キューに渡す。`botctl` は bootstrap 情報を読みこの資格情報を送信する。これは `manage` の viewer / admin と別の経路で、`botd` 側に RBAC / `AuditedExecutor` の接続はなく、共有資格情報を持つ利用者ごとの役割分離・永続監査を提供しない。資格情報や bootstrap ファイルを閲覧可能な主体から保護する必要がある。`--force` の確認は権限認証の代替ではない。遠隔管理や mTLS とこのローカル listener は接続されていない。`src/src/bin/botd.rs` の `authenticated_status_returns_snapshot_without_secret`、`status_is_dispatched_only_after_authentication` と `src/tests/botctl_daemon.rs` がローカル経路の一部を検証する。Windows ACL、複数ホストでの利用は未検証。
+`botd` は loopback のみで受け付け、匿名 stdin で渡された非ゼロの32バイト共有資格情報を要求と定数時間比較してから操作を管理キューに渡す。`botctl` は bootstrap 情報を読みこの資格情報を送信する。これは `manage` の viewer / admin と別の経路で、更新capabilityにはrole・shard scopeと監査が接続されるが、全操作で利用者ごとの役割分離・永続監査を提供しない。資格情報や bootstrap ファイルを閲覧可能な主体から保護する必要がある。`--force` の確認は権限認証の代替ではない。遠隔管理や mTLS とこのローカル listener は接続されていない。`src/src/bin/botd.rs` の `authenticated_status_returns_snapshot_without_secret`、`status_is_dispatched_only_after_authentication` と `src/tests/botctl_daemon.rs` がローカル経路の一部を検証する。Windows ACL はサポート外、複数ホストでの利用は未検証。
 
 ## Daemon 間 mTLS TCP Transport（2026-11-12）
 
@@ -193,7 +204,7 @@ Windows / Rust 1.99.0 でロール×全9操作、未認証遠隔要求、確認�
 - `NodeId(u64)` は証明書の唯一の DNS SAN `node-<10進整数>.cluster` から取り出す（例: `NodeId(7)` は `node-7.cluster`）。先頭ゼロ、符号、ワイルドカード、末尾ドット、大文字への置換、複数 SAN、DNS 以外の SAN を受理しない。SAN がない場合だけ、UTF8String / PrintableString の唯一の CN に同形式を許す。SAN と CN が両方あれば完全一致が必要で、曖昧な名前や CN への暗黙の逃げ道を認めない。
 - CN 単独の場合は、提示チェーンが leaf 1枚だけで、設定したすべての trust anchor に NameConstraints がない場合に限定する。DNS の名前制約は CN に適用されないため、中間 CA や制約付き root を使う場合は SAN を必須にする。SAN の名前制約は webpki が検査する。SAN/CN 抽出用の小さな DER リーダーは境界・長さ・タグを検査するが、X.509 の署名・期限検証を代替しない。
 - 発信時はルート表の期待ノード ID とサーバー証明書を照合し、受信時はクライアント証明書とフレームの送信元を照合する。宛先 ID と接続開始時の受信側 incarnation も一致させる。別の許可ノードへのなりすましを防ぐ。payload 内の提案や ACK を実行する権限・現在の epoch の妥当性は、上位の合意・fencing 層で別途確認する。
-- TLS 再開と 0-RTT は無効。接続ごとに証明書を再検証する。証明書失効（CRL / OCSP）と自動ローテーション・オンラインの信頼一覧更新は**未実装**。置換時は Transport を停止して新設定で作成する。[rustls のチェーン検証 API](https://docs.rs/rustls/0.23.46/rustls/client/fn.verify_server_cert_signed_by_trust_anchor.html) は失効検査を含まない。設定した CA の秘密鍵と発行権限は運用側で管理する。
+- TLS 再開と 0-RTT は無効。接続ごとに証明書を再検証する。失効リストとleaf証明書の重複期間付きローテーションは後に実装された。OCSPと証明書配布・本番運用への自動統合は未完成。[rustls のチェーン検証 API](https://docs.rs/rustls/0.23.46/rustls/client/fn.verify_server_cert_signed_by_trust_anchor.html) は失効検査を含まない。設定した CA の秘密鍵と発行権限は運用側で管理する。
 
 ### 起動・制限・配送契約
 
@@ -215,9 +226,9 @@ MessagePack は現 workspace では dev-dependency のみで、依存追加は�
 
 `incarnation` は再起動ごとに呼出側が非ゼロの新しい値を割り当てる契約で、永続採番は未実装。Transport の時刻は各プロセスの経過時間で、payload の heartbeat / lease / 提案期限は元の時計領域を保持する。既存 PeerTable / cluster_sim は共有 Clock を前提にするため、実ホスト間の時計比較や安全な lease へそのまま転用しない。mTLS や heartbeat 喪失だけで quorum 承認・昇格権限を作らない。
 
-### 検証範囲
+### 過去の参考記録: Windows / Rust 1.99.0 での検証範囲
 
-テスト内だけで rcgen により CA・ノード証明書を生成し、秘密鍵をファイルやログへ保存しない。Windows / Rust 1.99.0 の実 TCP loopback で4種類のメッセージ往復、SAN / CN、偽 CA・未許可・不一致・期限・EKU・NameConstraints・平文・TLSバージョン・ALPN の拒否、巨大/不正フレーム、slowloris、接続・キュー上限と回復、shutdown を検証した。送信側の handshake / greeting / ACK の無応答、length prefix の小分け送信、shutdown 取消後の再待機も試験した。PeerTable / Failover には共通 ManualClock と実 TCP で届いた heartbeat を供給し、途絶の Suspected → FailoverPending と quorum 不足での Degraded を検証した。分散 consensus や実 Shard 起動を検証した試験ではない。
+テスト内だけで rcgen により CA・ノード証明書を生成し、秘密鍵をファイルやログへ保存しない。当時のWindows開発機（Windows / Rust 1.99.0、サポート外）の実 TCP loopback で4種類のメッセージ往復、SAN / CN、偽 CA・未許可・不一致・期限・EKU・NameConstraints・平文・TLSバージョン・ALPN の拒否、巨大/不正フレーム、slowloris、接続・キュー上限と回復、shutdown を検証した。送信側の handshake / greeting / ACK の無応答、length prefix の小分け送信、shutdown 取消後の再待機も試験した。PeerTable / Failover には共通 ManualClock と実 TCP で届いた heartbeat を供給し、途絶の Suspected → FailoverPending と quorum 不足での Degraded を検証した。分散 consensus や実 Shard 起動を検証した試験ではない。
 
 `src/` から次の確認に成功した。新規は実 TCP 統合25件と DER / codec / 名前の単体3件で、関連既存試験を含む145件と doctest 4件は失敗・ignoreとも0件。workspace 全体の実行試験は再実行していない。
 
@@ -229,4 +240,4 @@ cargo fmt --all --check
 git diff --check
 ```
 
-Linux 実行、IPv6実通信、複数ホスト/Tailscale、実 Discord、OS suspend・時計ずれ、本番 quorum/lease、負荷性能、証明書失効・ローテーション、永続監査との接続は未検証または未実装。既存制約文書・進捗の統合更新は PM に引き継ぎ、`docs/progress.md` は変更しない。
+Linux 実行、IPv6実通信、複数ホスト/Tailscale、実 Discord（ユーザー検証範囲）、OS suspend・時計ずれ、本番 quorum/lease、負荷性能、当時の証明書失効・ローテーション、永続監査との接続は未検証または未実装だった。新機能として `fs_perms`、`cert_rotation`/`cert_policy`/CA、`raft_quorum`（mTLS Raft）、`cluster_runtime` の Raft 経路、`child_recovery`、`update_rollback` と daemon の update 制御、`subscription`/`durable_jobs`、`FrameworkStateStore` とファイル永続 `StateStore`、`metrics_feed`、`discord_smoke`、手動ワークフロー `stress.yml`/`bench.yml` が追加されているが、実Discord検証はユーザーが実施する範囲である。既存制約文書・進捗の統合更新は PM に引き継ぎ、`docs/progress.md` は変更しない。
