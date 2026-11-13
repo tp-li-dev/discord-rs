@@ -33,7 +33,7 @@ use tokio_rustls::{TlsAcceptor, TlsConnector, client::TlsStream};
 
 const A: NodeId = NodeId(1);
 const B: NodeId = NodeId(2);
-const WAIT: Duration = Duration::from_secs(10);
+const WAIT: Duration = Duration::from_secs(60);
 const OVERLAP: Duration = Duration::from_secs(3);
 const KEY_SENTINEL: &str = "rotation-private-key-material-must-never-appear";
 

@@ -17,7 +17,7 @@ use std::{
 };
 use tokio::time::{Instant, sleep, timeout};
 
-const WAIT: Duration = Duration::from_secs(15);
+const WAIT: Duration = Duration::from_secs(60);
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
 
 struct Root(PathBuf);

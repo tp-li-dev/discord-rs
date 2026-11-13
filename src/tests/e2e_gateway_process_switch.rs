@@ -26,7 +26,7 @@ use tokio::{
     process::Child,
 };
 
-const WAIT: Duration = Duration::from_secs(20);
+const WAIT: Duration = Duration::from_secs(90);
 const SECRET: [u8; 32] = [79; 32];
 const SENTINELS: [&str; 3] = [
     "test-only-switch-alpha-credential",

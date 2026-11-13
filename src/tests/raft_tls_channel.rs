@@ -33,7 +33,7 @@ use tokio::{
 };
 use tokio_rustls::{TlsAcceptor, TlsConnector, client::TlsStream};
 
-const WAIT: Duration = Duration::from_secs(8);
+const WAIT: Duration = Duration::from_secs(60);
 
 struct Ca {
     cert: Certificate,

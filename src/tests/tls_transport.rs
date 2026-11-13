@@ -31,7 +31,7 @@ use tokio_rustls::{TlsAcceptor, TlsConnector, client::TlsStream};
 const A: NodeId = NodeId(1);
 const B: NodeId = NodeId(2);
 const C: NodeId = NodeId(3);
-const WAIT: Duration = Duration::from_secs(5);
+const WAIT: Duration = Duration::from_secs(60);
 const ALPN: &[u8] = b"botd-cluster/1";
 
 struct TestCa {

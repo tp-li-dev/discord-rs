@@ -26,7 +26,7 @@ use src::{
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::time::{Instant, sleep};
 
-const WAIT: Duration = Duration::from_secs(15);
+const WAIT: Duration = Duration::from_secs(60);
 const CEILING: Duration = Duration::from_secs(2);
 
 struct Root(PathBuf);

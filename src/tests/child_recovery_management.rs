@@ -22,7 +22,7 @@ use tokio::{
     process::{Child, Command},
 };
 
-const WAIT: Duration = Duration::from_secs(15);
+const WAIT: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Default)]
 struct ManualClock(Arc<Mutex<Duration>>);

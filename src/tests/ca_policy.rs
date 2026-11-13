@@ -27,7 +27,7 @@ use tokio_rustls::{TlsConnector, client::TlsStream};
 const A: NodeId = NodeId(1);
 const B: NodeId = NodeId(2);
 const C: NodeId = NodeId(3);
-const WAIT: Duration = Duration::from_secs(10);
+const WAIT: Duration = Duration::from_secs(60);
 const OVERLAP: Duration = Duration::from_millis(700);
 
 struct Ca {

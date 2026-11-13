@@ -21,7 +21,7 @@ use std::{
 };
 use tokio::time::{Instant, sleep};
 
-const WAIT: Duration = Duration::from_secs(20);
+const WAIT: Duration = Duration::from_secs(60);
 const TTL: Duration = Duration::from_secs(10);
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
 

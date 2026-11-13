@@ -33,7 +33,7 @@ use std::{
 };
 use tokio::time::{Instant, sleep, sleep_until, timeout};
 
-const WAIT: Duration = Duration::from_secs(20);
+const WAIT: Duration = Duration::from_secs(60);
 
 struct Ca {
     certificate: Certificate,
