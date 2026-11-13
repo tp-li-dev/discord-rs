@@ -9,8 +9,9 @@ RELOAD="reload_command"
 CLUSTER="cluster_sim raft_cluster_runtime e2e_cluster_processes"
 DAEMON="botctl_daemon fixture_build raft_quorum"
 # Tests that spawn several real botd/Gateway/Worker processes each. Running all of
-# their tests at once starves a 4-vCPU runner and trips the deadlines, so this
-# shard limits concurrency.
+# their tests at once is unreliable (the tests interfere when run concurrently;
+# serial runs pass, see docs/known-limitations.md), so this
+# shard runs them serially.
 PROCESS="e2e_gateway_process_switch botd_child_recovery gateway_admission_process hot_swap_scenarios raft_botd_processes botd_metrics child_recovery_processes worker_child_recovery e2e_shard_worker e2e_shard_runtime"
 
 targets() {
@@ -46,7 +47,7 @@ case "${1:?shard name required}" in
     ;;
   process)
     # shellcheck disable=SC2086
-    run $(test_args $PROCESS) -- --test-threads=2
+    run $(test_args $PROCESS) -- --test-threads=1
     ;;
   rest)
     heavy=" $RELOAD $CLUSTER $DAEMON $PROCESS "

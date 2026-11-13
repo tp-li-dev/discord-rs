@@ -56,3 +56,7 @@
 [progress.md](progress.md) に記録されている Windows / Rust 1.99.0 での過去のworkspace検証は『過去の参考記録』です。統合直後にT04が一度失敗し、再実行で成功、fixture の成果物選択も修正されたと記録されています。これらは追加後の現コードの再検証結果ではなく、安定性は引き続き要確認です。現統合版の本番Linux、実Discord（ユーザー検証範囲）、複数ホスト・実ネットワーク、OS suspendや本番合意の検証は確認されていません。
 
 [benchmarks.md](benchmarks.md) はWindows開発機の過去の参考記録とユーザー提供のLinux共有CI記録（Actions ubuntu-latest、IPC往復 p99 = 115.5/258.1/973.6 µs、failover検知 Suspected p50 1503.6 ms / FailoverPending p50 3003.1 ms、共有ランナーで本番保証ではない、往復値で片道p99の直接測定ではない）を含みます。実Discord検証はユーザーが実施する範囲です。Linux本番性能、負荷時Heartbeat、RSS/Shard、1/4/16/64 Shard、更新・Failover遅延は未検証です。個々の測定を仕様全体の性能目標達成の証拠にはしません。
+
+## 試験の並列実行時の干渉（既知の課題、2026-11-13）
+- 実プロセス（botd、Gateway、Worker、模擬 Discord）を複数起動する統合試験（`e2e_gateway_process_switch`、`botd_child_recovery`、`hot_swap_scenarios`、`raft_botd_processes` など）は、同一バイナリ内で並列に実行すると、GitHub Actions（Ubuntu、4 vCPU）でハングして待ち時間上限を超えることがある（落ちる試験は実行ごとに異なる）。`--test-threads=1` の直列実行では、Ubuntu で `e2e_gateway_process_switch` の 7 件が 3 回連続成功した（各 9 秒前後）。
+- CI は `.github/scripts/test-shard.sh` の `process` シャードでこれらを直列に実行して回避している。根本原因（試験間の共有資源の取り合い、子プロセス回収の干渉など）は特定していない。未解決。
