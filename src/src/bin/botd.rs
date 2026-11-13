@@ -4,8 +4,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use src::daemon::control::{CommandRequest, ControlPlane, NOTE};
 use src::daemon::update_control::{ControlAccess, UpdateHub};
+use src::{cluster::NodeId, cluster_runtime::RaftRuntimeOptions, raft_quorum::StorageMode};
 use src::{local_control::DaemonControlEnvelope, update_rollback::UpdateControlRequest};
-use std::{ffi::OsString, io, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{
+    collections::BTreeMap, ffi::OsString, io, net::SocketAddr, path::PathBuf, time::Duration,
+};
 use subtle::ConstantTimeEq;
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
@@ -17,7 +20,7 @@ use tokio::{
 const REQUEST_LIMIT: u64 = 4096;
 const RESPONSE_LIMIT: usize = 64 * 1024;
 const DEADLINE: Duration = Duration::from_secs(3);
-const USAGE: &str = "usage: botd --file F --runtime-root ABS --gateway-program ABS --bootstrap-stdin [--no-autostart] [--mock-discord LOOPBACK_IP:PORT] [--allow-test-quorum] [--allow-test-gateway-switch --mock-identify-budget F]";
+const USAGE: &str = "usage: botd --file F --runtime-root ABS --gateway-program ABS --bootstrap-stdin [--no-autostart] [--mock-discord LOOPBACK_IP:PORT] [--allow-test-quorum] [--allow-raft-quorum --raft-store ABS --raft-rpc-listen LOOPBACK_IP:PORT --raft-rpc-peer ID=LOOPBACK_IP:PORT ... [--raft-create] [--raft-bootstrap]] [--allow-test-gateway-switch --mock-identify-budget F]";
 
 struct Options {
     file: PathBuf,
@@ -26,6 +29,7 @@ struct Options {
     no_autostart: bool,
     mock_discord: Option<SocketAddr>,
     allow_test_quorum: bool,
+    raft: Option<RaftRuntimeOptions>,
     allow_test_gateway_switch: bool,
     mock_identify_budget: Option<PathBuf>,
     mock_recovery_max_restarts: Option<u32>,
@@ -40,6 +44,12 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
     let mut no_autostart = false;
     let mut mock_discord = None;
     let mut allow_test_quorum = false;
+    let mut allow_raft_quorum = false;
+    let mut raft_store = None;
+    let mut raft_rpc_listen = None;
+    let mut raft_rpc_peers = BTreeMap::new();
+    let mut raft_create = false;
+    let mut raft_bootstrap = false;
     let mut allow_test_gateway_switch = false;
     let mut mock_identify_budget = None;
     let mut mock_recovery_max_restarts = None;
@@ -48,6 +58,39 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
             Some("--file") if file.is_none() => &mut file,
             Some("--runtime-root") if runtime_root.is_none() => &mut runtime_root,
             Some("--gateway-program") if gateway_program.is_none() => &mut gateway_program,
+            Some("--raft-store") if raft_store.is_none() => &mut raft_store,
+            Some("--allow-raft-quorum") if !allow_raft_quorum => {
+                allow_raft_quorum = true;
+                continue;
+            }
+            Some("--raft-create") if !raft_create => {
+                raft_create = true;
+                continue;
+            }
+            Some("--raft-bootstrap") if !raft_bootstrap => {
+                raft_bootstrap = true;
+                continue;
+            }
+            Some("--raft-rpc-listen") if raft_rpc_listen.is_none() => {
+                let value = args.next().ok_or(USAGE)?;
+                raft_rpc_listen = Some(raft_endpoint(value.to_str().ok_or(USAGE)?)?);
+                continue;
+            }
+            Some("--raft-rpc-peer") => {
+                let value = args.next().ok_or(USAGE)?;
+                let (id, address) = value.to_str().ok_or(USAGE)?.split_once('=').ok_or(USAGE)?;
+                let node: u64 = id.parse().map_err(|_| "invalid Raft peer ID")?;
+                if node == 0 || id != node.to_string() || raft_rpc_peers.len() >= 15 {
+                    return Err("invalid Raft peer ID or member limit");
+                }
+                if raft_rpc_peers
+                    .insert(NodeId(node), raft_endpoint(address)?)
+                    .is_some()
+                {
+                    return Err("duplicate Raft peer ID");
+                }
+                continue;
+            }
             Some("--mock-identify-budget") if mock_identify_budget.is_none() => {
                 &mut mock_identify_budget
             }
@@ -99,6 +142,53 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
         }
         *target = Some(PathBuf::from(value));
     }
+    let raft = if allow_raft_quorum {
+        if mock_discord.is_none() {
+            return Err("Raft quorum requires --mock-discord; production is disabled");
+        }
+        if allow_test_quorum || allow_test_gateway_switch || no_autostart {
+            return Err("Raft quorum requires exclusive automatic process ownership");
+        }
+        let storage_path = raft_store.ok_or("Raft quorum requires --raft-store")?;
+        if !storage_path.is_absolute()
+            || storage_path
+                .components()
+                .any(|part| part == std::path::Component::ParentDir)
+        {
+            return Err("Raft store must be an absolute path without parent traversal");
+        }
+        if raft_bootstrap && !raft_create {
+            return Err("Raft bootstrap requires explicit --raft-create");
+        }
+        let rpc_listen = raft_rpc_listen.ok_or("Raft quorum requires --raft-rpc-listen")?;
+        let mut routes = std::collections::BTreeSet::from([rpc_listen]);
+        if raft_rpc_peers.len() < 2 || raft_rpc_peers.values().any(|route| !routes.insert(*route)) {
+            return Err("Raft quorum requires distinct routes for all peers");
+        }
+        Some(RaftRuntimeOptions {
+            allow_raft: true,
+            enable_production: false,
+            storage_path,
+            storage_mode: if raft_create {
+                StorageMode::Create
+            } else {
+                StorageMode::Open
+            },
+            bootstrap: raft_bootstrap,
+            rpc_listen,
+            rpc_peers: raft_rpc_peers,
+        })
+    } else {
+        if raft_store.is_some()
+            || raft_rpc_listen.is_some()
+            || !raft_rpc_peers.is_empty()
+            || raft_create
+            || raft_bootstrap
+        {
+            return Err("Raft settings require --allow-raft-quorum");
+        }
+        None
+    };
     let options = Options {
         file: file.ok_or(USAGE)?,
         runtime_root: runtime_root.ok_or(USAGE)?,
@@ -106,6 +196,7 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
         no_autostart,
         mock_discord,
         allow_test_quorum,
+        raft,
         allow_test_gateway_switch,
         mock_identify_budget,
         mock_recovery_max_restarts,
@@ -131,6 +222,16 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
         return Err("mock Identify budget requires --allow-test-gateway-switch");
     }
     Ok(options)
+}
+
+fn raft_endpoint(value: &str) -> Result<SocketAddr, &'static str> {
+    let address: SocketAddr = value
+        .parse()
+        .map_err(|_| "invalid Raft loopback endpoint")?;
+    if !address.ip().is_loopback() || address.port() == 0 {
+        return Err("Raft RPC requires a loopback IP and nonzero port");
+    }
+    Ok(address)
 }
 
 // Deliberately no Debug: capabilities must never be formatted or logged.
@@ -482,6 +583,9 @@ async fn run() -> Result<(), &'static str> {
     let options = parse_options(std::env::args_os().skip(1))?;
     let loaded = src::cluster_runtime::LoadedClusterConfig::load(&options.file)
         .map_err(|_| "cannot load daemon configuration")?;
+    if options.raft.is_some() {
+        return run_raft_cluster(options, loaded).await;
+    }
     if options.allow_test_gateway_switch {
         if loaded.test_cluster.is_some()
             || loaded.placement.cluster.mode != src::placement::ClusterMode::Standalone
@@ -593,6 +697,84 @@ async fn run() -> Result<(), &'static str> {
         }
     };
     server.abort();
+    result
+}
+
+async fn run_raft_cluster(
+    mut options: Options,
+    config: src::cluster_runtime::LoadedClusterConfig,
+) -> Result<(), &'static str> {
+    // Authenticate the local owner before creating stores, binding cluster RPC,
+    // or launching any child. No environment credentials enter this branch.
+    let bootstrap = read_bootstrap(tokio::io::stdin())
+        .await
+        .map_err(|_| "invalid anonymous control bootstrap")?;
+    if bootstrap
+        .access
+        .as_ref()
+        .is_some_and(|a| a.role != "admin" || a.scope.is_some())
+    {
+        return Err("Raft cluster requires a full local administrator capability");
+    }
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|_| "cannot bind local daemon control")?;
+    let port = listener
+        .local_addr()
+        .map_err(|_| "cannot inspect local daemon control")?
+        .port();
+    let mut host = src::daemon::cluster_host::ClusterHost::bind(
+        &config,
+        options.raft.take().ok_or("Raft opt-in required")?,
+        &options.runtime_root,
+        &options.gateway_program,
+        options.mock_discord,
+    )
+    .await?;
+    let (sender, mut receiver) = mpsc::channel::<Envelope>(64);
+    let mut server = tokio::spawn(status_server(
+        listener,
+        bootstrap.secret,
+        bootstrap.access.unwrap_or_default(),
+        sender,
+    ));
+    let announcement = json!({"port":port,"local_only":true,"startup_ok":true,
+        "mock_discord":true,"raft_quorum":true,"test_quorum":false,"production_ready":false});
+    let mut bytes =
+        serde_json::to_vec(&announcement).map_err(|_| "cannot encode daemon announcement")?;
+    bytes.push(b'\n');
+    let mut stdout = tokio::io::stdout();
+    if stdout.write_all(&bytes).await.is_err() || stdout.flush().await.is_err() {
+        server.abort();
+        host.shutdown().await;
+        return Err("cannot announce local daemon control");
+    }
+    let mut interval = tokio::time::interval(Duration::from_millis(25));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let result = loop {
+        tokio::select! {
+            signal = tokio::signal::ctrl_c() => break signal.map_err(|_| "cannot receive daemon shutdown signal"),
+            _ = interval.tick() => {
+                if let Err(error) = host.tick().await { break Err(error); }
+            }
+            Some(envelope) = receiver.recv() => {
+                let response = if envelope.update.is_none()
+                    && matches!(envelope.request.command.as_str(), "ps" | "status" | "inspect" | "shards") {
+                    let snapshot = host.status();
+                    json!({"ok":true,"offline":false,"status":snapshot,
+                        "cluster":snapshot["cluster"],"processes":snapshot["processes"],
+                        "transitions":snapshot["transitions"],
+                        "note":"EXPERIMENTAL OpenRaft/mTLS with loopback mock Gateway; production disabled."})
+                } else {
+                    json!({"ok":false,"offline":false,"error":"Raft quorum owns process lifecycle; manual mutation denied"})
+                };
+                let _ = envelope.response.send(response);
+            }
+            _ = &mut server => break Err("local daemon control stopped"),
+        }
+    };
+    server.abort();
+    host.shutdown().await;
     result
 }
 
@@ -919,11 +1101,125 @@ mod tests {
     fn accepts_absolute_program_and_root() {
         assert!(parse_options(options(&[])).is_ok());
         assert!(!parse_options(options(&[])).unwrap().allow_test_quorum);
+        assert!(parse_options(options(&[])).unwrap().raft.is_none());
         assert!(
             parse_options(options(&["--allow-test-quorum"]))
                 .unwrap()
                 .allow_test_quorum
         );
+    }
+
+    fn raft_options() -> Vec<OsString> {
+        let mut args = options(&[
+            "--allow-raft-quorum",
+            "--mock-discord",
+            "127.0.0.1:1234",
+            "--raft-rpc-listen",
+            "127.0.0.1:1201",
+            "--raft-rpc-peer",
+            "2=127.0.0.1:1202",
+            "--raft-rpc-peer",
+            "3=127.0.0.1:1203",
+            "--raft-store",
+        ]);
+        args.push(
+            std::env::current_dir()
+                .unwrap()
+                .join("test-raft-store")
+                .into_os_string(),
+        );
+        args
+    }
+
+    #[test]
+    fn raft_reopen_is_default_and_creation_and_bootstrap_are_explicit() {
+        let raft = parse_options(raft_options()).unwrap().raft.unwrap();
+        assert!(raft.allow_raft);
+        assert!(!raft.enable_production);
+        assert_eq!(raft.storage_mode, StorageMode::Open);
+        assert!(!raft.bootstrap);
+        assert_eq!(raft.rpc_peers.len(), 2);
+        let mut args = raft_options();
+        args.push("--raft-create".into());
+        args.push("--raft-bootstrap".into());
+        let raft = parse_options(args).unwrap().raft.unwrap();
+        assert_eq!(raft.storage_mode, StorageMode::Create);
+        assert!(raft.bootstrap);
+    }
+
+    #[test]
+    fn raft_requires_mock_mode_and_rejects_competing_lifecycle_owners() {
+        assert!(parse_options(options(&["--allow-raft-quorum"])).is_err());
+        for extra in [
+            "--allow-test-quorum",
+            "--allow-test-gateway-switch",
+            "--no-autostart",
+            "--allow-raft-quorum",
+            "--raft-bootstrap",
+            "--enable-production",
+        ] {
+            let mut args = raft_options();
+            args.push(extra.into());
+            assert!(parse_options(args).is_err(), "accepted {extra}");
+        }
+        let mut args = raft_options();
+        let index = args.iter().position(|arg| arg == "--mock-discord").unwrap();
+        args.drain(index..index + 2);
+        assert!(parse_options(args).is_err());
+    }
+
+    #[test]
+    fn raft_settings_cannot_implicitly_enable_quorum() {
+        for extra in [
+            &["--raft-store", "store"][..],
+            &["--raft-rpc-listen", "127.0.0.1:1201"],
+            &["--raft-rpc-peer", "2=127.0.0.1:1202"],
+            &["--raft-create"],
+            &["--raft-bootstrap"],
+        ] {
+            assert!(parse_options(options(extra)).is_err());
+        }
+        let mut args = raft_options();
+        args.retain(|arg| arg != "--allow-raft-quorum");
+        assert!(parse_options(args).is_err());
+    }
+
+    #[test]
+    fn raft_rejects_invalid_or_duplicate_routes_and_unsafe_store_paths() {
+        for peer in [
+            "2=127.0.0.1:1204",
+            "4=127.0.0.1:1201",
+            "4=127.0.0.1:1202",
+            "0=127.0.0.1:1204",
+            "04=127.0.0.1:1204",
+            "4=127.0.0.1:0",
+            "4=0.0.0.0:1204",
+            "4=192.0.2.1:1204",
+            "4=localhost:1204",
+            "invalid",
+        ] {
+            let mut args = raft_options();
+            args.extend(["--raft-rpc-peer".into(), peer.into()]);
+            assert!(parse_options(args).is_err(), "accepted {peer}");
+        }
+        for path in [
+            PathBuf::from("relative"),
+            std::env::current_dir().unwrap().join("..").join("store"),
+        ] {
+            let mut args = raft_options();
+            *args.last_mut().unwrap() = path.into_os_string();
+            assert!(parse_options(args).is_err());
+        }
+        for address in ["127.0.0.1:0", "0.0.0.0:1234", "[::]:1234", "192.0.2.1:1234"] {
+            assert!(raft_endpoint(address).is_err());
+        }
+        assert!(raft_endpoint("[::1]:1234").is_ok());
+        for field in ["--raft-store", "--raft-rpc-listen"] {
+            let mut args = raft_options();
+            let index = args.iter().position(|arg| arg == field).unwrap();
+            args.drain(index..index + 2);
+            assert!(parse_options(args).is_err());
+        }
     }
 
     #[test]
