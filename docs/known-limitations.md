@@ -57,6 +57,7 @@
 
 [benchmarks.md](benchmarks.md) はWindows開発機の過去の参考記録とユーザー提供のLinux共有CI記録（Actions ubuntu-latest、IPC往復 p99 = 115.5/258.1/973.6 µs、failover検知 Suspected p50 1503.6 ms / FailoverPending p50 3003.1 ms、共有ランナーで本番保証ではない、往復値で片道p99の直接測定ではない）を含みます。実Discord検証はユーザーが実施する範囲です。Linux本番性能、負荷時Heartbeat、RSS/Shard、1/4/16/64 Shard、更新・Failover遅延は未検証です。個々の測定を仕様全体の性能目標達成の証拠にはしません。
 
-## 試験の並列実行時の干渉（既知の課題、2026-11-13）
-- 実プロセス（botd、Gateway、Worker、模擬 Discord）を複数起動する統合試験（`e2e_gateway_process_switch`、`botd_child_recovery`、`hot_swap_scenarios`、`raft_botd_processes` など）は、同一バイナリ内で並列に実行すると、GitHub Actions（Ubuntu、4 vCPU）でハングして待ち時間上限を超えることがある（落ちる試験は実行ごとに異なる）。`--test-threads=1` の直列実行では、Ubuntu で `e2e_gateway_process_switch` の 7 件が 3 回連続成功した（各 9 秒前後）。
-- CI は `.github/scripts/test-shard.sh` の `process` シャードでこれらを直列に実行して回避している。根本原因（試験間の共有資源の取り合い、子プロセス回収の干渉など）は特定していない。未解決。
+## 実プロセス統合試験の実行方法（既知の課題、2026-11-13）
+- 実プロセス（botd、Gateway、Worker、模擬 Discord）を複数起動する統合試験（`e2e_gateway_process_switch`、`botd_child_recovery`、`hot_swap_scenarios`、`raft_botd_processes` など）は、GitHub Actions（Ubuntu、4 vCPU）で、同一バイナリ内で並列に実行したり、複数のバイナリを 1 回の `cargo test` にまとめたりすると、ハングして待ち時間上限を超えることがあった（落ちる試験は実行ごとに異なった）。
+- バイナリごとに別の `cargo test` で、`--test-threads=1` の直列実行にすると、Ubuntu で全件成功した（`.github/scripts/test-shard.sh` の `process` シャード。診断用の `stress.yml` の `switch` スイートでも直列 3 回成功）。実行間の残留プロセスは検出されなかった。
+- 根本原因（試験間の共有資源の取り合い、CPU の取り合い、子プロセスの回収の干渉など）は特定していない。未解決。並列実行に戻す場合は、この試験群の隔離（ポート・ディレクトリ・プロセス）を先に確認すること。

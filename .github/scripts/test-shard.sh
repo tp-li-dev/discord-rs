@@ -9,9 +9,9 @@ RELOAD="reload_command"
 CLUSTER="cluster_sim raft_cluster_runtime e2e_cluster_processes"
 DAEMON="botctl_daemon fixture_build raft_quorum"
 # Tests that spawn several real botd/Gateway/Worker processes each. Running all of
-# their tests at once is unreliable (the tests interfere when run concurrently;
-# serial runs pass, see docs/known-limitations.md), so this
-# shard runs them serially.
+# their tests at once, or several of these binaries in one cargo invocation, was
+# unreliable on CI (root cause unknown, see docs/known-limitations.md), so this
+# shard runs each binary on its own, with serial tests.
 PROCESS="e2e_gateway_process_switch botd_child_recovery gateway_admission_process hot_swap_scenarios raft_botd_processes botd_metrics child_recovery_processes worker_child_recovery e2e_shard_worker e2e_shard_runtime"
 
 targets() {
