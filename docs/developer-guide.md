@@ -1,6 +1,9 @@
 ﻿# 開発者ガイド（現在のAPI）
 
-[architecture.md](architecture.md) は目標仕様です。ここでは `src/framework`、`src/framework-macros` と実Workerのコード・テストに存在するAPIを説明します。実Discordの確認はユーザーが実施していますが、APIや障害時の保証を網羅した検証ではありません。未達は [known-limitations.md](known-limitations.md) を参照してください。
+[architecture.md](architecture.md) は目標仕様です。ここでは `src/framework`、`src/framework-macros` と実Workerのコード・テストに存在するAPIを説明します。実Discordでの検証はユーザーが実施する範囲です。
+
+> [!NOTE]
+> 2026-11-13の決定により、**対応OSはLinux(Ubuntu)のみであり、Windowsはサポート外**（開発機での動作は保証しない。Windows固有コードは残るが保証・CI対象外）です。後述のWindows開発機での検証結果はすべて『過去の参考記録』と位置づけられます。未達事項や保証限界は [known-limitations.md](known-limitations.md) を参照してください。
 
 ## Cogなしのコマンド
 
@@ -103,9 +106,9 @@ StateMapは具体型ごとに `Send + Sync + 'static` の値を保持し、`Cont
 
 `framework/src/interactions.rs` のRegistryと `#[component]` / `#[modal]` はButton・Select・Modalの名前空間付きルートに対応し、`wait_for` とSubscriptionの型もあります。通信非依存のAPIで、Discordや実Workerへの配送は未接続です。ルートやcustom IDだけでユーザー認可・再送防止はできません。
 
-`src/state_store.rs` はTTL・容量制限・CAS・schema検査を伴う非同期StateStoreを提供します。メモリ状態はプロセス停止で失われます。ファイル永続backendと耐久backendを要求するsubscription APIもありますが、実Discord配送やWorkerへの統合を意味しません。`durable_jobs.rs` も永続ジョブ用のライブラリ基盤です。`src/supervisor.rs` のTaskManager / Supervisorは追跡・取消・drain・再起動方針の基盤で、Workerの要求タスクに一部接続されています。任意のCog・外部副作用を含む全資源のdrainを保証しません。
+`src/state_store.rs` はTTL・容量制限・CAS・schema検査を伴う非同期StateStoreを提供します。メモリ状態はプロセス停止で失われます。`FrameworkStateStore` と `StateStoreAdapter` により framework の状態操作を StateStore へ接続可能であり、ファイル永続 StateStore backend も実装されていますが、実Discord配送やWorkerへの自動統合を意味しません。`subscription` や `durable_jobs.rs` も耐久 backend を要求するライブラリ基盤です。`src/supervisor.rs` のTaskManager / Supervisorは追跡・取消・drain・再起動方針の基盤で、Workerの要求タスクに一部接続されています。任意のCog・外部副作用を含む全資源のdrainを保証しません。
 
-`src/tls_transport.rs` は相互TLSと証明書更新、`cert_policy.rs` は認証付きpolicy保存を提供します。`raft_quorum` のOpenRaft、mTLS Raft RPC、`cluster_runtime::bind_raft` は試験経路として接続されていますが、本番backendのbotd起動は拒否されます。`child_recovery` はdaemonのGateway監視とWorker復旧に接続され、`metrics_feed` はdaemon未接続です。いずれも本番の分散安全性を証明しません。
+ファイル権限保護として `fs_perms` があり、Linux では開いたハンドルの mode をファイル0600・ディレクトリ0700に設定・検証します（Windows用コードは残りますがWindowsはサポート外です）。`src/tls_transport.rs` は相互TLSと証明書更新（`cert_rotation`）、`cert_policy.rs` は認証付きpolicy保存とCAチェーン管理を提供します。`raft_quorum` のOpenRaft、mTLS Raft RPC、`cluster_runtime::bind_raft` は試験経路として接続されていますが、本番backendのbotd起動は拒否されます。`child_recovery` はdaemonのGateway監視とWorker復旧に接続され、`update_rollback` と daemon の更新制御はサーバー側 capability 認可と監査を備えますが通常モードでの実行は制限されます。`metrics_feed` は観測用 feed ですが daemon には未接続です。いずれも本番の分散安全性を証明しません。
 
 Discord不要のサンプルは `src/` から次で実行できます。
 
@@ -126,12 +129,17 @@ cargo test --offline --workspace
 
 frameworkの `hybrid` / `typed_macro` / `cog_extensions` / `state` / `events` とcompile-failがAPI・診断の根拠です。実Worker試験はDiscord HTTPの成功、Interaction期限、OS障害・分断時の安全性を証明しません。
 
-## 過去の検証記録
+## 過去の検証記録（過去の参考記録: Windows）
+
+> [!NOTE]
+> 対応OSはLinux(Ubuntu)のみであり、**Windowsはサポート外**（開発機での動作は保証しない。Windows固有コードは残るが保証・CI対象外、2026-11-13決定）です。以下の2026-11-12時点でのWindows / Rust 1.99.0での成功記録は『過去の参考記録』と位置づけられます。
 
 2026-11-12、Windows / Rust 1.99.0で `cargo test --offline --workspace`、`cargo fmt --all --check`、`cargo clippy --offline --workspace --all-targets -- -D warnings` が成功しました。掲載した3つのRustブロックを一時ディレクトリへ抽出し、既存workspaceのビルド成果物に対してrustcでコンパイルしました。Cog・Ready・状態共有サンプルは1テスト成功、フリー関数のコマンド・イベント例もコンパイル成功です。リポジトリのコードは変更していません。実Discord・Linux・複数ホストの再検証は行っていません。
 
 ## CIと追加の検証対象
 
-`.github/workflows/ci.yml` はpushとpull requestで実行されます。`stress.yml` は手動実行でOSごと1〜20回、suiteを選択します。`bench.yml` も手動のLinux測定です。workflowの存在は今回の実行成功を意味しません。更新負荷試験の無停止条件は既知の未達で `#[ignore]` です。測定条件と結果は [benchmarks.md](benchmarks.md) を参照してください。
+`.github/workflows/ci.yml` はpushとpull requestで実行されます（Linux/Ubuntu CIが対象であり、Windows CIはサポート外）。`stress.yml` は手動実行でOSごと1〜20回、suite（update_load, raft, recovery, acl, all）を選択します。`bench.yml` も手動のLinux測定です。workflowの存在は今回の実行成功を意味しません。更新負荷試験の無停止条件は既知の未達で `src/tests/update_load.rs` は `#[ignore]` です。
 
-`discord_smoke` は読み取り専用REST補助で、Gateway/Coreを起動しません。`FrameworkStateStore` のアダプター、ファイル永続StateStore、subscriptionとdurable jobsはライブラリAPIとして利用条件を確認してください。実Workerの自動永続化や外部副作用のexactly-onceを保証しません。
+ユーザー提供のLinux CIベンチ記録（GitHub Actions `ubuntu-latest`、AMD EPYC 7763 4vCPU）では、IPC往復 p99 が並列度 1 / 4 / 16 で 115.5 / 258.1 / 973.6 µs、failover 検知 p50 は Suspected 1503.6 ms、FailoverPending 3003.1 ms です。これらは共有ランナーでの観測であり本番性能の保証ではなく、往復値は片道p99の直接測定ではありません。測定条件と結果は [benchmarks.md](benchmarks.md) を参照してください。
+
+`discord_smoke` は読み取り専用REST補助CLI（`src/src/bin/discord_smoke.rs`、`src/tests/discord_smoke/cli.rs`）で、GatewayやCoreを起動しません。実Discordでの検証はユーザーが実施する範囲です。`FrameworkStateStore` のアダプター、ファイル永続StateStore、subscriptionとdurable jobsはライブラリAPIとして利用条件を確認してください。実Workerの自動永続化や外部副作用のexactly-onceを保証しません。

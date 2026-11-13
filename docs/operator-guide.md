@@ -1,6 +1,9 @@
 # 運用ガイド（ローカル試作）
 
-`botctl` / `botd` は、認証付きのローカル接続で複数BotのShard別Gateway子プロセスを管理します。実 `src` Gatewayの起動引数・Workerプール・停止契約へ接続し、Discordに接続しない明示的な模擬モードを追加しました。実Discordでの複数Shard運用や分散制御の検証は完了していません。`manage` は別のローカル単一Bot管理経路で、その表示の「コア」は管理プロセスを指します。以下はリポジトリルートで `cd src` した後のコマンドです。
+> [!NOTE]
+> 2026-11-13の決定により、**対応OSはLinux(Ubuntu)のみであり、Windowsはサポート外**（開発機での動作は保証しない。Windows固有コードは残るが保証・CI対象外）です。実Discordでの検証はユーザーが実施する範囲です。
+
+`botctl` / `botd` は、認証付きのローカル接続で複数BotのShard別Gateway子プロセスを管理します。実 `src` Gatewayの起動引数・Workerプール・停止契約へ接続し、Discordに接続しない明示的な模擬モードを追加しました。実Discordでの複数Shard運用や分散制御の検証は完了していません（実Discord検証はユーザーが実施する範囲です）。`manage` は別のローカル単一Bot管理経路で、その表示の「コア」は管理プロセスを指します。以下はリポジトリルートで `cd src` した後のコマンドです。
 
 実装契約と検証範囲は [Shard実行設計](shard-runtime-design.md)、残る制約は [制約一覧](known-limitations.md) を参照してください。
 
@@ -60,7 +63,7 @@ cargo run --offline --bin botctl -- config validate --file local-bots.toml --jso
 botd --file local-bots.toml --runtime-root ABS_RUNTIME --gateway-program ABS_GATEWAY --bootstrap-stdin
 ```
 
-このリポジトリのGatewayを使う場合、`ABS_GATEWAY` はビルドした `target/debug/src.exe`（Windows）または `target/debug/src`（Linux）の絶対パスです。Gatewayは1プロセスで1Shardを担当し、既定2 WorkerをそのShard内で起動します。`--gateway-program` の任意成果物が同じ契約を実装していることまでdaemonが保証するわけではありません。
+このリポジトリのGatewayを使う場合、`ABS_GATEWAY` はビルドした `target/debug/src`（Linux）の絶対パスです（Windowsはサポート外であり、開発機での動作は保証しません。Windows固有コードは残りますが保証・CI対象外です）。Gatewayは1プロセスで1Shardを担当し、既定2 WorkerをそのShard内で起動します。`--gateway-program` の任意成果物が同じ契約を実装していることまでdaemonが保証するわけではありません。
 
 ランチャーはdaemon起動ごとに暗号学的乱数の32byte secretを生成し、次の受渡しを行います。**secretを端末へ入力・表示したり、argv・環境変数・一時ファイル・ログへ記録したりしないでください。** 下表はJSONの構造を示しており、secretの固定値を用いた起動例ではありません。
 
@@ -72,7 +75,7 @@ botd --file local-bots.toml --runtime-root ABS_RUNTIME --gateway-program ABS_GAT
 
 各JSONはUTF-8、末尾改行付きです。`botctl` は `127.0.0.1` の公告ポートへ接続し、各要求を認証します。接続情報はそのdaemonの存続期間だけ使用してください。自動検出用endpointファイル、一般用途の常駐ランチャー、OSサービス登録は提供していません。ローカルbootstrapのアクセス設定にはroleとShard scopeがあります。仕様のUnix socket / Named Pipeへの移行、OSユーザー権限の検証、遠隔管理は未接続です。別途mTLS transportの試験実装がありますが、本daemonの遠隔管理を提供しません。TCPを転送・公開して遠隔管理には使用しないでください。
 
-既定ではdaemon起動時にローカルShardを起動します。`--no-autostart` を追加すると、起動を `botctl start` まで保留できます。`startup_ok` は初回起動要求の結果であり、以後の実状態は `status` で確認します。Gatewayの環境は初期化し、通常モードではそのBot用のtokenとBot/Shard/起動世代だけを注入します。Windowsではネットワーク初期化に必要なOS変数 `SystemRoot` だけを追加継承し、`PATH` や他Botの環境は継承しません。`SystemRoot` とidentity用4変数はtoken参照名に使えません。
+既定ではdaemon起動時にローカルShardを起動します。`--no-autostart` を追加すると、起動を `botctl start` まで保留できます。`startup_ok` は初回起動要求の結果であり、以後の実状態は `status` で確認します。Gatewayの環境は初期化し、通常モードではそのBot用のtokenとBot/Shard/起動世代だけを注入します。`PATH` や他Botの環境は継承しません（過去のWindows開発機用コードには `SystemRoot` を追加継承する処理が存在しますが、Windowsはサポート外です）。identity用4変数はtoken参照名に使えません。
 
 Gatewayが起動するWorkerはさらに `env_clear` するため、任意名のBot tokenもCoreへ渡しません。状態・Worker更新監視ファイル・計画上のIPC/管理パスはBot/Shard別です。業務状態はメモリ内であり、状態パスの割当が永続化やGateway再起動時の復元を意味するわけではありません。
 
@@ -151,7 +154,7 @@ botctl operation 0123456789abcdef0123456789abcdef --bootstrap-stdin --json
 
 操作記録はdaemonのメモリ内に最大1024件保持し、満杯なら新規操作を拒否します。1操作の対象はローカル64Shardまでで、これを超えるBotへの起動・停止・再起動は処理前に拒否します。同じID・同じ操作は記録済み結果を返し、異なる対象・操作へのID再利用は拒否します。記録はdaemon再起動で失われ、永続監査や再起動を跨ぐ重複排除にはなりません。再照会で見つからないことだけを未実行の証拠にしないでください。
 
-daemon終了時に子を無条件でkillしません。子が残る可能性があるため起動予約を保持し、再起動後の重複起動を拒否します。PID・起動世代・OS開始時刻・認証済みIPCによる孤児の照合と再採用は未実装です。予約を削除して新しい子を起動する前に外部で実態の確認が必要です。ランタイムrootの別名・シンボリックリンク・Windows ACL、OSやサービス管理側による子の終了、停電時の永続性は保証していません。
+daemon終了時に子を無条件でkillしません。子が残る可能性があるため起動予約を保持し、再起動後の重複起動を拒否します。PID・起動世代・OS開始時刻・認証済みIPCによる孤児の照合と再採用は未実装です。予約を削除して新しい子を起動する前に外部で実態の確認が必要です。ランタイムrootの別名・シンボリックリンク、OSやサービス管理側による子の終了、停電時の永続性は保証していません。Windows ACL はサポート外（Windows非対応）です。
 
 `botctl update` / `rollback` は計画と成果物の検証後、明示的な要求を認証付きdaemonへ送れます。通常runtimeは実行を利用不可として失敗させます。試験用Gateway切替runtimeには実行経路がありますが、本番更新・rollbackの完成を意味しません。`create`、`logs`、`nodes`、`doctor` などのdaemon機能も未提供で、既存の `manage` / `reload` / `doctor` は以下の別経路を利用します。
 
@@ -170,7 +173,7 @@ rollbackでも候補のプロセス世代は現在より大きくします。計
 
 ## 試験実装と運用上の境界
 
-- `fs_perms` はUnixで開いたファイル・ディレクトリのmodeを扱います。Windowsの従来のハンドルAPIは `Unsupported` ですが、信頼された親・環境でファイルを保護して開くパスAPIがあります。Windowsのディレクトリ保護は未実装です。TOCTOU等の制約があり、既存の秘密ファイルは自動移行されません。詳細は [fs_perms.rs](../src/src/fs_perms.rs) を参照してください。
+- `fs_perms` はLinuxで開いたファイル（0600）・ディレクトリ（0700）のmodeを設定・検証します。Windows用パスAPIコードは残りますが、Windowsはサポート外（Windows ACL、ハンドルAPI、ディレクトリ保護は未解決課題ではなく『サポート外』）です。TOCTOU等の制約があり、既存の秘密ファイルは自動移行されません。詳細は [fs_perms.rs](../src/src/fs_perms.rs) を参照してください。
 - `tls_transport` の証明書更新と [cert_policy.rs](../src/src/cert_policy.rs) の認証付き永続policyはライブラリ機能です。CA更新を含む安全な配布・有効化・失効の運用は統合されておらず、再起動時の復元や信頼経路も利用側の責務です。
 - OpenRaftの `raft_quorum`、mTLS Raft RPC、`cluster_runtime::bind_raft` は接続された試験経路です。botdの本番backend起動は拒否され、模擬Discord等の明示的条件が必要です。永続合意の存在を本番failoverや包括的fencingの保証としないでください。
 - Gatewayのプロセス切替経路は `--allow-test-gateway-switch`、`--mock-discord`、`--mock-identify-budget` を必要とするstandalone自動起動の試験専用です。実Discord・本番Gateway更新には使えません。試験では新旧プロセスと模擬応答を観測しますが、実ネットワークや障害全般の無停止・無欠落を保証しません。
@@ -207,15 +210,12 @@ cargo run --offline --bin register -- 123456789012345678 234567890123456789 gree
 
 内部のCargo呼び出しもofflineにする場合、管理プロセス起動前に環境を設定します。
 
-```powershell
-# PowerShell
-$env:CARGO_NET_OFFLINE = 'true'
-```
-
 ```sh
-# Linux shell
+# Linux shell（サポート対象）
 export CARGO_NET_OFFLINE=true
 ```
+
+（過去のWindows開発機での実行には PowerShell で `$env:CARGO_NET_OFFLINE = 'true'` を使用した記録がありますが、Windowsはサポート外です。）
 
 ```sh
 cargo run --offline --bin manage -- start
@@ -265,10 +265,10 @@ reloadはreleaseビルド → `src/workers/` への成果物コピー → `src/w
 
 引き継ぎ対象は `!count` のカウンターと `!job` の計算状態です。`!job start` はチャンネルごとに1個の計算を開始し、Workerの約1秒周期で進みます。`!job status`、更新、再度statusで明示的checkpointの継続を確認できます。任意のFutureや外部APIの実行途中を移動しません。StateMap/Cogの状態はsnapshot対象外です。
 
-`DISCORD_WORKER_FILE` を使う場合は親とreloadに同じ絶対パスを渡します。更新指定ファイルと `workers/` は任意バイナリ実行につながるため、信頼する管理者だけに書込権限を限定してください。Windowsのendpoint保護は親ディレクトリのACLに依存します。Windows ACL、成果物の署名検証、全ログ経路の秘密マスクは検証・実装が残っています。
+`DISCORD_WORKER_FILE` を使う場合は親とreloadに同じ絶対パスを渡します。更新指定ファイルと `workers/` は任意バイナリ実行につながるため、信頼する管理者だけに書込権限を限定してください。Windows ACL はサポート外（Windows非対応）です。成果物の署名検証、全ログ経路の秘密マスクは検証・実装が残っています。
 
 ## 復旧と検証の境界
 
 `child_recovery` はdaemonのGateway監視とWorker側の復旧経路に接続されています。再試行・予算・degraded状態の観測は、孤児の再採用やホスト障害からの安全な分散復旧を意味しません。`metrics_feed` はライブラリとテストがありますがdaemonに接続されていません。
 
-`discord_smoke` は明示実行の読み取り専用REST確認補助で、GatewayやCoreを起動しません。ユーザーが実施した実Discord検証と模擬Discordの試験は区別してください。性能測定の条件とLinux共有runnerの記録は [benchmarks.md](benchmarks.md) を参照してください。更新負荷中の無停止条件は未達で、該当試験は `#[ignore]` です。
+`discord_smoke` は明示実行の読み取り専用REST確認補助CLI（`src/src/bin/discord_smoke.rs`、`src/tests/discord_smoke/cli.rs`）で、GatewayやCoreを起動しません。実Discordでの検証はユーザーが実施する範囲です。性能測定の条件とLinux共有runner（Actions `ubuntu-latest`、AMD EPYC 7763 4vCPU、IPC往復 p99 = 115.5/258.1/973.6 µs、failover検知 Suspected p50 1503.6 ms / FailoverPending p50 3003.1 ms、共有ランナーで本番保証ではない、往復値で片道p99の直接測定ではない）の記録は [benchmarks.md](benchmarks.md) を参照してください。手動ワークフローとして `.github/workflows/stress.yml` と `bench.yml` が用意されていますが、更新負荷中の無停止条件は未達で `src/tests/update_load.rs` は `#[ignore]` です。
