@@ -4,7 +4,7 @@
 
 ## 1. 現状の要約
 - **対応OSと成否の基準（2026-11-13決定）**：対応OSは **Linux（Ubuntu）のみ**、**Windows はサポート外**（開発機での動作は保証しない。Windows固有コードは残るが保証・CI対象外）。**試験の成否の基準は Ubuntu の GitHub Actions**（`ci.yml`、`stress.yml`、`bench.yml`）とする。
-- **CI / ベンチマーク状況**：GitHub Actions（Ubuntu）の並列ジョブ（fmt、clippy、test、examples+doctor、stable 互換）は全ジョブ成功。Linux 上での IPC / failover ベンチマークも測定済み（AMD EPYC 7763 4vCPU、IPC 往復 p99 は並列度 1/4/16 で 115.5/258.1/973.6 µs、failover 検知 Suspected p50 1503.6ms / FailoverPending p50 3003.1ms。本番性能の保証ではない）。
+- **CI / ベンチマーク状況**：GitHub Actions（Ubuntu のみ）の並列ジョブ（fmt、clippy、test の 5 シャード＝reload/cluster/daemon/process/rest、examples+doctor、集約の ci-ok）は、2026-11-13 に全ジョブ成功を確認（最長経路は reload シャードの約 280 秒）。stable 互換は週次/手動の別ワークフロー（stable.yml）。Linux 上での IPC / failover ベンチマークも測定済み（AMD EPYC 7763 4vCPU、IPC 往復 p99 は並列度 1/4/16 で 115.5/258.1/973.6 µs、failover 検知 Suspected p50 1503.6ms / FailoverPending p50 3003.1ms。本番性能の保証ではない）。
 - **main 統合済み（第13弾まで）**：
   - 属性マクロ・Cog・型付き引数・コンポーネント経路（framework）
   - Worker IPC（handshake、event_seq、drain、ホットスワップ T04〜T06/T19）

@@ -184,3 +184,11 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
   - `codex/finaldocs`：docs の最終整備（benchmarks, conformance, developer-guide, known-limitations, operator-guide, security を途中まで更新）。事実照合が未了。
 - 要調査：Actions の手動 stress（suite=acl、repeat=5）で Ubuntu iteration 1 と Windows iteration 4 が失敗。Windows ACL の CI 差の修正が完全には効いていない可能性がある。ログ確認から始める。main の Windows テストの結果は未確認のまま。
 - 再開手順：`gh run list` で Actions を確認 → 上記3ブランチを `ci-verify` 等で Actions 検証 → 問題なければ main へ統合。ローカルの重い全体試験は避け、Actions（ci.yml、stress.yml、bench.yml）で行う。
+
+## 2026-11-13：Windows サポート外、CI の並列化、Codex クオータ切れ後の統合
+- 決定：対応 OS は Linux（Ubuntu）のみ。Windows はサポート外（Windows 固有コードは残すが保証・CI 対象外）。AGENTS.md と docs/architecture.md を更新。
+- CI：`ci.yml` を Ubuntu のみの並列構成に再編（fmt、clippy、test の 5 シャード、examples+doctor、集約の ci-ok）。`.github/scripts/test-shard.sh` が実測時間で試験を分割（新規テストは rest に自動で入る）。dev プロファイルの debug 情報を縮小。stable は週次/手動の `stable.yml` へ、`stress.yml` は Ubuntu のみ（`switch` スイートを追加）。結果：全ジョブ成功、最長経路 約 280 秒（以前は直列で約 11 分）。
+- 試験の安定化：Raft の lease 試験とプロセス/ネットワーク試験の待ち時間上限を CI 向けに緩和。実プロセス統合試験（process シャード）は、バイナリごとに直列実行にして安定。並列実行で不安定になる根本原因は未特定（known-limitations.md に記録）。
+- 統合：zdtfix（無停止更新：連続更新・Gateway 切替・旧 Worker クラッシュは基準を満たす。『ハンドラー実行後・結果返却前のクラッシュ』は仕様上の限界＝結果不明として `#[ignore]` の別試験に分離）、raftwire（Raft runtime を botd に配線、既定無効・模擬 Discord 限定）、メトリクスの daemon 接続（Identify 待ち・drain 時間・世代・欠落数のみ。failover/IPC往復/REST予算の送信元は未接続）、docs の最終整備。
+- ツール：Codex は利用枠切れ（2026-11-18 18:17 頃まで）。Antigravity CLI（agy、ファイル編集のみ）と Claude Code のサブエージェント（モデル指定なし）で代替。Haiku は環境設定のため使えなかった（要 Claude Code 再起動後の再確認）。
+- 未検証・未完了：実 Discord（ユーザー実施）、複数ホストの実障害、OS suspend、本番での Raft 有効化（起動拒否のまま）、メトリクスの残りの送信元の接続、永続 Subscription/ジョブの Worker 接続、Core 単独更新・更新失敗時の自動 rollback、process シャードの並列不安定の根本原因。
