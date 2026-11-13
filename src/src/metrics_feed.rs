@@ -50,6 +50,19 @@ pub(crate) struct FeedSnapshot {
     dropped: u64,
 }
 
+impl FeedSnapshot {
+    /// Read-only view for status output. Absent values were never observed.
+    pub(crate) fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "failover_state": self.failover, "switch_phase": self.phase,
+            "switch_generation": self.generation, "event_retained": self.retained,
+            "event_retained_bytes": self.bytes, "rest_wait_ns": self.rest_ns,
+            "identify_wait_ns": self.identify_ns, "drain_ns": self.drain_ns,
+            "feed_dropped": self.dropped,
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct FeedSender {
     tx: SyncSender<Observation>,
