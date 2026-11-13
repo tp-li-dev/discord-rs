@@ -46,8 +46,24 @@ case "${1:?shard name required}" in
     run $(test_args $DAEMON)
     ;;
   process)
-    # shellcheck disable=SC2086
-    run $(test_args $PROCESS) -- --test-threads=1
+    # One cargo invocation per binary, serial tests, and a sweep of leftover
+    # child processes in between: earlier binaries can leave botd/Gateway/Worker
+    # children behind, which then starve or conflict with the next binary.
+    status=0
+    : > test-output.log
+    for t in $PROCESS; do
+      echo "=== $t ===" | tee -a test-output.log
+      cargo test --locked --workspace --test "$t" -- --test-threads=1 2>&1 | tee -a test-output.log || status=1
+      leftovers=$(ps -eo pid,etime,cmd | grep -E "target/debug/(botd|src|deps/[a-z_]+-[0-9a-f]+)" | grep -v -E "grep|cargo" || true)
+      if [ -n "$leftovers" ]; then
+        echo "--- leftover processes after $t ---" | tee -a test-output.log
+        echo "$leftovers" | tee -a test-output.log
+        pkill -f "target/debug/botd" || true
+        pkill -f "target/debug/src" || true
+        sleep 1
+      fi
+    done
+    exit "$status"
     ;;
   rest)
     heavy=" $RELOAD $CLUSTER $DAEMON $PROCESS "
