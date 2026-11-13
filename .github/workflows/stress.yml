@@ -16,7 +16,7 @@ on:
         required: true
         default: all
         type: choice
-        options: [update_load, raft, recovery, acl, all]
+        options: [update_load, raft, recovery, acl, switch, all]
 permissions:
   contents: read
 concurrency:
@@ -83,6 +83,9 @@ jobs:
           run_suite raft cargo test -p src --test raft_quorum --test raft_cluster_runtime --test raft_lease_policy
           run_suite recovery cargo test -p src --test botd_child_recovery --test child_recovery_processes --test daemon_recovery_wiring
           run_suite acl cargo test -p src --test fs_perms --test fs_perms_path_api
+          # Diagnoses hangs of the process-spawning switch tests: serial run with
+          # captured output, then lists leftover botd/Gateway processes.
+          run_suite switch bash -c 'cargo test -p src --test e2e_gateway_process_switch -- --test-threads=1 --nocapture; rc=$?; echo "--- leftover processes ---"; ps -eo pid,ppid,etime,stat,cmd | grep -E "botd|target/debug/src|worker" | grep -v grep | head -40; exit $rc'
           exit "$status"
       - name: Upload failure log
         if: failure()
