@@ -17,7 +17,7 @@ use std::{
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     net::TcpStream,
-    sync::{Semaphore, oneshot},
+    sync::{Semaphore, mpsc, oneshot},
     task::JoinSet,
 };
 use twilight_gateway::{
@@ -333,12 +333,16 @@ const MOCK_FRAME_LIMIT: u64 = 64 * 1024;
 enum MockInput {
     Prefix {
         id: u64,
+        #[serde(default)]
+        event_id: Option<u64>,
         key: u64,
         content: String,
         rest_addr: SocketAddr,
     },
     Slash {
         id: u64,
+        #[serde(default)]
+        event_id: Option<u64>,
         key: u64,
         name: String,
         rest_addr: SocketAddr,
@@ -465,20 +469,39 @@ fn api_outcome(status: Option<u16>) -> worker::ApiOutcome {
     })
 }
 
-async fn mock_command(manager: Arc<worker::Manager>, input: MockInput) -> Result<Value, AppError> {
-    let (id, key, rest_addr) = match &input {
+async fn mock_command(
+    manager: Arc<worker::Manager>,
+    input: MockInput,
+    accepted: mpsc::Sender<(u64, u64)>,
+) -> Result<Value, AppError> {
+    let (id, event_id, key, rest_addr) = match &input {
         MockInput::Prefix {
-            id, key, rest_addr, ..
+            id,
+            event_id,
+            key,
+            rest_addr,
+            ..
         }
         | MockInput::Slash {
-            id, key, rest_addr, ..
-        } => (*id, *key, *rest_addr),
+            id,
+            event_id,
+            key,
+            rest_addr,
+            ..
+        } => (*id, *event_id, *key, *rest_addr),
         _ => return Err(StartupFailure::InvalidMockFrame.into()),
     };
     if !rest_addr.ip().is_loopback() || rest_addr.port() == 0 {
         return Err(StartupFailure::InvalidMockFrame.into());
     }
     let mut guard = manager.begin_response_delivery(key).await?;
+    if let Some(event_id) = event_id {
+        // A forwarded frame is not yet admitted work. The local switch relay
+        // waits for this reservation before pausing the old Gateway, so its
+        // already accepted work can retain the originating Core through drain.
+        // This is only an ingress acknowledgement, not handler/REST success.
+        let _ = accepted.send((id, event_id)).await;
+    }
     let (content, outcome, receipt) = match input {
         MockInput::Prefix { content, .. } => {
             match manager
@@ -627,10 +650,17 @@ async fn mock_events(
     tokio::pin!(shutdown);
     let mut inputs_open = true;
     let mut commands = JoinSet::new();
+    let (accepted_tx, mut accepted_rx) = mpsc::channel(1);
     let result = loop {
         tokio::select! {
             biased;
             _ = &mut shutdown => break Ok(()),
+            Some((id, event_id)) = accepted_rx.recv() => {
+                if let Err(error) = mock_write(&mut writer,
+                    &json!({"type":"accepted", "id":id, "event_id":event_id})).await {
+                    break Err(error);
+                }
+            }
             joined = commands.join_next(), if !commands.is_empty() => {
                 match joined {
                     Some(Ok(Ok(value))) => if let Err(error) = mock_write(&mut writer, &value).await { break Err(error); },
@@ -651,7 +681,7 @@ async fn mock_events(
                         // selected mock collector; no production listener exists.
                         std::process::exit(86);
                     }
-                    Ok(Some(input)) => { commands.spawn(mock_command(manager.clone(), input)); }
+                    Ok(Some(input)) => { commands.spawn(mock_command(manager.clone(), input, accepted_tx.clone())); }
                     Ok(None) => inputs_open = false,
                     Err(error) => break Err(error),
                 }

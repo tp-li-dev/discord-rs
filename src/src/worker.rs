@@ -254,6 +254,28 @@ impl std::fmt::Display for WorkerFailure {
 }
 impl std::error::Error for WorkerFailure {}
 
+#[derive(Debug)]
+struct UndispatchedRequest(AppError);
+
+impl std::fmt::Display for UndispatchedRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+impl std::error::Error for UndispatchedRequest {}
+
+fn undispatched(error: AppError) -> AppError {
+    Box::new(UndispatchedRequest(error))
+}
+
+fn request_cause<'a>(
+    error: &'a (dyn std::error::Error + Send + Sync + 'static),
+) -> &'a (dyn std::error::Error + Send + Sync + 'static) {
+    error
+        .downcast_ref::<UndispatchedRequest>()
+        .map_or(error, |error| error.0.as_ref())
+}
+
 fn failure(message: &'static str) -> AppError {
     Box::new(WorkerFailure {
         message,
@@ -263,7 +285,9 @@ fn failure(message: &'static str) -> AppError {
 
 /// Safe diagnostics without formatting an arbitrary error or traversing sources.
 pub fn diagnostic(error: &(dyn std::error::Error + 'static)) -> String {
-    if let Some(error) = error.downcast_ref::<WorkerFailure>() {
+    if let Some(error) = error.downcast_ref::<UndispatchedRequest>() {
+        diagnostic(error.0.as_ref())
+    } else if let Some(error) = error.downcast_ref::<WorkerFailure>() {
         match error.exit_code {
             Some(code) => format!("{} (exit_code={code})", error.message),
             None => error.message.to_owned(),
@@ -331,7 +355,7 @@ pub fn error_file(file: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Request {
     ConfigureInteractions {
@@ -847,7 +871,11 @@ impl Process {
 
     async fn request(&mut self, request: &Request) -> Result<Response, AppError> {
         if self.broken {
-            return Err(failure("worker is unavailable"));
+            return Err(undispatched(failure("worker is unavailable")));
+        }
+        if self.exit_status.lock().unwrap().is_some() {
+            self.broken = true;
+            return Err(undispatched(self.exited(false).await));
         }
         let sequenced;
         let request = if let Request::ReadyEvent { bot_name } = request
@@ -882,6 +910,7 @@ impl Process {
         } else {
             DEADLINE
         };
+        let mut frame_written = false;
         let result = timeout(deadline, async {
             let mut data = serde_json::to_vec(request)?;
             data.push(b'\n');
@@ -894,6 +923,9 @@ impl Process {
                     std::io::Error::new(std::io::ErrorKind::BrokenPipe, "worker input is closed")
                 })?;
                 input.write_all(&data).await?;
+                // A partial newline-delimited frame cannot start a handler.
+                // After the complete frame, even flush/EOF failure is ambiguous.
+                frame_written = true;
                 input.flush().await
             })
             .await
@@ -947,7 +979,14 @@ impl Process {
                 _ => "worker timed out",
             })
         })
-        .and_then(|result| result);
+        .and_then(|result| result)
+        .map_err(|error| {
+            if frame_written {
+                error
+            } else {
+                undispatched(error)
+            }
+        });
         if result.is_ok() {
             self.broken = false;
         }
@@ -1940,8 +1979,7 @@ impl Manager {
             let state_boundary = timeout(DRAIN_DEADLINE, previous.state_barrier.write())
                 .await
                 .map_err(|_| failure("worker state handoff timed out"))?;
-            let mut active = worker.write().await;
-            if !force && active.path == path {
+            if !force && previous.path == path {
                 continue;
             }
             if !previous.responses.unknown_ids().is_empty() {
@@ -2015,6 +2053,14 @@ impl Manager {
                 })
                 .await
                 .map_err(|_| failure("previous recovery candidate has not exited"))??;
+            }
+            // Candidate restore can wait on IPC. Keep routing readable while
+            // that happens: response reservations and snapshot-independent old
+            // handlers remain available. The state boundary still prevents old
+            // snapshot mutations, and update serializes recovery/other commits.
+            let mut active = worker.write().await;
+            if !Arc::ptr_eq(&active, &previous) {
+                return Err(failure("worker recovery changed during update"));
             }
             {
                 // This handle lock is independent from old in-flight IPC. Keep
@@ -2129,6 +2175,8 @@ impl Manager {
 
     /// Reserve a response whose sanitized REST result must return over Worker IPC.
     /// A supported peer is required before any command or external effect starts.
+    /// If routing changes before admission, dispatch moves this unused reservation
+    /// to the new generation. Once dispatched, its generation never changes.
     pub async fn begin_response_delivery(&self, key: u64) -> Result<ResponseGuard, AppError> {
         self.reserve_response(key, true).await
     }
@@ -2229,25 +2277,70 @@ impl Manager {
         if response.dispatched {
             return Err(failure("response dispatch already used"));
         }
-        let admission = self
-            .admit(response.index, Some(&response.generation), &request)
-            .await?;
-        response.dispatched = true;
-        let generation = admission.generation.clone();
-        let request = if response.deliver_result {
-            Request::ResponseDispatch {
-                operation_id: response.operation.id(),
-                request: Box::new(request),
+        let started = tokio::time::Instant::now();
+        loop {
+            let admission = timeout(APPLICATION_DEADLINE, async {
+                loop {
+                    match self
+                        .admit(response.index, Some(&response.generation), &request)
+                        .await
+                    {
+                        Ok(admission) => return Ok(admission),
+                        Err(error) => {
+                            if !response.deliver_result
+                                || Arc::ptr_eq(
+                                    &*self.workers[response.index].read().await,
+                                    &response.generation,
+                                )
+                            {
+                                return Err(error);
+                            }
+                            // Admission failed before any IPC or application work.
+                            // Rebind only a delivery reservation that has never been
+                            // dispatched; an ambiguous handler/result is never replayed.
+                            // Reserve the new generation first so cancellation leaves
+                            // the original guard available for the caller to settle.
+                            let current = self.reserve_response(key, true).await?;
+                            let unused = std::mem::replace(response, current);
+                            unused.confirm();
+                        }
+                    }
+                }
+            })
+            .await
+            .map_err(|_| failure("worker admission timed out"))??;
+            response.dispatched = true;
+            let generation = admission.generation.clone();
+            let dispatch = if response.deliver_result {
+                Request::ResponseDispatch {
+                    operation_id: response.operation.id(),
+                    request: Box::new(request.clone()),
+                }
+            } else {
+                request.clone()
+            };
+            let result = Self::exchange(&generation, dispatch).await;
+            let not_dispatched = result
+                .as_ref()
+                .is_err_and(|error| error.is::<UndispatchedRequest>());
+            if not_dispatched {
+                response.dispatched = false;
             }
-        } else {
-            request
-        };
-        let result = Self::exchange(&generation, request).await;
-        response.expects_result = matches!(&result, Ok(Some(_)));
-        drop(admission);
-        self.recover_if_broken(response.index, generation, &result)
-            .await;
-        result
+            response.expects_result = matches!(&result, Ok(Some(_)));
+            drop(admission);
+            self.recover_if_broken(response.index, generation.clone(), &result)
+                .await;
+            if not_dispatched
+                && response.deliver_result
+                && started.elapsed() < APPLICATION_DEADLINE
+                && !Arc::ptr_eq(&*self.workers[response.index].read().await, &generation)
+            {
+                // This request never crossed the framing boundary. A confirmed
+                // replacement is available; admission will rebind the reservation.
+                continue;
+            }
+            return result;
+        }
     }
 
     /// Deliver once to the issuing generation, including after routing switched.
@@ -2525,9 +2618,10 @@ impl Manager {
         expected: Option<&Arc<Generation>>,
         request: &Request,
     ) -> Result<Admission, AppError> {
-        // In the managed Shard path a ResponseGuard is already an admission
-        // permit. Pause/Drain may not revoke the dispatch reserved before it.
-        let reserved = expected.is_some() && self.gateway_admission.is_some();
+        // A ResponseGuard is already an admission permit in both the managed
+        // Shard and legacy pool paths. Pause/Drain must not revoke it or acquire
+        // another read permit behind a shutdown writer waiting on this guard.
+        let reserved = expected.is_some();
         timeout(APPLICATION_DEADLINE, async {
             loop {
                 if !reserved {
@@ -2654,6 +2748,7 @@ impl Manager {
         let Err(error) = result else {
             return;
         };
+        let error = request_cause(error.as_ref());
         let (exit_status, failed_attempt) = {
             let process = generation.process.lock().await;
             if !process.broken {
@@ -2706,7 +2801,7 @@ impl Manager {
                 exit_code: error.exit_code.or(observed_exit),
             });
         let reported: &(dyn std::error::Error + Send + Sync + 'static) =
-            enriched.as_ref().map_or(error.as_ref(), |error| error);
+            enriched.as_ref().map_or(error, |error| error);
         self.record_failure(
             &generation.path,
             reported,

@@ -119,7 +119,7 @@ fn run() -> Result<u8> {
     let executable = std::env::current_exe()?;
     let mode = fs::read_to_string(sidecar(&executable, ".mode"))?;
     let mode = mode.trim();
-    if !["pass", "hold-restore", "crash-dispatch"].contains(&mode) {
+    if !["pass", "hold-restore", "crash-restore", "crash-dispatch"].contains(&mode) {
         return Err("invalid fixture mode".into());
     }
     let mut relay = Relay::start(&executable)?;
@@ -154,6 +154,17 @@ fn run() -> Result<u8> {
                 response.replace_range(range, &std::process::id().to_string());
             }
             if request_kind == "restore" && kind(&response)? == "restored" {
+                if mode == "crash-restore" {
+                    match OpenOptions::new().write(true).create_new(true)
+                        .open(sidecar(&executable, ".crash-once")) {
+                        Ok(_) => {
+                            fs::write(sidecar(&executable, &format!(".{}.crashed", std::process::id())), [])?;
+                            return Ok(86);
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                }
                 restored = true;
                 fs::write(
                     sidecar(&executable, &format!(".{}.restored", std::process::id())),
