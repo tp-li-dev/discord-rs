@@ -2591,11 +2591,8 @@ impl<C: Clock> Daemon<C> {
             {
                 feed.observe(crate::metrics_feed::Observation::Drain(since.elapsed()));
             }
-            self.metrics.set_process(
-                &entry.snapshot.key,
-                state.pid.is_some(),
-                state.generation,
-            );
+            self.metrics
+                .set_process(&entry.snapshot.key, state.pid.is_some(), state.generation);
             entry.snapshot.restarts = state.restart.restarts;
             entry.snapshot.retry_at_ms = state.restart.retry_at.map(|at| at.as_millis());
             entry.snapshot.restart_exhausted = matches!(state.state, RecoveryState::Degraded(_));
@@ -2638,9 +2635,7 @@ impl<C: Clock> Daemon<C> {
             .child_mut(entry.recovery_key)
             .map_err(|_| DaemonError::InvalidState)?
         {
-            entry
-                .stop_since
-                .get_or_insert_with(std::time::Instant::now);
+            entry.stop_since.get_or_insert_with(std::time::Instant::now);
             if mode == StopMode::Force {
                 child.start_kill().map_err(|_| DaemonError::StopFailed)?;
             }

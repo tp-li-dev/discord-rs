@@ -122,7 +122,12 @@ async fn botd_reports_real_identify_drain_and_runtime_values() {
     let running = cli(port, &["status"]).await;
     let shard = &running["status"]["metrics"]["shards"][0];
     assert_eq!(shard["runtime"]["gateway"]["role"], "active");
-    assert!(shard["runtime"]["gateway"]["generation_id"].as_u64().unwrap() >= 1);
+    assert!(
+        shard["runtime"]["gateway"]["generation_id"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
     assert!(shard["feed"]["identify_wait_ns"].is_u64());
 
     assert_eq!(cli(port, &["stop", "alpha"]).await["ok"], true);
