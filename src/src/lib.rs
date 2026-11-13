@@ -15,6 +15,7 @@ pub mod gateway_switch;
 pub mod identify;
 pub mod interaction_flow;
 pub mod local_control;
+pub mod daemon_metrics;
 pub mod metrics;
 pub mod metrics_feed;
 pub mod ownership;

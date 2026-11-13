@@ -1056,6 +1056,20 @@ pub mod control {
                         .collect();
                     let mut value = json!({"ok": true, "offline": false, "note": NOTE,
                         "status": {"processes": processes, "monitor_ok": self.monitor_ok}});
+                    // Advisory observations only; no labels beyond Bot/shard/generation.
+                    value["status"]["metrics"] = self
+                        .daemon
+                        .metrics()
+                        .status(selected.as_ref().map(|b| b.bot_id.as_str()));
+                    if selected.is_none() {
+                        let text = self.daemon.metrics().render_prometheus();
+                        // Keep the control response bounded for very large layouts.
+                        if text.len() <= 24 * 1024 {
+                            value["status"]["metrics_prometheus"] = json!(text);
+                        } else {
+                            value["status"]["metrics_prometheus_omitted"] = json!(true);
+                        }
+                    }
                     if let Some(bot) = selected {
                         value["bot"] = self.bot_view(&bot);
                     } else {
@@ -1871,6 +1885,10 @@ struct Entry {
     /// Only explicit local test configuration may select this. Never infer the
     /// mode from missing credentials, inherited environment, or child failure.
     mock_discord: Option<SocketAddr>,
+    /// Metrics feed (best effort, never blocks) and the boundary timers it uses.
+    feed: Option<crate::metrics_feed::FeedSender>,
+    admission_since: Option<std::time::Instant>,
+    stop_since: Option<std::time::Instant>,
 }
 
 pub struct Daemon<C = MonotonicClock> {
@@ -1884,6 +1902,7 @@ pub struct Daemon<C = MonotonicClock> {
     clock_failed: bool,
     instance: [u8; 16],
     sequence: u64,
+    metrics: crate::daemon_metrics::DaemonMetrics,
 }
 
 // Share the exact clock domain with the recovery engine without requiring C: Clone.
@@ -1933,15 +1952,26 @@ impl<S: CredentialSource> RecoveryHost for ProcessRecoveryHost<'_, S> {
         // their existing lifecycle contract; neither is a Discord admission.
         let entry = self
             .entries
-            .values()
+            .values_mut()
             .find(|e| e.recovery_key == key)
             .unwrap();
+        // Identify wait: first time this launch asked for admission until it
+        // was granted. Unavailable keeps the timer running.
+        let since = *entry
+            .admission_since
+            .get_or_insert_with(std::time::Instant::now);
         if self.require_shared_admission
             && entry.mock_discord.is_none()
             && self.manual != Some(&entry.snapshot.key)
         {
             IdentifyAdmission::Unavailable
         } else {
+            entry.admission_since = None;
+            if let Some(feed) = &entry.feed {
+                feed.observe(crate::metrics_feed::Observation::IdentifyWait(
+                    since.elapsed(),
+                ));
+            }
             IdentifyAdmission::Granted
         }
     }
@@ -2097,6 +2127,14 @@ impl<C: Clock> Daemon<C> {
             return Err(DaemonError::InvalidPolicy);
         }
         validate_specs(&specs)?;
+        let metric_keys: Vec<ShardKey> = specs
+            .iter()
+            .map(|spec| ShardKey {
+                bot_id: spec.bot_id.clone(),
+                shard_id: spec.shard_id,
+            })
+            .collect();
+        let metrics = crate::daemon_metrics::DaemonMetrics::new(&metric_keys);
         let mut instance = [0; 16];
         getrandom::fill(&mut instance).map_err(|_| DaemonError::RandomUnavailable)?;
         let mut bot_keys = HashMap::new();
@@ -2127,6 +2165,7 @@ impl<C: Clock> Daemon<C> {
                     shard_id: key.shard_id,
                     role: ChildRole::Gateway,
                 };
+                let feed = metrics.sender(&key);
                 (
                     key,
                     Entry {
@@ -2138,6 +2177,9 @@ impl<C: Clock> Daemon<C> {
                         graceful_stop: None,
                         restart_held: false,
                         mock_discord: None,
+                        feed,
+                        admission_since: None,
+                        stop_since: None,
                     },
                 )
             })
@@ -2166,7 +2208,13 @@ impl<C: Clock> Daemon<C> {
             clock_failed: false,
             instance,
             sequence: 0,
+            metrics,
         })
+    }
+
+    /// Read-only advisory metrics owned by this daemon (see `daemon_metrics`).
+    pub fn metrics(&self) -> &crate::daemon_metrics::DaemonMetrics {
+        &self.metrics
     }
 
     /// Explicit trusted artifact path, before ANY launch attempt. No shell or
@@ -2535,6 +2583,18 @@ impl<C: Clock> Daemon<C> {
                 .recovery
                 .snapshot(entry.recovery_key)
                 .map_err(|_| DaemonError::InvalidState)?;
+            // Drain boundary: stop requested until the owned child was reaped.
+            if state.pid.is_none()
+                && let Some(since) = entry.stop_since.take()
+                && let Some(feed) = &entry.feed
+            {
+                feed.observe(crate::metrics_feed::Observation::Drain(since.elapsed()));
+            }
+            self.metrics.set_process(
+                &entry.snapshot.key,
+                state.pid.is_some(),
+                state.generation,
+            );
             entry.snapshot.restarts = state.restart.restarts;
             entry.snapshot.retry_at_ms = state.restart.retry_at.map(|at| at.as_millis());
             entry.snapshot.restart_exhausted = matches!(state.state, RecoveryState::Degraded(_));
@@ -2577,6 +2637,9 @@ impl<C: Clock> Daemon<C> {
             .child_mut(entry.recovery_key)
             .map_err(|_| DaemonError::InvalidState)?
         {
+            entry
+                .stop_since
+                .get_or_insert_with(std::time::Instant::now);
             if mode == StopMode::Force {
                 child.start_kill().map_err(|_| DaemonError::StopFailed)?;
             }
