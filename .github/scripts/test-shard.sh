@@ -46,9 +46,11 @@ case "${1:?shard name required}" in
     for t in $(targets); do
       case "$heavy" in *" $t "*) ;; *) args="$args --test $t" ;; esac
     done
-    # Unit tests of lib/bin targets and doc tests run here as well.
+    # Unit tests of lib/bin targets run here; doc tests cannot be combined with
+    # other target selectors, so they run as a separate cargo invocation.
     # shellcheck disable=SC2086
-    run --lib --bins --doc $args
+    run --lib --bins $args
+    cargo test --locked --workspace --doc 2>&1 | tee -a test-output.log
     ;;
   *)
     echo "unknown shard: $1" >&2
