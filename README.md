@@ -29,7 +29,7 @@ cargo run --offline --bin doctor -- examples/placement.toml --resolved-shards bo
 cargo run --offline --bin register -- 123456789012345678 global greet
 ```
 
-最後は仮の application ID に対する dry-run で、Discordには送信しません。Rust と各OSのネイティブビルド環境が必要です。
+最後は仮の application ID に対する dry-run で、Discordには送信しません。対応OSは Linux（Ubuntu）のみ、Windows はサポート外です（Windows固有コードは残りますが保証・CI対象外）。Rust とビルド環境が必要です。
 
 ## 起動と更新
 
@@ -48,4 +48,4 @@ cargo run --offline --bin manage -- list-unknown
 
 `!ping`、`!greet Alice 3`、`!count`、`!job start` / `!job status` / `!job stop`、`!version`、`!workers` が実装されています。slashは自動登録されません。手順と更新失敗時の扱いは [運用ガイド](docs/operator-guide.md)、APIとローカルサンプルは [開発者ガイド](docs/developer-guide.md) を参照してください。
 
-設計・検証履歴は [progress.md](docs/progress.md)、IPCは [ipc-protocol.md](docs/ipc-protocol.md)、秘密と権限は [security.md](docs/security.md)、限定的なWindows codec測定は [benchmarks.md](docs/benchmarks.md) にあります。
+設計・検証履歴は [progress.md](docs/progress.md)、IPCは [ipc-protocol.md](docs/ipc-protocol.md)、秘密と権限は [security.md](docs/security.md)、限定的なWindows測定（過去の参考記録）は [benchmarks.md](docs/benchmarks.md) にあります。

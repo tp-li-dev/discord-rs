@@ -79,7 +79,7 @@ jobs:
         working-directory: src
         run: cargo fetch --locked
       - name: Test shard
-        run: .github/scripts/test-shard.sh ${{ matrix.shard }}
+        run: bash .github/scripts/test-shard.sh ${{ matrix.shard }}
       - name: Upload test log on failure
         if: failure()
         uses: actions/upload-artifact@v4
