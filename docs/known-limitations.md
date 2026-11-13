@@ -61,3 +61,4 @@
 - 実プロセス（botd、Gateway、Worker、模擬 Discord）を複数起動する統合試験（`e2e_gateway_process_switch`、`botd_child_recovery`、`hot_swap_scenarios`、`raft_botd_processes` など）は、GitHub Actions（Ubuntu、4 vCPU）で、同一バイナリ内で並列に実行したり、複数のバイナリを 1 回の `cargo test` にまとめたりすると、ハングして待ち時間上限を超えることがあった（落ちる試験は実行ごとに異なった）。
 - バイナリごとに別の `cargo test` で、`--test-threads=1` の直列実行にすると、Ubuntu で全件成功した（`.github/scripts/test-shard.sh` の `process` シャード。診断用の `stress.yml` の `switch` スイートでも直列 3 回成功）。実行間の残留プロセスは検出されなかった。
 - 根本原因（試験間の共有資源の取り合い、CPU の取り合い、子プロセスの回収の干渉など）は特定していない。未解決。並列実行に戻す場合は、この試験群の隔離（ポート・ディレクトリ・プロセス）を先に確認すること。
+- **未解決の不安定さ**：上記のバイナリ単位・直列の実行でも、`e2e_gateway_process_switch`（Identify 予算に関する試験）が確率的にハングして失敗することがある（main の CI で 1 回失敗。診断用 stress では直列 3 回成功）。待ち時間を 90 秒にしても落ちるため、遅延ではなくハングと見られる。暫定対応として、CI の `process` シャードは失敗したバイナリを最大 3 回まで再実行し、再実行は警告としてログに出す（`::warning::`）。再実行で通った場合も不安定さは残っているものとして扱い、根本原因の調査は未着手。

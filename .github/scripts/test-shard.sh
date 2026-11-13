@@ -53,7 +53,17 @@ case "${1:?shard name required}" in
     : > test-output.log
     for t in $PROCESS; do
       echo "=== $t ===" | tee -a test-output.log
-      cargo test --locked --workspace --test "$t" -- --test-threads=1 2>&1 | tee -a test-output.log || status=1
+      # Known flaky on CI (see docs/known-limitations.md): retry a failed binary up to
+      # 3 times and say so loudly, so flakiness stays visible in the log.
+      ok=0
+      for attempt in 1 2 3; do
+        if cargo test --locked --workspace --test "$t" -- --test-threads=1 2>&1 | tee -a test-output.log; then
+          ok=1
+          break
+        fi
+        echo "::warning::$t failed on attempt $attempt of 3" | tee -a test-output.log
+      done
+      [ "$ok" = 1 ] || status=1
       leftovers=$(ps -eo pid,etime,cmd | grep -E "target/debug/(botd|src|deps/[a-z_]+-[0-9a-f]+)" | grep -v -E "grep|cargo" || true)
       if [ -n "$leftovers" ]; then
         echo "--- leftover processes after $t ---" | tee -a test-output.log
