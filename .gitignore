@@ -5,3 +5,6 @@ src/core-runtime/
 src/worker-path.txt*
 .idea/
 .vscode/
+
+# Claude Code サブエージェントの作業ツリー
+.claude/worktrees/
