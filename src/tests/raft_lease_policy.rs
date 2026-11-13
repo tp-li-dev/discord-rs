@@ -112,12 +112,14 @@ fn options(local_maximum: Duration) -> NodeOptions {
     NodeOptions {
         allow_test_mode: true,
         max_lease_ttl: local_maximum,
-        write_timeout: Duration::from_secs(2),
+        // Shared CI runners run many test binaries at once; keep elections and
+        // writes far above scheduler jitter so the policy under test is what fails.
+        write_timeout: Duration::from_secs(10),
         raft_config: Config {
             cluster_name: "raft-lease-policy-test".into(),
-            heartbeat_interval: 50,
-            election_timeout_min: 400,
-            election_timeout_max: 800,
+            heartbeat_interval: 100,
+            election_timeout_min: 1500,
+            election_timeout_max: 3000,
             snapshot_policy: SnapshotPolicy::Never,
             ..Config::default()
         },

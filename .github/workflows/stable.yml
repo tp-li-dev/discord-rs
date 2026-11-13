@@ -1,0 +1,33 @@
+name: Stable compatibility
+
+# Informational only: checks the newest stable toolchain weekly or on demand,
+# off the critical path of every push.
+on:
+  schedule:
+    - cron: '0 3 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  stable:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: src
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.8.1
+        with:
+          workspaces: src -> target
+          shared-key: stable
+      - run: cargo fetch --locked
+      - run: cargo build --locked --release --bin src --target-dir target/reload-build
+      - run: cargo test --locked --workspace --no-fail-fast

@@ -1,5 +1,8 @@
 name: Rust CI
 
+# Linux (Ubuntu) is the only supported OS. Jobs run in parallel; the slowest
+# test shard is the critical path, so shards are balanced by runtime
+# (see .github/scripts/test-shard.sh).
 on:
   push:
   pull_request:
@@ -11,9 +14,19 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
+env:
+  # Debug info only slows compile/link and bloats the cache; incremental
+  # compilation cannot help a fresh runner.
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: 5
+
 jobs:
   fmt:
+    name: fmt
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     defaults:
       run:
         working-directory: src
@@ -22,17 +35,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.90.0
         with:
           components: rustfmt
-      - name: Check formatting
-        run: cargo fmt --all --check
+      - run: cargo fmt --all --check
 
   clippy:
-    name: Clippy (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
+    name: clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: src
@@ -44,20 +52,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2.8.1
         with:
           workspaces: src -> target
-      - name: Clippy
-        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+          shared-key: clippy
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
   test:
-    name: Test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    name: test (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
-    defaults:
-      run:
-        working-directory: src
+        # Measured runtimes: reload ~185s (incl. release prebuild), cluster ~96s,
+        # daemon ~84s, rest ~125s.
+        shard: [reload, cluster, daemon, rest]
     steps:
       - uses: actions/checkout@v4
       # trybuild compares rustc diagnostics with checked-in snapshots.
@@ -65,28 +72,26 @@ jobs:
       - uses: Swatinem/rust-cache@v2.8.1
         with:
           workspaces: src -> target
+          shared-key: test
+          save-if: ${{ matrix.shard == 'rest' }}
       # Some integration tests launch Cargo offline, including on a cold runner.
       - name: Fetch locked dependencies
+        working-directory: src
         run: cargo fetch --locked
-      - name: Prepare reload build
-        run: cargo build --locked --release --bin src --target-dir target/reload-build
-      - name: Test
-        shell: bash
-        run: |
-          set -o pipefail
-          cargo test --locked --workspace --no-fail-fast 2>&1 | tee test-output.log
+      - name: Test shard
+        run: .github/scripts/test-shard.sh ${{ matrix.shard }}
       - name: Upload test log on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: test-log-${{ matrix.os }}
+          name: test-log-${{ matrix.shard }}
           path: src/test-output.log
           if-no-files-found: ignore
 
   examples-doctor:
-    name: Examples and doctor
+    name: examples and doctor
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: src
@@ -96,38 +101,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2.8.1
         with:
           workspaces: src -> target
-      - name: Build examples
-        run: cargo build --locked --workspace --examples
-      - name: Check sample configuration
-        run: cargo run --locked --bin doctor -- examples/placement.toml --resolved-shards bot-two=1
+          shared-key: examples
+      - run: cargo build --locked --workspace --examples
+      - run: cargo run --locked --bin doctor -- examples/placement.toml --resolved-shards bot-two=1
 
-  stable:
-    name: Stable compatibility (allowed to fail)
+  # Single required status check for branch protection.
+  ci-ok:
+    name: ci-ok
+    if: always()
+    needs: [fmt, clippy, test, examples-doctor]
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-    continue-on-error: true
-    defaults:
-      run:
-        working-directory: src
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.8.1
-        with:
-          workspaces: src -> target
-      - name: Fetch locked dependencies
-        run: cargo fetch --locked
-      - name: Prepare reload build
-        run: cargo build --locked --release --bin src --target-dir target/reload-build
-      - name: Test
-        shell: bash
-        run: |
-          set -o pipefail
-          cargo test --locked --workspace --no-fail-fast 2>&1 | tee test-output.log
-      - name: Upload test log on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-log-stable-ubuntu
-          path: src/test-output.log
-          if-no-files-found: ignore
+      - run: |
+          echo '${{ toJSON(needs) }}'
+          if [ '${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}' = 'true' ]; then exit 1; fi

@@ -50,3 +50,11 @@ harness = false
 [[bench]]
 name = "failover_detect"
 harness = false
+
+# Faster dev/test builds: keep line tables for backtraces, drop full debug info
+# (dependencies get none). Does not change runtime behaviour.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false

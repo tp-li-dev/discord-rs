@@ -8,7 +8,7 @@
 ## 0. 先に読む：このプロジェクトで絶対に崩さない方針
 
 1. **開発体験を最優先する**。`discord.py` の「書きやすい・読みやすい・理解しやすい」を参考にし、小さなBotは短く、大規模Botは機能ごとに整理して美しく保つ。性能のためだけに利用者へ大量の定型コードを強制しない。
-2. **Rust + Tokio + Twilightを基本**とする。開発はWindows、本番性能と安定性はLinuxを最優先。ただし両OSで正常動作させる。
+2. **Rust + Tokio + Twilightを基本**とする。対応OSはLinux（Ubuntu）のみ。Windowsはサポート外（2026-11-13決定。Windows固有コードは残すが保証・CI対象としない）。本番性能と安定性はLinuxを最優先。
 3. **Dockerのような `botctl` CLI + 常駐Bot Daemon**。最初から複数Botの名前／IDによる管理に対応する。Daemonは各サーバーに配置し、Tailscale等を通じて状態取得・遠隔操作・協調管理できる。
 4. **Shard単位で独立したGatewayとCoreを配置**する。平常時の原則は「1 Shard = 1 Gateway実行単位 + 1 Active Core実行単位」。同じBotの複数Shardは異なるサーバーに配置できる。これは「1 Botが1 Gatewayプロセス」という制限ではない。
 5. **Core更新はGateway接続を切らずにホットスワップ**。旧Coreは新規受付をやめ、実行中の仕事と送信結果の確認を終えてから終了する。
@@ -113,7 +113,7 @@ flowchart TB
 
 | 分野 | 採用案 | 補足 |
 |---|---|---|
-| 言語・実行 | Rust stable / Tokio | Windowsで開発、Linuxでのパフォーマンスを最優先 |
+| 言語・実行 | Rust stable / Tokio | Linuxでのパフォーマンスを最優先（Windowsはサポート外） |
 | Discord Gateway | `twilight-gateway` | 最新の互換バージョンをそろえて固定。Shard/Resumeを活用 |
 | Discord REST/model | `twilight-http`, `twilight-model` | Coreへトークンを渡さずGateway経由で操作 |
 | Discordキャッシュ | `twilight-cache-inmemory`（選択的） | 全メンバー・全メッセージの無条件保存はしない |
@@ -707,7 +707,7 @@ rust-discord-framework/
 6. **Coreホットスワップ**：新Core起動→Readiness→切替→旧Core Draining→結果確認→旧Core停止。失敗・ロールバックをテスト。
 7. **Shard/Gatewayローリング更新**：`/gateway/bot`自動取得、Identify制限、同Shard新旧セッション、Active権限、Shadow期間、Shard単位更新をテスト。
 8. **マルチノード制御**：Daemon間のTLS通信、厳密なShard配置設定、Quorum所有権・Epoch・期限管理、3秒障害検知、代理起動、30秒復旧安定待ちと自動返却。ネットワーク分断・クォーラム喪失テスト必須。
-9. **機能完成**：View/Modal・永続状態、実用Cog例、ログ・メトリクス・セキュリティ、Linux/Windows CI、ベンチマークと日本語Docs。
+9. **機能完成**：View/Modal・永続状態、実用Cog例、ログ・メトリクス・セキュリティ、Linux（Ubuntu）CI、ベンチマークと日本語Docs。
 
 **重要**：一括依頼は「途中経過を隠す」ことではない。各Phaseをビルド・テストし、依存が満たせない機能を架空の成功として報告せず、残課題を明記する。全工程を時間内に完了できない場合も、**動作・テスト済み範囲を明確に切り出した成果物**を残す。
 
@@ -716,7 +716,7 @@ rust-discord-framework/
 - [ ] `cargo fmt --all --check` 成功。
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings` 成功（許可した例外は理由を明記）。
 - [ ] `cargo test --workspace` 成功。属性マクロの成功・失敗テストを含む。
-- [ ] WindowsとUbuntu（Linux）のCIでコンパイル・単体テストが通る。
+- [ ] Ubuntu（Linux）のCIでコンパイル・単体テストが通る（Windowsはサポート外）。
 - [ ] 開発者がCogなしでハイブリッドPingを数行で書いて動作できる。
 - [ ] Cogありの状態共有・イベント・コマンドが動作する。
 - [ ] CLIが複数Botを名前・ID・一意な短縮IDで管理できる。
