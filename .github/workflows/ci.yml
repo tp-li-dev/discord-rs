@@ -63,8 +63,8 @@ jobs:
       fail-fast: false
       matrix:
         # Measured runtimes: reload ~185s (incl. release prebuild), cluster ~96s,
-        # daemon ~84s, rest ~125s.
-        shard: [reload, cluster, daemon, rest]
+        # daemon ~84s, process ~120s (limited concurrency), rest ~70s.
+        shard: [reload, cluster, daemon, process, rest]
     steps:
       - uses: actions/checkout@v4
       # trybuild compares rustc diagnostics with checked-in snapshots.
