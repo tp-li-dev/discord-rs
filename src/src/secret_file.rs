@@ -320,7 +320,7 @@ mod tests {
         let bad: Vec<Vec<u8>> = vec![
             Vec::new(),
             b"\n".to_vec(),
-            GOOD[..62].as_bytes().to_vec(),
+            GOOD.as_bytes()[..62].to_vec(),
             format!("{GOOD}00").into_bytes(),
             format!("{}g", &GOOD[..63]).into_bytes(),
             format!("{} {}", &GOOD[..32], &GOOD[32..]).into_bytes(),
