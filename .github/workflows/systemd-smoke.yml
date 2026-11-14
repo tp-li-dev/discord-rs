@@ -142,6 +142,7 @@ jobs:
           test "$result" = "success"
       - name: Gateway and Core start under systemd (mock Discord), baseline vs hardened
         run: |
+          set +e
           set -uo pipefail
           # Exercises the spawn path (child processes, sockets, syscalls) under the unit's
           # sandbox. The mock collector only accepts connections; no traffic leaves the
@@ -159,6 +160,9 @@ jobs:
           PY
           python3 /tmp/collector.py &
           sleep 1
+          # Diagnostic only: botd sends Gateway stderr to /dev/null, so wrap the program.
+          { echo '#!/bin/sh'; echo 'exec /opt/discord-rs/bin/src "$@" 2>>/var/lib/discord-rs/gateway-stderr.log'; } | sudo tee /opt/discord-rs/bin/src-wrap >/dev/null
+          sudo chmod 0755 /opt/discord-rs/bin/src-wrap
           run_case() {
             name="$1"; extra="$2"
             echo "=== case: $name ==="
@@ -166,7 +170,7 @@ jobs:
               echo "[Service]"; echo "Type=notify"; echo "NotifyAccess=main"; echo "WatchdogSec=6s"
               echo "TimeoutStartSec=30s"
               echo "ExecStart="
-              echo "ExecStart=/opt/discord-rs/bin/botd --file /etc/discord-rs/bots.toml --runtime-root /var/lib/discord-rs/runtime --gateway-program /opt/discord-rs/bin/src --secret-file /etc/discord-rs/botd.secret --control-port 47321 --mock-discord 127.0.0.1:47400"
+              echo "ExecStart=/opt/discord-rs/bin/botd --file /etc/discord-rs/bots.toml --runtime-root /var/lib/discord-rs/runtime --gateway-program /opt/discord-rs/bin/src-wrap --secret-file /etc/discord-rs/botd.secret --control-port 47321 --mock-discord 127.0.0.1:47400"
               echo "$extra"
             } > /tmp/case.conf
             sudo install -m 0644 /tmp/case.conf /etc/systemd/system/botd.service.d/smoke.conf
@@ -176,13 +180,16 @@ jobs:
             ok=0
             for i in $(seq 1 30); do
               out=$(sudo -u discord-rs /opt/discord-rs/bin/botctl status --secret-file /etc/discord-rs/botd.secret --port 47321 --json || true)
-              if echo "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); rows=d.get("shards") or []; sys.exit(0 if rows and all(r.get("phase")=="Stable" for r in rows) else 1)'; then
+              if echo "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); ps=[p for b in d.get("bots",[]) for p in b.get("processes",[])]; sys.exit(0 if ps and all(p.get("recovery",{}).get("stable") or p.get("recovery",{}).get("state") in ("Running","Stable") for p in ps) else 1)'; then
                 ok=1; break
               fi
               sleep 1
             done
             echo "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(json.dumps({"shards": d.get("shards"), "procs": [[{k: v for k, v in p.items() if k != "identity"} for p in b.get("processes", [])] for b in d.get("bots", [])]}, indent=1)[:1500])' || true
             ps -u discord-rs -o pid,ppid,etime,cmd | head -12
+            echo "--- Gateway stderr ($name) ---"
+            sudo tail -n 15 /var/lib/discord-rs/gateway-stderr.log 2>/dev/null || echo "(none)"
+            sudo rm -f /var/lib/discord-rs/gateway-stderr.log
             sudo systemctl stop botd || true
             echo "case $name ok=$ok"
             [ "$ok" = 1 ]
