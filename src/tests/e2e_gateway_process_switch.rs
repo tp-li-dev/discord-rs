@@ -290,7 +290,25 @@ impl Fixture {
     }
 
     async fn accept(&mut self) -> usize {
-        let (stream, peer) = bounded(line!(), self.collector.accept()).await.unwrap();
+        let accepted = tokio::time::timeout(WAIT, self.collector.accept()).await;
+        let (stream, peer) = match accepted {
+            Ok(connection) => connection.unwrap(),
+            Err(_) => {
+                // No Gateway connected in time: report what botd believes about its
+                // shards so the cause (spawn failure, Degraded, waiting budget) is visible.
+                let status = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    self.request(json!({"command":"status"})),
+                )
+                .await
+                .map(|value| value.to_string())
+                .unwrap_or_else(|_| "botd status did not answer within 10s".into());
+                panic!(
+                    "no Gateway connected within {WAIT:?} ({} accepted so far); botd status: {status}",
+                    self.gateways.len()
+                );
+            }
+        };
         assert!(peer.ip().is_loopback());
         let (output, input) = stream.into_split();
         let mut gateway = Gateway {
