@@ -22,13 +22,14 @@ use tokio::{
 const REQUEST_LIMIT: u64 = 4096;
 const RESPONSE_LIMIT: usize = 64 * 1024;
 const DEADLINE: Duration = Duration::from_secs(3);
-const USAGE: &str = "usage: botd --file F --runtime-root ABS --gateway-program ABS (--bootstrap-stdin | --secret-file ABS [--control-port PORT]) [--no-autostart] [--mock-discord LOOPBACK_IP:PORT] [--allow-test-quorum] [--allow-raft-quorum --raft-store ABS --raft-rpc-listen LOOPBACK_IP:PORT --raft-rpc-peer ID=LOOPBACK_IP:PORT ... [--raft-create] [--raft-bootstrap]] [--allow-test-gateway-switch --mock-identify-budget F]";
+const USAGE: &str = "usage: botd --file F --runtime-root ABS --gateway-program ABS (--bootstrap-stdin | --secret-file ABS [--control-port PORT]) [--no-autostart] [--stop-children-on-exit] [--mock-discord LOOPBACK_IP:PORT] [--allow-test-quorum] [--allow-raft-quorum --raft-store ABS --raft-rpc-listen LOOPBACK_IP:PORT --raft-rpc-peer ID=LOOPBACK_IP:PORT ... [--raft-create] [--raft-bootstrap]] [--allow-test-gateway-switch --mock-identify-budget F]";
 
 struct Options {
     file: PathBuf,
     runtime_root: PathBuf,
     gateway_program: PathBuf,
     no_autostart: bool,
+    stop_children_on_exit: bool,
     mock_discord: Option<SocketAddr>,
     allow_test_quorum: bool,
     raft: Option<RaftRuntimeOptions>,
@@ -46,6 +47,7 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
     let mut gateway_program = None;
     let mut bootstrap = false;
     let mut no_autostart = false;
+    let mut stop_children_on_exit = false;
     let mut mock_discord = None;
     let mut allow_test_quorum = false;
     let mut allow_raft_quorum = false;
@@ -138,6 +140,10 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
                 no_autostart = true;
                 continue;
             }
+            Some("--stop-children-on-exit") if !stop_children_on_exit => {
+                stop_children_on_exit = true;
+                continue;
+            }
             Some("--allow-test-quorum") if !allow_test_quorum => {
                 allow_test_quorum = true;
                 continue;
@@ -215,6 +221,7 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
         runtime_root: runtime_root.ok_or(USAGE)?,
         gateway_program: gateway_program.ok_or(USAGE)?,
         no_autostart,
+        stop_children_on_exit,
         mock_discord,
         allow_test_quorum,
         raft,
@@ -242,6 +249,11 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
     }
     if !options.runtime_root.is_absolute() || !options.gateway_program.is_absolute() {
         return Err("runtime root and gateway program must be absolute paths");
+    }
+    let test_or_raft =
+        options.raft.is_some() || options.allow_test_quorum || options.allow_test_gateway_switch;
+    if options.stop_children_on_exit && test_or_raft {
+        return Err("--stop-children-on-exit applies only to the standalone daemon");
     }
     if options.allow_test_gateway_switch {
         if options.mock_discord.is_none() {
@@ -727,10 +739,19 @@ async fn run() -> Result<(), &'static str> {
     let mut last_watchdog = tokio::time::Instant::now();
     let mut interval = tokio::time::interval(Duration::from_millis(25));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // SIGTERM is handled only with --stop-children-on-exit; otherwise it keeps
+    // its default behavior. Registered before the loop so no signal is lost.
+    let mut term = term_signal(options.stop_children_on_exit)?;
+    let mut signaled = false;
     let result = loop {
         tokio::select! {
             signal = tokio::signal::ctrl_c() => {
+                signaled = signal.is_ok();
                 break signal.map_err(|_| "cannot receive daemon shutdown signal");
+            }
+            () = recv_term(&mut term) => {
+                signaled = true;
+                break Ok(());
             }
             _ = interval.tick() => {
                 control.tick(&credentials).await;
@@ -770,7 +791,58 @@ async fn run() -> Result<(), &'static str> {
     };
     let _ = notifier.stopping();
     server.abort();
+    if options.stop_children_on_exit && signaled {
+        // Graceful only, within STOP_CHILDREN_DEADLINE overall. A child that
+        // does not stop in time is left running, never force-killed.
+        let remaining = control
+            .shutdown_children(&credentials, STOP_CHILDREN_DEADLINE)
+            .await;
+        if !remaining.is_empty() {
+            eprintln!(
+                "botd: {} shard child(ren) did not stop within {}s and were left running (not killed)",
+                remaining.len(),
+                STOP_CHILDREN_DEADLINE.as_secs()
+            );
+        }
+    }
     result
+}
+
+/// Overall budget for `--stop-children-on-exit` (below the unit's TimeoutStopSec).
+const STOP_CHILDREN_DEADLINE: Duration = Duration::from_secs(30);
+
+#[cfg(unix)]
+type TermSignal = tokio::signal::unix::Signal;
+#[cfg(not(unix))]
+type TermSignal = ();
+
+#[cfg(unix)]
+fn term_signal(enabled: bool) -> Result<Option<TermSignal>, &'static str> {
+    if !enabled {
+        return Ok(None);
+    }
+    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map(Some)
+        .map_err(|_| "cannot receive daemon shutdown signal")
+}
+#[cfg(not(unix))]
+fn term_signal(_enabled: bool) -> Result<Option<TermSignal>, &'static str> {
+    Ok(None)
+}
+
+/// Pends forever when SIGTERM handling is not enabled (or on non-Unix).
+#[cfg(unix)]
+async fn recv_term(term: &mut Option<TermSignal>) {
+    match term {
+        Some(signal) => {
+            signal.recv().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+#[cfg(not(unix))]
+async fn recv_term(_term: &mut Option<TermSignal>) {
+    std::future::pending::<()>().await
 }
 
 async fn run_raft_cluster(
@@ -1173,6 +1245,31 @@ mod tests {
             parse_options(options(&["--allow-test-quorum"]))
                 .unwrap()
                 .allow_test_quorum
+        );
+    }
+
+    #[test]
+    fn stop_children_on_exit_is_opt_in_single_and_standalone_only() {
+        assert!(
+            !parse_options(options(&[]))
+                .unwrap()
+                .stop_children_on_exit
+        );
+        assert!(
+            parse_options(options(&["--stop-children-on-exit"]))
+                .unwrap()
+                .stop_children_on_exit
+        );
+        assert!(
+            parse_options(options(&["--stop-children-on-exit", "--no-autostart"])).is_ok()
+        );
+        // Duplicates and test/Raft modes are rejected.
+        assert!(
+            parse_options(options(&["--stop-children-on-exit", "--stop-children-on-exit"]))
+                .is_err()
+        );
+        assert!(
+            parse_options(options(&["--stop-children-on-exit", "--allow-test-quorum"])).is_err()
         );
     }
 

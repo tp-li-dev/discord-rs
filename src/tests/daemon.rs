@@ -108,6 +108,15 @@ fn specs(root: &Root, inputs: &[(&str, u32)]) -> Vec<ShardRuntimeSpec> {
         .into_iter()
         .map(OsString::from)
         .collect();
+        // Like a real Gateway, the fixture's command line carries its own
+        // `--management-path`, which the daemon uses to tell that this child
+        // is alive before it would ever discard a leftover reservation. After
+        // "--" libtest treats these as (harmless) name filters.
+        s.gateway.args.extend([
+            OsString::from("--"),
+            OsString::from("--management-path"),
+            s.gateway.management_path.clone().into_os_string(),
+        ]);
         let vars = &mut s.gateway.environment.variables;
         vars.insert("FIXTURE_MODE".into(), "hold".into());
         vars.insert("FIXTURE_LABEL".into(), s.bot_id.clone());
@@ -152,13 +161,16 @@ fn fixture_process() {
         && std::env::var_os("DISCORD_TOKEN").is_none()
         && std::env::var_os("PATH").is_none();
     let args: Vec<_> = std::env::args().skip(1).collect();
-    let args_exact = args
-        == [
-            "--exact",
-            "fixture_process",
-            "--nocapture",
-            "--test-threads=1",
-        ];
+    let args_exact = args.len() == 7
+        && args[..4]
+            == [
+                "--exact",
+                "fixture_process",
+                "--nocapture",
+                "--test-threads=1",
+            ]
+        && args[4] == "--"
+        && args[5] == "--management-path";
     let ready = std::env::var_os("FIXTURE_READY").unwrap();
     std::fs::write(
         ready,
@@ -502,6 +514,33 @@ async fn daemon_drop_keeps_child_alive_and_blocks_replacement_until_reconciliati
     // PID adoption. Instead the fixture's stop acknowledgement provides evidence.
     let ack = exit_file(&root, "A", 0).with_extension("ack");
     eventually(|| ack.exists()).await;
+}
+
+/// Linux only: the decision reads /proc. Other OSes keep refusing (see the test
+/// above), which is the safe default.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn leftover_reservation_without_a_live_gateway_is_removed_and_launch_proceeds() {
+    let root = Root::new();
+    let clock = ManualClock::default();
+    let plan = specs(&root, &[("A", 0)]);
+    let reservation = plan[0]
+        .gateway
+        .management_path
+        .with_extension("botd-reservation");
+    std::fs::create_dir_all(reservation.parent().unwrap()).unwrap();
+    // As left behind by a killed botd: a reservation but no process at all.
+    std::fs::write(&reservation, b"stale").unwrap();
+    let mut d = managed(plan, policy(), &clock);
+    d.0.start_all(&credentials).unwrap();
+    ready_audit(&ready(&root, "A", 0)).await;
+    assert_eq!(d.0.snapshots()[0].state, ProcessState::Running);
+    // The new launch wrote its own reservation (not the stale content).
+    assert_ne!(std::fs::read(&reservation).unwrap(), b"stale");
+    for s in d.0.snapshots() {
+        d.0.stop(&s.key, StopMode::Force).unwrap();
+    }
+    terminal(&mut d.0).await;
 }
 
 #[tokio::test]

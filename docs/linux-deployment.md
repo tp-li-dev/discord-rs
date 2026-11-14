@@ -169,13 +169,20 @@ unit の要点（`deploy/systemd/botd.service` 内のコメントも参照）:
 - `User=discord-rs`、`NoNewPrivileges=yes`、`ProtectSystem=strict`、`ProtectHome=yes`、`PrivateTmp=yes`、
   `ReadWritePaths=/var/lib/discord-rs`、`EnvironmentFile=/etc/discord-rs/botd.env`、
   `Restart=on-failure`、`RestartSec=5s`、`LimitNOFILE=65536`、ログは journald。
-- **`KillSignal=SIGINT`**: botd が停止要求として扱うのは SIGINT のみで、systemd 既定の SIGTERM では停止処理に入りません。
-  `KillMode=mixed` で主プロセスにだけ SIGINT を送り、`TimeoutStopSec=60` 後に残りを SIGKILL します。
-  botd は終了時に子を無条件で kill せず、起動予約を保持します（運用ガイド「daemon終了時」）。停止後に Gateway 子が
-  cgroup の SIGKILL で終了する場合、Gateway の graceful stop（受付済み処理とREST結果確認の完了）は保証されません。
-  この停止シーケンスの実機検証はしていません。
-- `Restart=on-failure` による再起動後、前回の子の孤児再採用は未実装です。再起動で重複起動が拒否される場合があります
-  （「障害時の確認項目」参照）。
+- **`--stop-children-on-exit`（ExecStart）と `KillSignal=SIGTERM`**: このフラグ有効時、botd は SIGINT と SIGTERM の
+  どちらでも、起動した全 Shard の Gateway 子へ graceful な停止を要求し、最大 30 秒待ってから終了します。止まった子の
+  起動予約は解放されます。期限内に止まらない子は botd が強制終了せず、標準エラー（journald）に出して終了します。
+  `KillMode=mixed` で主プロセスにだけ SIGTERM を送り、`TimeoutStopSec=60` 後に残りを systemd が SIGKILL します。
+  その場合、Gateway の graceful stop（受付済み処理とREST結果確認の完了）は保証されません。フラグ無しの botd は従来どおり
+  SIGINT のみを処理し、子を kill せず残して予約を保持します（既定。運用ガイド「daemon終了時」）。フラグを外す場合は
+  `KillSignal=SIGINT` に戻してください。この停止シーケンスは実機の systemd では未検証です。
+- **起動予約の整理**: botd の再起動時、前回の予約ファイルが残っていても、Linux では `/proc/*/cmdline` を調べてその
+  Shard の Gateway（`--management-path` が一致）が生きていないと確認できた場合だけ、予約を削除して起動します。
+  生きている、または判定できない場合は従来どおり拒否します。`ProtectProc=invisible` でも同一ユーザー（`discord-rs`）の
+  Gateway は見えます。孤児の再採用（生きている子を新しい botd が引き継ぐ）は未実装のままです。
+- 同じ runtime root に対して複数の botd を同時に動かす構成は非対応です（一方が予約を作ってから Gateway を起動するまでの
+  短い間、他方が予約を古いと誤判定する可能性があります）。
+- ローカルでは未ビルドで、動作は CI の結果待ちです。
 
 ### 導入後の確認
 
@@ -277,7 +284,7 @@ journalctl --disk-usage                             # 容量確認
 | env ファイル関連 | `/etc/discord-rs/botd.env` の存在・権限・変数名が `token_env` と一致するか。値が空でないか |
 | `Permission denied` | `/var/lib/discord-rs` の所有者 `discord-rs`・0700、`/opt` の実行権、`ProtectSystem=strict` で書込が必要な別パスがないか |
 | Gateway 子（`src`）が起動しない | `--gateway-program` が絶対パスの実行ファイルか。`ps -C src`。Gateway のログは保存されない（制約 3） |
-| 再起動後に Bot が起動しない／重複起動拒否 | botd は終了時に子を kill せず起動予約を保持する。孤児の照合・再採用は未実装。`ps -C src` で孤児を確認し、外部で実態確認のうえ運用者が整理する（運用ガイド「daemon終了時」）。予約を削除する場合は事前確認が必要 |
+| 再起動後に Bot が起動しない／重複起動拒否 | 予約が残り、その Shard の Gateway が `/proc` 上で生きている（または判定できない）場合に拒否される。生きていなければ botd が予約を自動削除して起動する（stderr に Shard キーと世代を 1 行出力）。孤児の再採用は未実装なので、`ps -C src` で孤児（Bot がオンラインのまま残った子）を確認し、運用者が整理する（運用ガイド「daemon終了時」）。unit の `--stop-children-on-exit` を使えば停止時に子も止まる |
 | Discord に接続できない | ネットワーク/DNS、token 失効、Intent 設定、Identify 制限。READY は botd では観測できないため、Discord 側の状態で確認する |
 | ファイル数不足 | `systemctl show botd -p LimitNOFILE`、`ls /proc/PID/fd | wc -l` |
 
@@ -296,5 +303,6 @@ journalctl --disk-usage                             # 容量確認
 - 本番での Raft quorum 有効化（拒否のまま）、分散 Identify・failover の本番統合。
 - 複数ホストでの実障害（ホスト停止・網分断・failover）。
 - 無停止更新、`botctl update`/`rollback` の本番実行、原子的 rollback。
-- 孤児プロセスの再採用、停電時の永続性、`SIGINT` → `KillMode=mixed` 停止の実機での挙動。
+- 孤児プロセスの再採用（未実装）、停電時の永続性、`--stop-children-on-exit` ＋ `SIGTERM` → `KillMode=mixed` 停止と
+  古い予約の自動整理（`/proc` 走査）の実機での挙動（ローカル未ビルド、CI 検証待ち）。
 - `deploy/systemd/botd.service` の hardening 指定が各 Ubuntu バージョンで起動を妨げないこと。

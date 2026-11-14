@@ -42,7 +42,8 @@ ExecStart=/opt/discord-rs/bin/botd \
     --runtime-root /var/lib/discord-rs/runtime \
     --gateway-program /opt/discord-rs/bin/src \
     --secret-file /etc/discord-rs/botd.secret \
-    --control-port 47321
+    --control-port 47321 \
+    --stop-children-on-exit
 
 # 秘密は別ファイル。先頭 "-" は付けない（ファイルが無ければ起動失敗にする）。
 EnvironmentFile=/etc/discord-rs/botd.env
@@ -56,10 +57,15 @@ RuntimeDirectoryMode=0700
 UMask=0077
 
 # --- 停止 ---
-# botd は SIGINT(ctrl_c) のみを停止要求として処理する（src/src/bin/botd.rs）。systemd 既定の
-# SIGTERM では botd の停止処理に入らないため SIGINT を使う。主プロセスにのみ送り、残りは
-# 停止完了時／時間切れ時に systemd が cgroup ごと SIGKILL する。
-KillSignal=SIGINT
+# ExecStart の --stop-children-on-exit により、botd は SIGINT と SIGTERM のどちらでも、起動した全 Shard の
+# Gateway 子を graceful に止めて（最大 30 秒）から終了する。止まった子の起動予約も解放する。
+# このフラグ無しの botd は SIGINT(ctrl_c) のみを処理し、子を残す（SIGTERM では停止処理に入らない）。
+# そのためフラグを外す場合は KillSignal=SIGINT に戻すこと。
+# SIGTERM は systemd の既定で、フラグ有効時は botd が処理するため、KillSignal は既定の SIGTERM にする。
+# KillMode=mixed: シグナルは主プロセスにのみ送り、残りの子は停止完了時／TimeoutStopSec（60 秒。botd の
+# 30 秒の期限より長い）切れ時に systemd が cgroup ごと SIGKILL する。
+# 孤児の再採用（生きている子を新しい botd が引き継ぐ）は未実装。この unit は実機の systemd では未検証。
+KillSignal=SIGTERM
 KillMode=mixed
 TimeoutStopSec=60
 
