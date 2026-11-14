@@ -1240,12 +1240,7 @@ pub mod control {
             credentials: &impl CredentialSource,
             deadline: Duration,
         ) -> Vec<ShardKey> {
-            let keys: Vec<ShardKey> = self
-                .daemon
-                .snapshots()
-                .into_iter()
-                .map(|s| s.key)
-                .collect();
+            let keys: Vec<ShardKey> = self.daemon.snapshots().into_iter().map(|s| s.key).collect();
             for key in &keys {
                 // A failed request leaves the child running; it is reported below.
                 let _ = self.daemon.graceful_stop(key).await;
@@ -2000,8 +1995,7 @@ fn read_proc_cmdlines() -> Option<Vec<Vec<u8>>> {
         match std::fs::read(entry.path().join("cmdline")) {
             Ok(bytes) => lines.push(bytes),
             // The process exited between listing and reading (ENOENT or ESRCH=3).
-            Err(e)
-                if e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(3) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(3) => {}
             Err(_) => return None,
         }
     }
@@ -2011,9 +2005,7 @@ fn read_proc_cmdlines() -> Option<Vec<Vec<u8>>> {
 #[cfg(target_os = "linux")]
 fn scan_gateway_liveness(program: &Path, management_path: &Path) -> GatewayLiveness {
     match read_proc_cmdlines() {
-        Some(lines) if gateway_alive_in(&lines, program, management_path) => {
-            GatewayLiveness::Alive
-        }
+        Some(lines) if gateway_alive_in(&lines, program, management_path) => GatewayLiveness::Alive,
         Some(_) => GatewayLiveness::NotAlive,
         None => GatewayLiveness::Unknown,
     }
@@ -2131,10 +2123,8 @@ mod stale_reservation_tests {
     }
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "discord-rs-stale-{}-{name}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("discord-rs-stale-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -2151,13 +2141,29 @@ mod stale_reservation_tests {
         let dir = scratch("removal");
         let path = dir.join("gateway-management.botd-reservation");
         std::fs::write(&path, b"not json").unwrap();
-        assert!(!reclaim_stale_reservation(&path, &key(), GatewayLiveness::Alive));
-        assert!(!reclaim_stale_reservation(&path, &key(), GatewayLiveness::Unknown));
+        assert!(!reclaim_stale_reservation(
+            &path,
+            &key(),
+            GatewayLiveness::Alive
+        ));
+        assert!(!reclaim_stale_reservation(
+            &path,
+            &key(),
+            GatewayLiveness::Unknown
+        ));
         assert!(path.exists());
-        assert!(reclaim_stale_reservation(&path, &key(), GatewayLiveness::NotAlive));
+        assert!(reclaim_stale_reservation(
+            &path,
+            &key(),
+            GatewayLiveness::NotAlive
+        ));
         assert!(!path.exists());
         // Nothing to remove: not reported as removed.
-        assert!(!reclaim_stale_reservation(&path, &key(), GatewayLiveness::NotAlive));
+        assert!(!reclaim_stale_reservation(
+            &path,
+            &key(),
+            GatewayLiveness::NotAlive
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2169,11 +2175,19 @@ mod stale_reservation_tests {
         std::fs::write(&target, b"x").unwrap();
         let link = dir.join("link.botd-reservation");
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        assert!(!reclaim_stale_reservation(&link, &key(), GatewayLiveness::NotAlive));
+        assert!(!reclaim_stale_reservation(
+            &link,
+            &key(),
+            GatewayLiveness::NotAlive
+        ));
         assert!(link.exists() && target.exists());
         let folder = dir.join("folder.botd-reservation");
         std::fs::create_dir(&folder).unwrap();
-        assert!(!reclaim_stale_reservation(&folder, &key(), GatewayLiveness::NotAlive));
+        assert!(!reclaim_stale_reservation(
+            &folder,
+            &key(),
+            GatewayLiveness::NotAlive
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2804,10 +2818,8 @@ impl<C: Clock> Daemon<C> {
                     // A leftover (e.g. botd was killed). Remove it only when no
                     // Gateway of this shard is verifiably alive; otherwise the
                     // reservation keeps blocking a duplicate launch.
-                    let liveness = scan_gateway_liveness(
-                        Path::new(&spec.program),
-                        &spec.management_path,
-                    );
+                    let liveness =
+                        scan_gateway_liveness(Path::new(&spec.program), &spec.management_path);
                     if !reclaim_stale_reservation(&path, &entry.snapshot.key, liveness) {
                         return Err(DaemonError::ReservationExists);
                     }

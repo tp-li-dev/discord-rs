@@ -1250,23 +1250,20 @@ mod tests {
 
     #[test]
     fn stop_children_on_exit_is_opt_in_single_and_standalone_only() {
-        assert!(
-            !parse_options(options(&[]))
-                .unwrap()
-                .stop_children_on_exit
-        );
+        assert!(!parse_options(options(&[])).unwrap().stop_children_on_exit);
         assert!(
             parse_options(options(&["--stop-children-on-exit"]))
                 .unwrap()
                 .stop_children_on_exit
         );
-        assert!(
-            parse_options(options(&["--stop-children-on-exit", "--no-autostart"])).is_ok()
-        );
+        assert!(parse_options(options(&["--stop-children-on-exit", "--no-autostart"])).is_ok());
         // Duplicates and test/Raft modes are rejected.
         assert!(
-            parse_options(options(&["--stop-children-on-exit", "--stop-children-on-exit"]))
-                .is_err()
+            parse_options(options(&[
+                "--stop-children-on-exit",
+                "--stop-children-on-exit"
+            ]))
+            .is_err()
         );
         assert!(
             parse_options(options(&["--stop-children-on-exit", "--allow-test-quorum"])).is_err()
