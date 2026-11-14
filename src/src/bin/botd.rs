@@ -342,15 +342,6 @@ async fn read_bootstrap<R: AsyncRead + Unpin>(reader: R) -> io::Result<Bootstrap
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "control bootstrap timed out"))?
 }
 
-/// Gateway（`src --bot-id`、`main.rs` の `GatewayOptions::parse`）が受け付ける形と同じ規則:
-/// 先頭ゼロや符号を含まない正規の 10 進 u64。別名（"001" と "1"）が同じ Bot の識別に化けない
-/// よう、Gateway 側が厳密に拒否する。規則を変える場合は両方を同時に変えること。
-fn is_canonical_discord_id(id: &str) -> bool {
-    id.parse::<u64>()
-        .ok()
-        .is_some_and(|number| number.to_string() == id)
-}
-
 /// secret の取得元。`--secret-file` があれば権限検査つきでファイルから、なければ匿名 stdin から読む。
 /// エラーは固定文字列のみ（secret・パス・OS のエラー文字列を含めない）。
 async fn load_bootstrap(secret_file: Option<&std::path::Path>) -> Result<Bootstrap, &'static str> {
@@ -696,20 +687,6 @@ async fn run() -> Result<(), &'static str> {
     let audit = RecoveryAudit::open(options.runtime_root.join("recovery-audit.jsonl")).await?;
     daemon.require_shared_recovery_admission();
     let credentials = EnvironmentCredentials;
-    // A Gateway rejects any --bot-id that is not a canonical decimal u64 and exits at
-    // once, so such a Bot would fail on every (re)start. Say so up front instead of
-    // letting the supervisor loop on a child that can never start.
-    if !options.no_autostart
-        && daemon
-            .snapshots()
-            .iter()
-            .any(|s| !is_canonical_discord_id(&s.key.bot_id))
-    {
-        return Err(
-            "bot_id must be a canonical decimal Discord ID when Gateways are launched \
-             (placeholder IDs are only usable with --no-autostart)",
-        );
-    }
     // Partial startup failures remain visible through snapshots. Dropping this
     // daemon, including any error below, deliberately does not force-kill children.
     let startup_ok = options.no_autostart || daemon.start_all(&credentials).is_ok();
@@ -1171,26 +1148,6 @@ async fn main() {
 mod tests {
     use super::*;
     use tokio::io::{DuplexStream, duplex};
-
-    #[test]
-    fn discord_id_rule_matches_the_gateway_launch_check() {
-        for good in ["1", "101", "18446744073709551615", "123456789012345678"] {
-            assert!(is_canonical_discord_id(good), "{good}");
-        }
-        for bad in [
-            "",
-            "001",
-            "+1",
-            "-1",
-            " 1",
-            "1 ",
-            "ab100-alpha",
-            "1.0",
-            "18446744073709551616",
-        ] {
-            assert!(!is_canonical_discord_id(bad), "{bad:?}");
-        }
-    }
 
     fn options(extra: &[&str]) -> Vec<OsString> {
         let root = std::env::current_dir().unwrap();
