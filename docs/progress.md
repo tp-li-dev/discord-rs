@@ -227,3 +227,8 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - 検証していないこと：応答時間の計測値、長時間稼働、Resume、複数 Shard、systemd 常駐での実 Discord 接続、レート制限が実際に出る場面。
 - 改善候補（未着手）：botd が終了時に、自分が起動した子を、確認つきで停止する（または `botctl shutdown` のような一括停止）。現状は、手動運用で停止順序を守る必要がある。
 
+
+## ロードマップ：Gateway の無停止更新（ローリング）の本番化（未着手、2026-11-14 に合意）
+- 現状：模擬 Discord の試験モードのみ（状態機械、旧 Gateway の drain、単一 Active、共有 Identify 予算を実プロセス試験で確認）。通常の daemon では実更新を安全に拒否する。Core（Worker）のホットスワップは標準経路で使える。
+- 本番化に必要：(1) 旧 Gateway から新 Gateway への Discord セッション（session_id、シーケンス番号、resume_gateway_url）の保護された引き継ぎと、新 Gateway の Resume（新規 Identify を消費しない）。(2) 複数プロセス間の Identify 調整（現状はプロセス内のみ）。(3) 実 Discord での検証（Resume の成否、切替中のイベント欠落、Interaction の 3 秒）。
+- 進め方：設計は Astra（max）、実装は Luna（max、高速）、検証は stress ワークフローと実機。Codex の利用再開（2026-11-18 18:17 頃）後に着手する。
