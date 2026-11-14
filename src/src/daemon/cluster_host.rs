@@ -781,6 +781,29 @@ impl ClusterHost {
     }
 }
 
+/// Fixed, secret-free message per failure kind. `ClusterRuntimeError` carries no
+/// user-supplied text, so naming the kind is safe and makes a failed (re)start
+/// diagnosable instead of one catch-all line.
+fn bind_error_message(error: crate::cluster_runtime::ClusterRuntimeError) -> &'static str {
+    use crate::cluster_runtime::ClusterRuntimeError as E;
+    match error {
+        E::ConfigRead | E::ConfigTooLarge | E::InvalidConfig => {
+            "Raft cluster configuration invalid (InvalidConfig)"
+        }
+        E::TestOnlyOptInRequired
+        | E::RaftOptInRequired
+        | E::ProductionNotReady
+        | E::MockDiscordRequired
+        | E::UnsupportedMode => "Raft cluster mode not permitted (opt-in or mock Discord required)",
+        E::CertificateRead | E::InvalidPrivateKey => "Raft cluster mTLS material invalid",
+        E::Transport => "Raft cluster transport failed (Transport: bind or connect)",
+        E::Coordinator => "Raft cluster storage or coordinator failed (Coordinator)",
+        E::Policy | E::CounterExhausted | E::UnknownShard | E::EpochRequired => {
+            "Raft cluster runtime rejected the request"
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -879,28 +902,5 @@ mod tests {
         );
         assert_eq!(budget.consecutive, 1);
         assert_eq!(budget.failures, 3);
-    }
-}
-
-/// Fixed, secret-free message per failure kind. `ClusterRuntimeError` carries no
-/// user-supplied text, so naming the kind is safe and makes a failed (re)start
-/// diagnosable instead of one catch-all line.
-fn bind_error_message(error: crate::cluster_runtime::ClusterRuntimeError) -> &'static str {
-    use crate::cluster_runtime::ClusterRuntimeError as E;
-    match error {
-        E::ConfigRead | E::ConfigTooLarge | E::InvalidConfig => {
-            "Raft cluster configuration invalid (InvalidConfig)"
-        }
-        E::TestOnlyOptInRequired
-        | E::RaftOptInRequired
-        | E::ProductionNotReady
-        | E::MockDiscordRequired
-        | E::UnsupportedMode => "Raft cluster mode not permitted (opt-in or mock Discord required)",
-        E::CertificateRead | E::InvalidPrivateKey => "Raft cluster mTLS material invalid",
-        E::Transport => "Raft cluster transport failed (Transport: bind or connect)",
-        E::Coordinator => "Raft cluster storage or coordinator failed (Coordinator)",
-        E::Policy | E::CounterExhausted | E::UnknownShard | E::EpochRequired => {
-            "Raft cluster runtime rejected the request"
-        }
     }
 }

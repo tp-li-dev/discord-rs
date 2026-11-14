@@ -1062,7 +1062,9 @@ async fn bounded_store_timeouts_keep_committed_claims_and_do_not_fake_empty_list
     let fixture = Fixture::new();
     let store = late_store(&fixture).await;
     let limits = JobLimits {
-        store_timeout_ms: 100,
+        // Ordinary store calls must not time out on a loaded CI runner; only the stalled
+        // call after `stall_after_commit` is expected to hit this limit.
+        store_timeout_ms: 2_000,
         ..JobLimits::default()
     };
     let queue = open(
