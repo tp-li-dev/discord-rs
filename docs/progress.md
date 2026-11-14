@@ -192,3 +192,11 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - 統合：zdtfix（無停止更新：連続更新・Gateway 切替・旧 Worker クラッシュは基準を満たす。『ハンドラー実行後・結果返却前のクラッシュ』は仕様上の限界＝結果不明として `#[ignore]` の別試験に分離）、raftwire（Raft runtime を botd に配線、既定無効・模擬 Discord 限定）、メトリクスの daemon 接続（Identify 待ち・drain 時間・世代・欠落数のみ。failover/IPC往復/REST予算の送信元は未接続）、docs の最終整備。
 - ツール：Codex は利用枠切れ（2026-11-18 18:17 頃まで）。Antigravity CLI（agy、ファイル編集のみ）と Claude Code のサブエージェント（モデル指定なし）で代替。Haiku は環境設定のため使えなかった（要 Claude Code 再起動後の再確認）。
 - 未検証・未完了：実 Discord（ユーザー実施）、複数ホストの実障害、OS suspend、本番での Raft 有効化（起動拒否のまま）、メトリクスの残りの送信元の接続、永続 Subscription/ジョブの Worker 接続、Core 単独更新・更新失敗時の自動 rollback、process シャードの並列不安定の根本原因。
+
+## 2026-11-14：不安定な統合試験の根本原因の解決と、Linux 常駐運用の整備
+- **根本原因の解決（本番相当の競合）**：実プロセス統合試験が CI（Ubuntu、4 vCPU）で約 35% 失敗していた（20 回中 7 回）。診断（時間切れ時に botd の状態を出す）で、同じ Bot の複数 Shard が同時に起動すると、片方が `Degraded: IdentifyUnavailable` になり永久に停止することが判明。原因は `MockIdentifyScheduler::reserve` が、ロック取得前に採られた時刻を『逆行』としてエラーにしていたこと。時刻を単調に丸めて修正（`src/src/gateway_switch.rs`）、単体試験を追加。修正後 20/20 成功。実運用の共有 Identify 調整でも、時刻のサンプリングと直列化の順序に同じ落とし穴がある。
+- 別の不安定さ（ETXTBSY）：試験が実行ファイルを `fs::copy` した直後に起動すると、同一プロセス内の他スレッドの fork が書き込み fd を保持している間に `Text file busy` で失敗し得る。`testkit::copy_executable`（ハードリンク、不可ならコピー）に置き換え（5 か所）。
+- CI：`process` シャードを、直列・再実行の暫定対応から、並列・再実行なしに戻した（根拠：反復 stress で 20/20 と 20/20）。stress に `switch`/`process` スイートを追加。
+- Linux 常駐運用：`deploy/systemd/botd.service`、`deploy/botd.env.example`、`docs/linux-deployment.md` を追加。botd に systemd `sd_notify`（READY/WATCHDOG/STOPPING、既定経路のみ）を実装（実 systemd では未検証のため unit では無効）。botd と botctl に `--secret-file`（権限 0600/0400、所有者、リンク拒否の検査）と `botctl secret generate` を追加し、systemd 常駐の botd を botctl で操作できるようにした（以前は secret を渡す手段がなく操作不能だった）。`--control-port` を追加。いずれも Ubuntu の CI（試験 5 シャード、clippy、fmt）で成功。実 Ubuntu/systemd の実機は未検証。
+- 運用：Haiku は Claude Code の再起動後に使えるようになった（軽い読み取り作業向け。余計なツールを呼ぶことがあるので範囲を絞る）。サブエージェントのローカル cargo は PC 負荷のため禁止し、検証は Actions で行う。
+- 未検証・未完了：実 Discord（ユーザー実施）、実 systemd/Ubuntu、複数ホストの実障害、本番での Raft 有効化（起動拒否のまま）、メトリクスの残りの送信元（failover、IPC 往復、REST 予算）、永続 Subscription/ジョブの Worker 接続、Core 単独更新・更新失敗時の自動 rollback、`raft_botd_processes` の rejoin の稀な失敗（原因未特定、診断を強化済み）。

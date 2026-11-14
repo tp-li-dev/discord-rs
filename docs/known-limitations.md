@@ -62,3 +62,4 @@
 - 原因：mock の Identify 予約器（`MockIdentifyScheduler::reserve`）が、各 Shard が『ロック取得前に採った時刻』を受け取り、他 Shard の予約より前の時刻だと『時刻の逆行』としてエラーを返していた。同じ Bot の複数 Shard が同時に起動すると、負けた Shard が `IdentifyUnavailable` として永久に `Degraded` になり、Gateway が接続してこなかった。
 - 修正：時刻を単調に丸める（`max(now, last_now)`）。再現の単体試験を追加（`tests/gateway_switch.rs`）。修正後、Ubuntu で 20 回の反復がすべて成功した。
 - 注意：この競合は mock の予約器の問題だが、実運用の Identify 調整（共有予算）を実装する際も、時刻のサンプリングと直列化の順序に同じ落とし穴がある。判定の時刻は、直列化の内側で採ること。
+- **未解決（低頻度）**：`raft_botd_processes` の `raft_botd_death_persistent_rejoin_and_automatic_failback` が、強制終了した botd の再起動（rejoin）で、`Raft cluster configuration, storage or mTLS invalid` により起動に失敗したことがある（Ubuntu の CI で 40 回の反復中 1 回。その後の 20 回は全件成功）。当時は失敗の種別が 1 つの文言に丸められていたため原因は不明。診断のため、種別ごとの固定文言（秘密なし）を出すよう変更済み。次に再現したら、その文言で原因（InvalidConfig、Transport、Coordinator など）を特定する。この経路は試験用（模擬 Discord 限定、本番では起動拒否）。
