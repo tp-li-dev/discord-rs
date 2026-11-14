@@ -108,6 +108,12 @@ read -rs DISCORD_TOKEN && export DISCORD_TOKEN
 
 ### 4. botd の起動（1 Shard）
 
+> **botd が読む token の環境変数名は、`bots.toml` の `token_env` と同じ名前でなければならない**（この手順書の例では `DISCORD_TEST_BOT_TOKEN`）。
+> **botd を起動する端末（systemd なら EnvironmentFile）で、その名前に token を設定してから起動する**。別の端末で設定した変数は、botd には渡らない。
+> 設定が無いと、子の起動前に失敗する: `botctl status --json` の `error` が `MissingCredential`、`state` が `Failed`、`restart_exhausted` が true、`gateway.log` はできない。
+> 名前は `grep token_env <bots.toml>` で確認できる。値は表示せず、設定の有無だけ確認する: `[ -n "${DISCORD_TEST_BOT_TOKEN:-}" ] && echo 設定済み`。
+> 起動に成功すると、Shard ごとの状態ディレクトリ（例 `<runtime-root>/bot-313031/shard-0/`）に `gateway.log`（0600）ができ、`--- gateway generation 1 ---` と `ログイン成功: …` が入る（2026-11-14 の実機で確認）。
+
 管理用の secret ファイル（token ではない）を作る。絶対パス・0600・botd を動かすユーザー所有で、既存ファイルは上書きされない。
 
 ```bash
