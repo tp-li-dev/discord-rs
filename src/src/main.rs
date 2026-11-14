@@ -1100,10 +1100,7 @@ async fn live_events(
                                 Ok(Err(error)) => {
                                     eprintln!(
                                         "{}",
-                                        failure_message(
-                                            "応答追跡を開始できません",
-                                            error.as_ref()
-                                        )
+                                        failure_message("応答追跡を開始できません", error.as_ref())
                                     );
                                     return "コマンドを実行できませんでした".to_owned();
                                 }
