@@ -16,7 +16,7 @@ on:
         required: true
         default: all
         type: choice
-        options: [update_load, raft, recovery, acl, switch, all]
+        options: [update_load, raft, recovery, acl, switch, process, all]
 permissions:
   contents: read
 concurrency:
@@ -85,6 +85,7 @@ jobs:
           run_suite acl cargo test -p src --test fs_perms --test fs_perms_path_api
           # Diagnoses hangs of the process-spawning switch tests: serial run with
           # captured output, then lists leftover botd/Gateway processes.
+          run_suite process bash ../.github/scripts/test-shard.sh process
           run_suite switch bash -c 'cargo test -p src --test e2e_gateway_process_switch -- --test-threads=1 --nocapture; rc=$?; echo "--- leftover processes ---"; ps -eo pid,ppid,etime,stat,cmd | grep -E "botd|target/debug/src|worker" | grep -v grep | head -40; exit $rc'
           exit "$status"
       - name: Upload failure log

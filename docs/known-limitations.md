@@ -57,8 +57,8 @@
 
 [benchmarks.md](benchmarks.md) はWindows開発機の過去の参考記録とユーザー提供のLinux共有CI記録（Actions ubuntu-latest、IPC往復 p99 = 115.5/258.1/973.6 µs、failover検知 Suspected p50 1503.6 ms / FailoverPending p50 3003.1 ms、共有ランナーで本番保証ではない、往復値で片道p99の直接測定ではない）を含みます。実Discord検証はユーザーが実施する範囲です。Linux本番性能、負荷時Heartbeat、RSS/Shard、1/4/16/64 Shard、更新・Failover遅延は未検証です。個々の測定を仕様全体の性能目標達成の証拠にはしません。
 
-## 実プロセス統合試験の実行方法（既知の課題、2026-11-13）
-- 実プロセス（botd、Gateway、Worker、模擬 Discord）を複数起動する統合試験（`e2e_gateway_process_switch`、`botd_child_recovery`、`hot_swap_scenarios`、`raft_botd_processes` など）は、GitHub Actions（Ubuntu、4 vCPU）で、同一バイナリ内で並列に実行したり、複数のバイナリを 1 回の `cargo test` にまとめたりすると、ハングして待ち時間上限を超えることがあった（落ちる試験は実行ごとに異なった）。
-- バイナリごとに別の `cargo test` で、`--test-threads=1` の直列実行にすると、Ubuntu で全件成功した（`.github/scripts/test-shard.sh` の `process` シャード。診断用の `stress.yml` の `switch` スイートでも直列 3 回成功）。実行間の残留プロセスは検出されなかった。
-- 根本原因（試験間の共有資源の取り合い、CPU の取り合い、子プロセスの回収の干渉など）は特定していない。未解決。並列実行に戻す場合は、この試験群の隔離（ポート・ディレクトリ・プロセス）を先に確認すること。
-- **未解決の不安定さ**：上記のバイナリ単位・直列の実行でも、`e2e_gateway_process_switch`（Identify 予算に関する試験）が確率的にハングして失敗することがある（main の CI で 1 回失敗。診断用 stress では直列 3 回成功）。待ち時間を 90 秒にしても落ちるため、遅延ではなくハングと見られる。暫定対応として、CI の `process` シャードは失敗したバイナリを最大 3 回まで再実行し、再実行は警告としてログに出す（`::warning::`）。再実行で通った場合も不安定さは残っているものとして扱い、根本原因の調査は未着手。
+## 実プロセス統合試験の不安定さ（解決済み、2026-11-14）
+- 実プロセス（botd、Gateway、Worker、模擬 Discord）を複数起動する統合試験は、GitHub Actions（Ubuntu、4 vCPU）で確率的に失敗していた（`e2e_gateway_process_switch` ほか。20 回の反復で 7 回失敗）。
+- 原因：mock の Identify 予約器（`MockIdentifyScheduler::reserve`）が、各 Shard が『ロック取得前に採った時刻』を受け取り、他 Shard の予約より前の時刻だと『時刻の逆行』としてエラーを返していた。同じ Bot の複数 Shard が同時に起動すると、負けた Shard が `IdentifyUnavailable` として永久に `Degraded` になり、Gateway が接続してこなかった。
+- 修正：時刻を単調に丸める（`max(now, last_now)`）。再現の単体試験を追加（`tests/gateway_switch.rs`）。修正後、Ubuntu で 20 回の反復がすべて成功した。
+- 注意：この競合は mock の予約器の問題だが、実運用の Identify 調整（共有予算）を実装する際も、時刻のサンプリングと直列化の順序に同じ落とし穴がある。判定の時刻は、直列化の内側で採ること。

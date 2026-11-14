@@ -8,10 +8,8 @@ cd "$(dirname "$0")/../../src"
 RELOAD="reload_command"
 CLUSTER="cluster_sim raft_cluster_runtime e2e_cluster_processes"
 DAEMON="botctl_daemon fixture_build raft_quorum"
-# Tests that spawn several real botd/Gateway/Worker processes each. Running all of
-# their tests at once, or several of these binaries in one cargo invocation, was
-# unreliable on CI (root cause unknown, see docs/known-limitations.md), so this
-# shard runs each binary on its own, with serial tests.
+# Tests that spawn several real botd/Gateway/Worker processes each. They get their
+# own shard because they are the slowest and most CPU hungry.
 PROCESS="e2e_gateway_process_switch botd_child_recovery gateway_admission_process hot_swap_scenarios raft_botd_processes botd_metrics child_recovery_processes worker_child_recovery e2e_shard_worker e2e_shard_runtime"
 
 targets() {
@@ -46,34 +44,11 @@ case "${1:?shard name required}" in
     run $(test_args $DAEMON)
     ;;
   process)
-    # One cargo invocation per binary, serial tests, and a sweep of leftover
-    # child processes in between: earlier binaries can leave botd/Gateway/Worker
-    # children behind, which then starve or conflict with the next binary.
-    status=0
-    : > test-output.log
-    for t in $PROCESS; do
-      echo "=== $t ===" | tee -a test-output.log
-      # Known flaky on CI (see docs/known-limitations.md): retry a failed binary up to
-      # 3 times and say so loudly, so flakiness stays visible in the log.
-      ok=0
-      for attempt in 1 2 3; do
-        if cargo test --locked --workspace --test "$t" -- --test-threads=1 2>&1 | tee -a test-output.log; then
-          ok=1
-          break
-        fi
-        echo "::warning::$t failed on attempt $attempt of 3" | tee -a test-output.log
-      done
-      [ "$ok" = 1 ] || status=1
-      leftovers=$(ps -eo pid,etime,cmd | grep -E "target/debug/(botd|src|deps/[a-z_]+-[0-9a-f]+)" | grep -v -E "grep|cargo" || true)
-      if [ -n "$leftovers" ]; then
-        echo "--- leftover processes after $t ---" | tee -a test-output.log
-        echo "$leftovers" | tee -a test-output.log
-        pkill -f "target/debug/botd" || true
-        pkill -f "target/debug/src" || true
-        sleep 1
-      fi
-    done
-    exit "$status"
+    # Tests that spawn real botd/Gateway/Worker processes. A race in the shared
+    # mock Identify scheduler used to make these flaky; fixed 2026-11-14 (20/20 CI
+    # iterations passed afterwards), so they run in parallel like everything else.
+    # shellcheck disable=SC2086
+    run $(test_args $PROCESS)
     ;;
   rest)
     heavy=" $RELOAD $CLUSTER $DAEMON $PROCESS "
