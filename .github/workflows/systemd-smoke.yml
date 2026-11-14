@@ -60,7 +60,7 @@ jobs:
           id = "one"
           [[bots]]
           name = "alpha"
-          bot_id = "ab100-alpha"
+          bot_id = "101"
           application_id = "101"
           token_env = "TOKEN_ALPHA"
           total_shards = 1
@@ -178,9 +178,9 @@ jobs:
             sudo rm -rf /var/lib/discord-rs/runtime
             sudo systemctl start botd || { echo "botd failed to start"; return 1; }
             ok=0
-            for i in $(seq 1 30); do
+            for i in $(seq 1 45); do
               out=$(sudo -u discord-rs /opt/discord-rs/bin/botctl status --secret-file /etc/discord-rs/botd.secret --port 47321 --json || true)
-              if echo "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); ps=[p for b in d.get("bots",[]) for p in b.get("processes",[])]; sys.exit(0 if ps and all(p.get("recovery",{}).get("stable") or p.get("recovery",{}).get("state") in ("Running","Stable") for p in ps) else 1)'; then
+              if echo "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); ps=[p for b in d.get("bots",[]) for p in b.get("processes",[])]; sys.exit(0 if ps and all(p.get("recovery",{}).get("stable") is True and p.get("recovery",{}).get("restarts",1) == 0 for p in ps) else 1)'; then
                 ok=1; break
               fi
               sleep 1
