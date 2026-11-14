@@ -8,8 +8,11 @@
 //!
 //! Drive `poll` regularly. Dropping this owner never kills children. A persistent
 //! create-new reservation blocks accidental replacement while an orphan may
-//! survive; stale reservations require external, authenticated reconciliation.
-//! There is deliberately no automatic PID-based adoption or reservation removal.
+//! survive. On Linux a leftover reservation is removed at launch only when the
+//! /proc command lines show no live Gateway for that shard (executable and
+//! `--management-path` match); otherwise, or when that cannot be judged (any
+//! other OS), it still blocks. There is deliberately no PID-based adoption of a
+//! living orphan: re-adoption is unimplemented.
 //! The root and artifacts are trusted operator inputs. Filesystem aliases/ACLs,
 //! power-loss durability and service-manager teardown are outside this skeleton.
 //! Reservations cover one configured runtime namespace, not other roots/hosts.
@@ -1228,6 +1231,40 @@ pub mod control {
             response
         }
 
+        /// Opt-in daemon shutdown (`botd --stop-children-on-exit`): request a
+        /// cooperative stop of every owned child, then reap until `deadline`.
+        /// Never force-kills. Exited children release their reservation through
+        /// the normal poll path. Returns the shards whose child is still alive.
+        pub async fn shutdown_children(
+            &mut self,
+            credentials: &impl CredentialSource,
+            deadline: Duration,
+        ) -> Vec<ShardKey> {
+            let keys: Vec<ShardKey> = self
+                .daemon
+                .snapshots()
+                .into_iter()
+                .map(|s| s.key)
+                .collect();
+            for key in &keys {
+                // A failed request leaves the child running; it is reported below.
+                let _ = self.daemon.graceful_stop(key).await;
+            }
+            let until = Instant::now() + deadline;
+            loop {
+                let _ = self.daemon.poll(credentials);
+                let remaining: Vec<ShardKey> = keys
+                    .iter()
+                    .filter(|key| self.daemon.has_child(key))
+                    .cloned()
+                    .collect();
+                if remaining.is_empty() || Instant::now() >= until {
+                    return remaining;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+
         /// Observe actual exits before advancing operations. One command per
         /// Bot per tick bounds cooperative writes and keeps reads responsive.
         pub async fn tick(&mut self, credentials: &impl CredentialSource) {
@@ -1893,6 +1930,264 @@ pub fn reconcile_orphan(record: &OrphanRecord, observed: &OrphanObservation) -> 
     Reconciliation::Matches
 }
 
+/// Result of looking for a live Gateway of one shard in the OS process table.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GatewayLiveness {
+    /// A process whose executable and `--management-path` match exists.
+    Alive,
+    /// The whole process table was read and no such process exists.
+    NotAlive,
+    /// The process table could not be read or judged: callers must refuse.
+    Unknown,
+}
+
+/// Pure judgement over `/proc/*/cmdline` contents (NUL separated arguments).
+/// True when some command line has the Gateway program as its executable (the
+/// exact path, or the same file name) and `--management-path` equal to this
+/// shard's management path (`--flag value` or `--flag=value`). Matching is
+/// deliberately generous: a false "alive" only keeps the old refusal.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn gateway_alive_in(cmdlines: &[Vec<u8>], program: &Path, management_path: &Path) -> bool {
+    let program = program.to_string_lossy();
+    let program = program.as_bytes();
+    let program_name = program.rsplit(|b| *b == b'/').next().unwrap_or(program);
+    let management = management_path.to_string_lossy();
+    let management = management.as_bytes();
+    const FLAG: &[u8] = b"--management-path";
+    cmdlines.iter().any(|raw| {
+        let mut args = raw.split(|b| *b == 0);
+        let Some(argv0) = args.next() else {
+            return false;
+        };
+        let name = argv0.rsplit(|b| *b == b'/').next().unwrap_or(argv0);
+        let same_program = argv0 == program || (!program_name.is_empty() && name == program_name);
+        if argv0.is_empty() || !same_program {
+            return false;
+        }
+        let mut args = args.peekable();
+        while let Some(arg) = args.next() {
+            if arg == FLAG {
+                if args.peek().is_some_and(|value| *value == management) {
+                    return true;
+                }
+            } else if arg.len() > FLAG.len()
+                && arg.starts_with(FLAG)
+                && arg[FLAG.len()] == b'='
+                && &arg[FLAG.len() + 1..] == management
+            {
+                return true;
+            }
+        }
+        false
+    })
+}
+
+/// Reads every `/proc/<pid>/cmdline`. None when the table cannot be trusted
+/// (no /proc, unreadable entry other than one that vanished meanwhile).
+#[cfg(target_os = "linux")]
+fn read_proc_cmdlines() -> Option<Vec<Vec<u8>>> {
+    let mut lines = Vec::new();
+    let mut seen_pid = false;
+    for entry in std::fs::read_dir("/proc").ok()? {
+        let entry = entry.ok()?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        seen_pid = true;
+        match std::fs::read(entry.path().join("cmdline")) {
+            Ok(bytes) => lines.push(bytes),
+            // The process exited between listing and reading (ENOENT or ESRCH=3).
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(3) => {}
+            Err(_) => return None,
+        }
+    }
+    seen_pid.then_some(lines)
+}
+
+#[cfg(target_os = "linux")]
+fn scan_gateway_liveness(program: &Path, management_path: &Path) -> GatewayLiveness {
+    match read_proc_cmdlines() {
+        Some(lines) if gateway_alive_in(&lines, program, management_path) => {
+            GatewayLiveness::Alive
+        }
+        Some(_) => GatewayLiveness::NotAlive,
+        None => GatewayLiveness::Unknown,
+    }
+}
+
+/// Only Linux can judge; elsewhere the old "reservation blocks" rule stays.
+#[cfg(not(target_os = "linux"))]
+fn scan_gateway_liveness(_program: &Path, _management_path: &Path) -> GatewayLiveness {
+    GatewayLiveness::Unknown
+}
+
+/// Removes a leftover launch reservation, but only when the shard's Gateway is
+/// confirmed not running and the path is a regular file (not a symlink).
+/// Prints one stderr line with the shard key and generation (no paths/secrets).
+fn reclaim_stale_reservation(path: &Path, key: &ShardKey, liveness: GatewayLiveness) -> bool {
+    if liveness != GatewayLiveness::NotAlive {
+        return false;
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_file() => {}
+        _ => return false,
+    }
+    let generation = std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<(ShardKey, LaunchGeneration)>(&bytes).ok())
+        .map(|(_, generation)| generation.sequence);
+    if std::fs::remove_file(path).is_err() {
+        return false;
+    }
+    match generation {
+        Some(sequence) => eprintln!(
+            "daemon: removed stale launch reservation (no live Gateway) bot_id={} shard_id={} generation={sequence}",
+            key.bot_id, key.shard_id
+        ),
+        None => eprintln!(
+            "daemon: removed stale launch reservation (no live Gateway) bot_id={} shard_id={} generation=unknown",
+            key.bot_id, key.shard_id
+        ),
+    }
+    true
+}
+
+#[cfg(test)]
+mod stale_reservation_tests {
+    use super::*;
+
+    const PROGRAM: &str = "/opt/discord-rs/bin/src";
+    const MANAGEMENT: &str = "/var/lib/discord-rs/runtime/bot-31/shard-0/gateway-management";
+
+    fn cmdline(parts: &[&str]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for part in parts {
+            bytes.extend_from_slice(part.as_bytes());
+            bytes.push(0);
+        }
+        bytes
+    }
+    fn alive(lines: &[Vec<u8>]) -> bool {
+        gateway_alive_in(lines, Path::new(PROGRAM), Path::new(MANAGEMENT))
+    }
+
+    #[test]
+    fn matching_program_and_management_path_is_alive() {
+        let gateway = cmdline(&[
+            PROGRAM,
+            "--bot-id",
+            "1",
+            "--management-path",
+            MANAGEMENT,
+            "--token-env",
+            "T",
+        ]);
+        assert!(alive(&[cmdline(&["bash"]), gateway.clone()]));
+        assert!(alive(&[cmdline(&[
+            PROGRAM,
+            format!("--management-path={MANAGEMENT}").as_str()
+        ])]));
+        // Same executable name through another path still counts as alive.
+        assert!(alive(&[cmdline(&[
+            "/usr/local/bin/src",
+            "--management-path",
+            MANAGEMENT
+        ])]));
+    }
+
+    #[test]
+    fn other_shard_other_program_or_no_flag_is_not_alive() {
+        let other_shard = cmdline(&[
+            PROGRAM,
+            "--management-path",
+            "/var/lib/discord-rs/runtime/bot-31/shard-1/gateway-management",
+        ]);
+        // The Core worker of the same shard uses core-management, not this path.
+        let core = cmdline(&[
+            "/opt/discord-rs/bin/bot-core",
+            "--management-path",
+            "/var/lib/discord-rs/runtime/bot-31/shard-0/core-management",
+        ]);
+        let other_program = cmdline(&["/bin/tail", "--management-path", MANAGEMENT]);
+        let no_value = cmdline(&[PROGRAM, "--management-path"]);
+        let long = format!("{MANAGEMENT}x");
+        let prefix = cmdline(&[PROGRAM, "--management-path", long.as_str()]);
+        let value_without_flag = cmdline(&[PROGRAM, MANAGEMENT]);
+        assert!(!alive(&[]));
+        assert!(!alive(&[Vec::new(), other_shard, core, other_program]));
+        assert!(!alive(&[no_value, prefix, value_without_flag]));
+    }
+
+    #[test]
+    fn empty_or_unterminated_command_lines_do_not_panic() {
+        assert!(!alive(&[Vec::new(), vec![0], vec![0, 0, 0]]));
+        let mut unterminated = cmdline(&[PROGRAM, "--management-path"]);
+        unterminated.extend_from_slice(MANAGEMENT.as_bytes());
+        assert!(alive(&[unterminated]));
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "discord-rs-stale-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+    fn key() -> ShardKey {
+        ShardKey {
+            bot_id: "31".into(),
+            shard_id: 0,
+        }
+    }
+
+    #[test]
+    fn reservation_is_removed_only_when_confirmed_not_alive() {
+        let dir = scratch("removal");
+        let path = dir.join("gateway-management.botd-reservation");
+        std::fs::write(&path, b"not json").unwrap();
+        assert!(!reclaim_stale_reservation(&path, &key(), GatewayLiveness::Alive));
+        assert!(!reclaim_stale_reservation(&path, &key(), GatewayLiveness::Unknown));
+        assert!(path.exists());
+        assert!(reclaim_stale_reservation(&path, &key(), GatewayLiveness::NotAlive));
+        assert!(!path.exists());
+        // Nothing to remove: not reported as removed.
+        assert!(!reclaim_stale_reservation(&path, &key(), GatewayLiveness::NotAlive));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_or_directory_reservation_is_never_removed() {
+        let dir = scratch("symlink");
+        let target = dir.join("target");
+        std::fs::write(&target, b"x").unwrap();
+        let link = dir.join("link.botd-reservation");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(!reclaim_stale_reservation(&link, &key(), GatewayLiveness::NotAlive));
+        assert!(link.exists() && target.exists());
+        let folder = dir.join("folder.botd-reservation");
+        std::fs::create_dir(&folder).unwrap();
+        assert!(!reclaim_stale_reservation(&folder, &key(), GatewayLiveness::NotAlive));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_scan_does_not_see_this_test_binary_as_that_gateway() {
+        // Reads the real /proc. This process is not a Gateway for MANAGEMENT.
+        assert_eq!(
+            scan_gateway_liveness(Path::new(PROGRAM), Path::new(MANAGEMENT)),
+            GatewayLiveness::NotAlive
+        );
+    }
+}
+
 /// Fixed categories: never retain credential values, command output or OS error
 /// text, which may contain deployment paths or other sensitive input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2497,17 +2792,35 @@ impl<C: Clock> Daemon<C> {
             let path = spec.management_path.with_extension("botd-reservation");
             std::fs::create_dir_all(path.parent().ok_or(DaemonError::InvalidSpec)?)
                 .map_err(|_| DaemonError::ReservationIo)?;
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-                .map_err(|e| {
-                    if e.kind() == std::io::ErrorKind::AlreadyExists {
-                        DaemonError::ReservationExists
-                    } else {
-                        DaemonError::ReservationIo
+            let open = || {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+            };
+            let mut file = match open() {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // A leftover (e.g. botd was killed). Remove it only when no
+                    // Gateway of this shard is verifiably alive; otherwise the
+                    // reservation keeps blocking a duplicate launch.
+                    let liveness = scan_gateway_liveness(
+                        Path::new(&spec.program),
+                        &spec.management_path,
+                    );
+                    if !reclaim_stale_reservation(&path, &entry.snapshot.key, liveness) {
+                        return Err(DaemonError::ReservationExists);
                     }
-                })?;
+                    open().map_err(|e| {
+                        if e.kind() == std::io::ErrorKind::AlreadyExists {
+                            DaemonError::ReservationExists
+                        } else {
+                            DaemonError::ReservationIo
+                        }
+                    })?
+                }
+                Err(_) => return Err(DaemonError::ReservationIo),
+            };
             // No credentials, argv, environment values or paths are persisted.
             let record = serde_json::to_vec(&(entry.snapshot.key.clone(), &generation))
                 .map_err(|_| DaemonError::ReservationIo)?;

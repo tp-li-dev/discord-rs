@@ -94,6 +94,7 @@ jobs:
               --gateway-program /opt/discord-rs/bin/src \
               --secret-file /etc/discord-rs/botd.secret \
               --control-port 47321 \
+              --stop-children-on-exit \
               --no-autostart
           CONF
           sudo install -m 0644 /tmp/smoke.conf /etc/systemd/system/botd.service.d/smoke.conf
@@ -170,7 +171,7 @@ jobs:
               echo "[Service]"; echo "Type=notify"; echo "NotifyAccess=main"; echo "WatchdogSec=6s"
               echo "TimeoutStartSec=30s"
               echo "ExecStart="
-              echo "ExecStart=/opt/discord-rs/bin/botd --file /etc/discord-rs/bots.toml --runtime-root /var/lib/discord-rs/runtime --gateway-program /opt/discord-rs/bin/src-wrap --secret-file /etc/discord-rs/botd.secret --control-port 47321 --mock-discord 127.0.0.1:47400"
+              echo "ExecStart=/opt/discord-rs/bin/botd --file /etc/discord-rs/bots.toml --runtime-root /var/lib/discord-rs/runtime --gateway-program /opt/discord-rs/bin/src-wrap --secret-file /etc/discord-rs/botd.secret --control-port 47321 --stop-children-on-exit --mock-discord 127.0.0.1:47400"
               echo "$extra"
             } > /tmp/case.conf
             sudo install -m 0644 /tmp/case.conf /etc/systemd/system/botd.service.d/smoke.conf
