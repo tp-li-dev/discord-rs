@@ -26,6 +26,7 @@ pub mod rbac_audit;
 pub mod redact;
 pub mod response_drain;
 pub mod rest_budget;
+pub mod sd_notify;
 pub mod shard_runtime;
 pub mod state_store;
 pub mod subscription;
