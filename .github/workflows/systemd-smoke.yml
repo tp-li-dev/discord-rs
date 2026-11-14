@@ -1,0 +1,145 @@
+name: systemd smoke
+
+# Runs botd under a real systemd on a GitHub-hosted Ubuntu runner: unit syntax,
+# Type=notify (READY=1), WatchdogSec, sandboxing options, --secret-file + botctl, and
+# a clean stop. No Discord connection (--no-autostart): this checks the supervision
+# path only, not Gateway behaviour.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'deploy/**'
+      - '.github/workflows/systemd-smoke.yml'
+      - 'src/src/sd_notify.rs'
+      - 'src/src/secret_file.rs'
+      - 'src/src/bin/botd.rs'
+      - 'src/src/bin/botctl.rs'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: systemd-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.90.0
+      - uses: Swatinem/rust-cache@v2.8.1
+        with:
+          workspaces: src -> target
+          shared-key: systemd-smoke
+      - name: Build release binaries
+        working-directory: src
+        run: cargo build --locked --release --bin botd --bin botctl --bin src
+      - name: Check systemd is available
+        run: |
+          ps -p 1 -o comm=
+          systemctl --version | head -1
+          systemctl is-system-running || true
+      - name: Install unit, binaries, config and secret
+        run: |
+          set -euxo pipefail
+          sudo useradd --system --no-create-home --shell /usr/sbin/nologin discord-rs
+          sudo install -d -m 0755 /opt/discord-rs/bin
+          sudo install -m 0755 src/target/release/botd src/target/release/botctl src/target/release/src /opt/discord-rs/bin/
+          sudo install -d -m 0750 -o root -g discord-rs /etc/discord-rs
+          cat > /tmp/bots.toml <<'TOML'
+          [cluster]
+          id = "systemd-smoke"
+          mode = "standalone"
+          [node]
+          id = "one"
+          [[bots]]
+          name = "alpha"
+          bot_id = "ab100-alpha"
+          application_id = "101"
+          token_env = "TOKEN_ALPHA"
+          total_shards = 1
+          [[bots.shard_placement]]
+          shard_id = 0
+          primary = "one"
+          TOML
+          sudo install -m 0640 -o root -g discord-rs /tmp/bots.toml /etc/discord-rs/bots.toml
+          # The secret must be owned by the service user (0600).
+          sudo /opt/discord-rs/bin/botctl secret generate --out /etc/discord-rs/botd.secret --json
+          sudo chown discord-rs:discord-rs /etc/discord-rs/botd.secret
+          sudo chmod 0600 /etc/discord-rs/botd.secret
+          sudo install -m 0640 -o root -g discord-rs deploy/botd.env.example /etc/discord-rs/botd.env
+          sudo install -m 0644 deploy/systemd/botd.service /etc/systemd/system/botd.service
+      - name: Smoke drop-in (notify + watchdog, no Discord)
+        run: |
+          set -euxo pipefail
+          sudo install -d /etc/systemd/system/botd.service.d
+          # Same command line as the shipped unit, plus --no-autostart so that no token
+          # or Discord access is needed. Type=notify and WatchdogSec exercise sd_notify.
+          cat > /tmp/smoke.conf <<'CONF'
+          [Service]
+          Type=notify
+          NotifyAccess=main
+          WatchdogSec=6s
+          TimeoutStartSec=30s
+          ExecStart=
+          ExecStart=/opt/discord-rs/bin/botd \
+              --file /etc/discord-rs/bots.toml \
+              --runtime-root /var/lib/discord-rs/runtime \
+              --gateway-program /opt/discord-rs/bin/src \
+              --secret-file /etc/discord-rs/botd.secret \
+              --control-port 47321 \
+              --no-autostart
+          CONF
+          sudo install -m 0644 /tmp/smoke.conf /etc/systemd/system/botd.service.d/smoke.conf
+          sudo systemctl daemon-reload
+      - name: Static unit checks
+        run: |
+          sudo systemd-analyze verify /etc/systemd/system/botd.service || true
+          sudo systemd-analyze security botd.service --no-pager || true
+      - name: Start botd under systemd (waits for READY=1)
+        run: |
+          set -euxo pipefail
+          if ! sudo systemctl start botd; then
+            sudo systemctl status botd --no-pager || true
+            sudo journalctl -u botd --no-pager | tail -50
+            exit 1
+          fi
+          sudo systemctl is-active botd
+      - name: botctl status through --secret-file
+        run: |
+          set -euo pipefail
+          # Run as the service user: only it can read the 0600 secret.
+          out=$(sudo -u discord-rs /opt/discord-rs/bin/botctl status --secret-file /etc/discord-rs/botd.secret --port 47321 --json)
+          echo "$out" | head -c 600; echo
+          echo "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d.get("ok") is True, d'
+          # A different secret must be refused.
+          sudo -u discord-rs sh -c 'umask 077; /opt/discord-rs/bin/botctl secret generate --out /tmp/wrong.secret --json >/dev/null'
+          if sudo -u discord-rs /opt/discord-rs/bin/botctl status --secret-file /tmp/wrong.secret --port 47321 --json >/tmp/wrong.out 2>&1; then
+            echo "wrong secret was accepted"; cat /tmp/wrong.out; exit 1
+          fi
+          echo "wrong secret refused"
+      - name: Stay alive across several watchdog periods
+        run: |
+          set -euo pipefail
+          sleep 20
+          sudo systemctl is-active botd
+          restarts=$(systemctl show botd -p NRestarts --value)
+          echo "NRestarts=$restarts"
+          test "$restarts" = "0"
+      - name: Clean stop
+        run: |
+          set -euxo pipefail
+          sudo systemctl stop botd
+          result=$(systemctl show botd -p Result --value)
+          status=$(systemctl show botd -p ExecMainStatus --value)
+          echo "Result=$result ExecMainStatus=$status"
+          test "$result" = "success"
+      - name: Journal
+        if: always()
+        run: sudo journalctl -u botd --no-pager | tail -80
