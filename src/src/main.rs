@@ -34,7 +34,8 @@ use twilight_model::{
             application_command::{CommandDataOption, CommandOptionValue},
         },
     },
-    http::interaction::{InteractionResponse, InteractionResponseType},
+    channel::message::{AllowedMentions, MessageFlags},
+    http::interaction::{InteractionResponse, InteractionResponseData, InteractionResponseType},
 };
 
 fn configured_shard(deployment: &worker::DeploymentIdentity) -> ShardId {
@@ -68,6 +69,59 @@ fn slash_input(
         })
         .collect::<Option<Vec<_>>>()?;
     Some((name.to_owned(), args))
+}
+
+const DISCORD_CONTENT_LIMIT: usize = 2000;
+const EMPTY_REPLY: &str = "(応答が空でした)";
+const BUSY_REPLY: &str = "現在処理できません。しばらくしてからもう一度お試しください";
+const UNSUPPORTED_REPLY: &str = "このコマンドは使えません";
+
+/// Discord rejects content that is empty/blank or longer than 2000 characters, which
+/// would leave the "thinking" placeholder in place. Cut to 1997 characters plus `…`.
+fn clamp_reply(content: &str) -> String {
+    if content.trim().is_empty() {
+        return EMPTY_REPLY.to_owned();
+    }
+    match content.char_indices().nth(DISCORD_CONTENT_LIMIT) {
+        None => content.to_owned(),
+        Some(_) => {
+            let end = content
+                .char_indices()
+                .nth(DISCORD_CONTENT_LIMIT - 3)
+                .map_or(content.len(), |(index, _)| index);
+            format!("{}…", &content[..end])
+        }
+    }
+}
+
+/// Best-effort ephemeral reply for an interaction that will not be processed. Bounded by a
+/// short timeout (Discord requires a first response within 3 seconds) and never panics.
+async fn reject_interaction(
+    http: &Client,
+    application_id: twilight_model::id::Id<twilight_model::id::marker::ApplicationMarker>,
+    interaction_id: twilight_model::id::Id<twilight_model::id::marker::InteractionMarker>,
+    token: &str,
+    text: &str,
+) {
+    let response = InteractionResponse {
+        kind: InteractionResponseType::ChannelMessageWithSource,
+        data: Some(InteractionResponseData {
+            content: Some(text.to_owned()),
+            flags: Some(MessageFlags::EPHEMERAL),
+            allowed_mentions: Some(AllowedMentions::default()),
+            ..Default::default()
+        }),
+    };
+    let sent = confirmed_response(
+        Duration::from_millis(1500),
+        http.interaction(application_id)
+            .create_response(interaction_id, token, &response)
+            .into_future(),
+    )
+    .await;
+    if !sent {
+        eprintln!("Interaction の拒否応答を送れませんでした（結果不明）");
+    }
 }
 
 // HTTP failures and timeouts can both have an unknown external outcome.
@@ -886,12 +940,15 @@ async fn live_events(
                 let http = http.clone();
                 requests.spawn(async move {
                     let _permit = permit;
+                    // No @everyone/@here/role/user pings from any Bot-authored message.
+                    let no_mentions = AllowedMentions::default();
                     if message.content.trim() == "!workers" {
-                        let content = manager.describe_workers().await;
+                        let content = clamp_reply(&manager.describe_workers().await);
                         if !confirmed_response(
                             std::time::Duration::from_secs(10),
                             http.create_message(message.channel_id)
                                 .content(&content)
+                                .allowed_mentions(Some(&no_mentions))
                                 .into_future(),
                         )
                         .await
@@ -922,10 +979,12 @@ async fn live_events(
                         .await
                     {
                         Ok(Some(content)) => {
+                            let content = clamp_reply(&content);
                             let status = tokio::time::timeout(
                                 Duration::from_secs(10),
                                 http.create_message(message.channel_id)
                                     .content(&content)
+                                    .allowed_mentions(Some(&no_mentions))
                                     .into_future(),
                             )
                             .await
@@ -959,9 +1018,25 @@ async fn live_events(
                     continue;
                 };
                 let Some((input, args)) = slash_input(&data.name, data.kind, &data.options) else {
+                    reject_interaction(
+                        &http,
+                        interaction.application_id,
+                        interaction.id,
+                        &interaction.token,
+                        UNSUPPORTED_REPLY,
+                    )
+                    .await;
                     continue;
                 };
                 let Some(channel) = interaction.channel.as_ref() else {
+                    reject_interaction(
+                        &http,
+                        interaction.application_id,
+                        interaction.id,
+                        &interaction.token,
+                        UNSUPPORTED_REPLY,
+                    )
+                    .await;
                     continue;
                 };
                 let key = channel.id.get();
@@ -969,20 +1044,19 @@ async fn live_events(
                 let http = http.clone();
                 let Ok(permit) = capacity.clone().try_acquire_owned() else {
                     eprintln!("Interaction を受け付けられません: 混雑中");
+                    // Inline and short-timeout on purpose: no extra task under overload.
+                    reject_interaction(
+                        &http,
+                        interaction.application_id,
+                        interaction.id,
+                        &interaction.token,
+                        BUSY_REPLY,
+                    )
+                    .await;
                     continue;
                 };
                 requests.spawn(async move {
                     let _permit = permit;
-                    let mut response_guard = match manager.begin_response_delivery(key).await {
-                        Ok(guard) => guard,
-                        Err(error) => {
-                            eprintln!(
-                                "{}",
-                                failure_message("応答追跡を開始できません", error.as_ref())
-                            );
-                            return;
-                        }
-                    };
                     // The identity never enters the Worker or the logs.
                     let identity = (
                         interaction.application_id,
@@ -991,7 +1065,11 @@ async fn live_events(
                     );
                     let ack_http = http.clone();
                     let update_http = http.clone();
-                    let dispatch_guard = &mut response_guard;
+                    // The response guard is reserved only after the deferred ACK is confirmed,
+                    // so a worker swap/reload cannot eat the 3-second ACK deadline.
+                    let guard_slot: Arc<Mutex<Option<worker::ResponseGuard>>> =
+                        Arc::new(Mutex::new(None));
+                    let dispatch_slot = guard_slot.clone();
                     let progress = Arc::new(Mutex::new(ResponseProgress::default()));
                     let dispatch_progress = progress.clone();
                     let update_progress = progress.clone();
@@ -1012,8 +1090,30 @@ async fn live_events(
                                 .is_ok()
                         },
                         move || async move {
-                            match dispatch_manager
-                                .dispatch_slash_with_response(dispatch_guard, key, input, args)
+                            let mut dispatch_guard = match tokio::time::timeout(
+                                Duration::from_secs(10),
+                                dispatch_manager.begin_response_delivery(key),
+                            )
+                            .await
+                            {
+                                Ok(Ok(guard)) => guard,
+                                Ok(Err(error)) => {
+                                    eprintln!(
+                                        "{}",
+                                        failure_message(
+                                            "応答追跡を開始できません",
+                                            error.as_ref()
+                                        )
+                                    );
+                                    return "コマンドを実行できませんでした".to_owned();
+                                }
+                                Err(_) => {
+                                    eprintln!("応答追跡の開始がタイムアウトしました");
+                                    return BUSY_REPLY.to_owned();
+                                }
+                            };
+                            let message = match dispatch_manager
+                                .dispatch_slash_with_response(&mut dispatch_guard, key, input, args)
                                 .await
                             {
                                 Ok(Some(message)) => {
@@ -1022,13 +1122,18 @@ async fn live_events(
                                 }
                                 Ok(None) => "コマンドの応答がありません".to_owned(),
                                 Err(_) => "コマンドを実行できませんでした".to_owned(),
-                            }
+                            };
+                            *dispatch_slot.lock().unwrap() = Some(dispatch_guard);
+                            message
                         },
                         move |(application_id, _, token), message| async move {
+                            let message = clamp_reply(&message);
+                            let no_mentions = AllowedMentions::default();
                             let result = update_http
                                 .interaction(application_id)
                                 .update_response(token.expose_secret())
                                 .content(Some(&message))
+                                .allowed_mentions(Some(&no_mentions))
                                 .await;
                             let status = result.ok().map(|response| response.status().get());
                             update_progress.lock().unwrap().status = status;
@@ -1040,16 +1145,19 @@ async fn live_events(
                         let progress = progress.lock().unwrap();
                         (progress.dispatched, progress.status)
                     };
-                    if dispatched {
-                        if manager
-                            .finish_response(response_guard, api_outcome(status))
-                            .await
-                            .is_err()
-                        {
-                            eprintln!("REST 結果の Worker 受領を確認できません（結果不明）");
+                    let response_guard = guard_slot.lock().unwrap().take();
+                    if let Some(response_guard) = response_guard {
+                        if dispatched {
+                            if manager
+                                .finish_response(response_guard, api_outcome(status))
+                                .await
+                                .is_err()
+                            {
+                                eprintln!("REST 結果の Worker 受領を確認できません（結果不明）");
+                            }
+                        } else if outcome == src::interaction_flow::Outcome::Completed {
+                            response_guard.confirm();
                         }
-                    } else if outcome == src::interaction_flow::Outcome::Completed {
-                        response_guard.confirm();
                     }
                     if outcome != src::interaction_flow::Outcome::Completed {
                         eprintln!("Interaction の応答処理に失敗しました（結果不明）: {outcome:?}");
@@ -1080,6 +1188,24 @@ async fn live_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clamp_reply_limits_to_2000_characters_and_never_leaves_empty() {
+        assert_eq!(clamp_reply("hello"), "hello");
+        let exact = "a".repeat(2000);
+        assert_eq!(clamp_reply(&exact), exact);
+        let over = "a".repeat(2001);
+        let clamped = clamp_reply(&over);
+        assert_eq!(clamped.chars().count(), 1998);
+        assert_eq!(clamped, format!("{}…", "a".repeat(1997)));
+        // Multibyte characters are counted as characters and never split.
+        let wide = "あ".repeat(2000);
+        assert_eq!(clamp_reply(&wide), wide);
+        let wide_over = "あ".repeat(2001);
+        assert_eq!(clamp_reply(&wide_over), format!("{}…", "あ".repeat(1997)));
+        assert_eq!(clamp_reply(""), EMPTY_REPLY);
+        assert_eq!(clamp_reply(" \n\t"), EMPTY_REPLY);
+    }
 
     #[test]
     fn external_diagnostics_child() {
