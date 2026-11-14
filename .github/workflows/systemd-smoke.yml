@@ -140,6 +140,58 @@ jobs:
           status=$(systemctl show botd -p ExecMainStatus --value)
           echo "Result=$result ExecMainStatus=$status"
           test "$result" = "success"
+      - name: Gateway and Core start under the hardened unit (mock Discord)
+        run: |
+          set -euo pipefail
+          # Exercises the spawn path (child processes, sockets, syscalls) under the unit's
+          # sandbox and SystemCallFilter. The mock collector only accepts connections; no
+          # traffic leaves the runner and no token is used.
+          cat > /tmp/collector.py <<'PY'
+          import socket
+          s = socket.socket()
+          s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+          s.bind(("127.0.0.1", 47400))
+          s.listen(16)
+          keep = []
+          while True:
+              conn, _ = s.accept()
+              keep.append(conn)
+          PY
+          python3 /tmp/collector.py &
+          sleep 1
+          cat > /tmp/smoke2.conf <<'CONF'
+          [Service]
+          Type=notify
+          NotifyAccess=main
+          WatchdogSec=6s
+          TimeoutStartSec=30s
+          ExecStart=
+          ExecStart=/opt/discord-rs/bin/botd \
+              --file /etc/discord-rs/bots.toml \
+              --runtime-root /var/lib/discord-rs/runtime \
+              --gateway-program /opt/discord-rs/bin/src \
+              --secret-file /etc/discord-rs/botd.secret \
+              --control-port 47321 \
+              --mock-discord 127.0.0.1:47400
+          CONF
+          sudo install -m 0644 /tmp/smoke2.conf /etc/systemd/system/botd.service.d/smoke.conf
+          sudo systemctl daemon-reload
+          sudo systemctl start botd
+          ok=0
+          for i in $(seq 1 40); do
+            out=$(sudo -u discord-rs /opt/discord-rs/bin/botctl status --secret-file /etc/discord-rs/botd.secret --port 47321 --json || true)
+            if echo "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); rows=d.get("shards") or []; sys.exit(0 if rows and all(r.get("phase")=="Stable" for r in rows) else 1)'; then
+              ok=1
+              break
+            fi
+            sleep 1
+          done
+          echo "$out" | head -c 900; echo
+          ps -u discord-rs -o pid,ppid,etime,cmd | head -20
+          test "$ok" = "1"
+          sudo systemctl is-active botd
+          sudo systemctl stop botd
+          test "$(systemctl show botd -p Result --value)" = "success"
       - name: Journal
         if: always()
         run: sudo journalctl -u botd --no-pager | tail -80
