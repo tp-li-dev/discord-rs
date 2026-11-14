@@ -88,7 +88,8 @@ sudo install -o root -g discord-rs -m 0640 src/examples/placement.toml /etc/disc
 
 `/etc/discord-rs/bots.toml` の書式は [運用ガイド](operator-guide.md) の例と
 `src/examples/placement.toml` を参照してください。`node.id` に一致する primary の Shard だけがそのホストで
-起動します。`bot_id` は u64 の正規 10 進文字列、`token_env` は Bot ごとに別名にします。
+起動します。`bot_id` は u64 の正規 10 進文字列（Discord の ID。先頭ゼロや符号は不可）、`token_env` は Bot ごとに別名にします。
+Gateway を起動する構成（`--no-autostart` なし）で `bot_id` が正規の数値でない場合、botd は起動時に「bot_id must be a canonical decimal Discord ID」で終了します（以前は子の Gateway が起動のたびに `launch_invalid` で落ち続けていました）。
 編集後にオフライン検査します（daemon へ接続せず、token や Discord 接続は確認しません）。
 
 ```sh
