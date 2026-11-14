@@ -69,7 +69,7 @@
 
 - **対応済み**：致命的な切断（4004、4010〜4014）で理由を出さず終了していた → close code（数値のみ）と、再接続しない旨を標準エラーに出すようにした（`main.rs`。終了コードは変えない＝botd の再起動ループを避けるため）。初回は Gateway を単体で起動して出力を見る手順を `real-discord-verification.md` に追加（H1・H2 対策）。
 - **高（手順で回避。コードは未修正）**
-  - H1：botd 配下では Gateway の stdout/stderr が破棄される（`daemon.rs` の `Stdio::null()`）。接続の失敗理由が botd の出力にも journald にも出ない。恒久対策（Gateway の診断をファイル/journald へ）は未実装。
+  - H1（実装済み、CI 検証待ち）：botd は Gateway 子の stdout/stderr を Shard 状態ディレクトリ直下の `gateway.log`（0600。シンボリックリンクなら null へフォールバック。起動時に 1 MiB 超で `gateway.log.1` へ 1 世代ローテーション。世代ごとに区切り行）へ追記する。journald には出ない。ローカル未ビルドで、実環境での確認は未実施。
   - H3：Gateway は `GUILD_MESSAGES | MESSAGE_CONTENT` を固定で要求する。MESSAGE_CONTENT は特権 Intent で、Developer Portal で有効化しないと 4014 で拒否される想定（実挙動は未検証）。Slash だけなら Intent 0 でも動作するはずだが、Intent を設定可能にする変更は未実施。
 - **中（未対応）**
   - M1：Interaction の ACK を始める前に `begin_response_delivery` を待つため（`worker.rs` の RwLock）、Worker の世代入れ替えや reload 中は 3 秒期限を圧迫し得る。Defer を先に送るか、begin に短い期限を付ける。
