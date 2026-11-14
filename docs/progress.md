@@ -200,3 +200,10 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - Linux 常駐運用：`deploy/systemd/botd.service`、`deploy/botd.env.example`、`docs/linux-deployment.md` を追加。botd に systemd `sd_notify`（READY/WATCHDOG/STOPPING、既定経路のみ）を実装（実 systemd では未検証のため unit では無効）。botd と botctl に `--secret-file`（権限 0600/0400、所有者、リンク拒否の検査）と `botctl secret generate` を追加し、systemd 常駐の botd を botctl で操作できるようにした（以前は secret を渡す手段がなく操作不能だった）。`--control-port` を追加。いずれも Ubuntu の CI（試験 5 シャード、clippy、fmt）で成功。実 Ubuntu/systemd の実機は未検証。
 - 運用：Haiku は Claude Code の再起動後に使えるようになった（軽い読み取り作業向け。余計なツールを呼ぶことがあるので範囲を絞る）。サブエージェントのローカル cargo は PC 負荷のため禁止し、検証は Actions で行う。
 - 未検証・未完了：実 Discord（ユーザー実施）、実 systemd/Ubuntu、複数ホストの実障害、本番での Raft 有効化（起動拒否のまま）、メトリクスの残りの送信元（failover、IPC 往復、REST 予算）、永続 Subscription/ジョブの Worker 接続、Core 単独更新・更新失敗時の自動 rollback、`raft_botd_processes` の rejoin の稀な失敗（原因未特定、診断を強化済み）。
+
+## 2026-11-14（続き）：実 systemd での検証
+- `.github/workflows/systemd-smoke.yml`（`deploy/**` や botd/botctl の変更で自動実行、手動実行も可）で、GitHub のランナー（Ubuntu）の実 systemd 上に botd を導入して検証。確認できたこと：unit の構文（`systemd-analyze verify`）、`Type=notify` で `READY=1` が届き起動が完了すること、`WatchdogSec=6s` の周期を超えて再起動 0 で動き続けること、`--secret-file` + botctl の `status` が通り別 secret は拒否されること、`systemctl stop` で正常終了（Result=success）すること、Gateway と Core ワーカー 2 つが systemd 配下で起動し稼働すること（模擬 Discord、外部への接続なし）。
+- unit の硬化を追加し（`SystemCallFilter=@system-service`、`~@privileged @resources`、`ProtectProc=invisible`、`ProcSubset=pid`、`RemoveIPC`、`ProtectClock`、`ProtectKernelLogs`、`ProtectHostname`、`RestrictRealtime`、`SystemCallArchitectures=native`）、硬化なしのベースラインと並べて、どちらも Gateway と Core が起動・稼働することを確認。
+- 発見（運用上の落とし穴）：同梱の Gateway（`src`）は `--bot-id` が正規の 10 進 u64 でないと `launch_invalid` で即終了し、botd は子が起動のたびに落ちて再起動を繰り返す。botd は事前に検出しない（`--gateway-program` は差し替え可能で、試験用フィクスチャは文字列 ID を使うため。一律の事前検証は試験を壊すので取り消した）。docs/linux-deployment.md に症状と確認方法を明記。子の標準エラーは botd が破棄するため journald に出ない（既知の制約）。
+- smoke の初期版は `--no-autostart` で子を起動しておらず、Gateway の失敗を見逃していた。判定を『Running・再起動 0・Core ワーカー 2』に直して、子の起動まで検証する形にした。
+- 未検証：実 Discord、実機の systemd（ランナー外）、systemd 配下で Type=notify を既定にすること（unit では無効のまま。有効化は上記 smoke の drop-in で確認済みだが、出荷する unit の既定は Type=simple）。
