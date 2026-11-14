@@ -550,7 +550,7 @@ async fn malformed_or_missing_result_receipts_remain_unknown_and_never_retarget(
         "bad-ready-pid",
     ] {
         let path = root.join(format!("{mode}{}", std::env::consts::EXE_SUFFIX));
-        std::fs::copy(&fixture, &path).unwrap();
+        src::testkit::copy_executable(&fixture, &path).unwrap();
         timeout(LIMIT, async {
             let started = Manager::start_pool_isolated(path, 1, deployment()).await;
             if mode == "bad-ready-pid" {

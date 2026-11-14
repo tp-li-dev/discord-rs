@@ -891,3 +891,24 @@ async fn read_request<S: AsyncRead + Unpin>(
     }
     Ok(interaction)
 }
+
+/// Puts an executable at `to` for a test to launch, without leaving a writer open.
+///
+/// `std::fs::copy` followed by an immediate spawn can fail on Linux with `ETXTBSY`
+/// ("Text file busy"): another thread of the same test process may `fork` while the
+/// copy is still open for writing, and that child keeps the descriptor until it
+/// `exec`s. A hard link has no writer at all, so it cannot race. Falls back to a
+/// copy when linking is not possible (for example across file systems).
+///
+/// The result shares the inode with `from`: do not modify `to` afterwards.
+pub fn copy_executable(
+    from: impl AsRef<std::path::Path>,
+    to: impl AsRef<std::path::Path>,
+) -> std::io::Result<u64> {
+    let (from, to) = (from.as_ref(), to.as_ref());
+    let _ = std::fs::remove_file(to);
+    match std::fs::hard_link(from, to) {
+        Ok(()) => Ok(0),
+        Err(_) => std::fs::copy(from, to),
+    }
+}

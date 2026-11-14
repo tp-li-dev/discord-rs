@@ -53,7 +53,7 @@ async fn parent_preserves_legacy_format_and_rejects_missing_or_wrong_ack() {
     );
     for mode in ["legacy-event", "missing-ack", "wrong-ack", "timeout-ack"] {
         let path = directory.join(format!("{mode}{}", std::env::consts::EXE_SUFFIX));
-        std::fs::copy(&fixture, &path).unwrap();
+        src::testkit::copy_executable(&fixture, &path).unwrap();
         let manager = src::worker::Manager::start_pool(path, 1).await.unwrap();
         let result = manager.dispatch_ready("fixture".into()).await;
         if mode == "legacy-event" {

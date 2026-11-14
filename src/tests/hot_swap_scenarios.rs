@@ -66,7 +66,7 @@ impl Scenario {
         let path = self
             .0
             .join(format!("{mode}{}", std::env::consts::EXE_SUFFIX));
-        std::fs::copy(relay_binary(), &path).unwrap();
+        src::testkit::copy_executable(relay_binary(), &path).unwrap();
         std::fs::write(sidecar(&path, ".real"), env!("CARGO_BIN_EXE_src")).unwrap();
         path
     }

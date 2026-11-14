@@ -55,7 +55,7 @@ impl Scenario {
         let fixture = interaction_fixture::binary().await;
         let root = interaction_fixture::unique_directory(label);
         let worker = root.join(format!("worker{}", std::env::consts::EXE_SUFFIX));
-        std::fs::copy(fixture, &worker).unwrap();
+        src::testkit::copy_executable(fixture, &worker).unwrap();
         let journal = root.join("state.journal");
         Self {
             root,

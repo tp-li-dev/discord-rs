@@ -35,7 +35,7 @@ fn fixture(mode: &str) -> PathBuf {
             "reject-command",
             "slow-ack",
         ] {
-            std::fs::copy(
+            src::testkit::copy_executable(
                 &base,
                 dir.join(format!("{mode}{}", std::env::consts::EXE_SUFFIX)),
             )
