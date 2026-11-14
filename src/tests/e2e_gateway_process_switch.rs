@@ -63,10 +63,11 @@ shard_id = 0
 primary = "local"
 "#;
 
-async fn bounded<T>(future: impl Future<Output = T>) -> T {
-    tokio::time::timeout(WAIT, future)
-        .await
-        .expect("Gateway switch process deadline")
+async fn bounded<T>(line: u32, future: impl Future<Output = T>) -> T {
+    match tokio::time::timeout(WAIT, future).await {
+        Ok(value) => value,
+        Err(_) => panic!("Gateway switch process deadline at line {line}"),
+    }
 }
 
 fn directory() -> PathBuf {
@@ -115,6 +116,7 @@ impl Gateway {
     async fn receive(&mut self) -> Value {
         let mut bytes = Vec::new();
         bounded(
+            line!(),
             (&mut self.output)
                 .take(64 * 1024 + 1)
                 .read_until(b'\n', &mut bytes),
@@ -131,7 +133,9 @@ impl Gateway {
     async fn send(&mut self, value: Value) {
         let mut bytes = serde_json::to_vec(&value).unwrap();
         bytes.push(b'\n');
-        bounded(self.input.write_all(&bytes)).await.unwrap();
+        bounded(line!(), self.input.write_all(&bytes))
+            .await
+            .unwrap();
     }
 
     async fn exchange(&mut self, value: Value) -> Value {
@@ -182,7 +186,10 @@ impl Gateway {
         assert_eq!(reply["type"], "stopped");
         assert_eq!(reply["pid"], self.ready["pid"]);
         let mut byte = [0];
-        assert_eq!(bounded(self.output.read(&mut byte)).await.unwrap(), 0);
+        assert_eq!(
+            bounded(line!(), self.output.read(&mut byte)).await.unwrap(),
+            0
+        );
     }
 }
 
@@ -243,13 +250,16 @@ impl Fixture {
         let mut child = command.spawn().unwrap();
         let mut bootstrap = serde_json::to_vec(&json!({"secret":SECRET})).unwrap();
         bootstrap.push(b'\n');
-        bounded(child.stdin.take().unwrap().write_all(&bootstrap))
+        bounded(line!(), child.stdin.take().unwrap().write_all(&bootstrap))
             .await
             .unwrap();
         let mut bytes = Vec::new();
-        bounded(BufReader::new(child.stdout.take().unwrap()).read_until(b'\n', &mut bytes))
-            .await
-            .unwrap();
+        bounded(
+            line!(),
+            BufReader::new(child.stdout.take().unwrap()).read_until(b'\n', &mut bytes),
+        )
+        .await
+        .unwrap();
         no_secrets(&bytes);
         let announced: Value = serde_json::from_slice(&bytes).expect("botd test announcement");
         assert_eq!(announced["mock_discord"], true);
@@ -280,7 +290,7 @@ impl Fixture {
     }
 
     async fn accept(&mut self) -> usize {
-        let (stream, peer) = bounded(self.collector.accept()).await.unwrap();
+        let (stream, peer) = bounded(line!(), self.collector.accept()).await.unwrap();
         assert!(peer.ip().is_loopback());
         let (output, input) = stream.into_split();
         let mut gateway = Gateway {
@@ -360,7 +370,8 @@ impl Fixture {
     }
 
     async fn operation(&self, id: &str) -> Value {
-        bounded(async {
+        let mut last = Value::Null;
+        let waited = tokio::time::timeout(WAIT, async {
             loop {
                 let reply = self
                     .request(json!({"command":"operation","operation_id":id}))
@@ -369,14 +380,20 @@ impl Fixture {
                 if reply["operation"]["state"] != "running" {
                     return reply;
                 }
+                last = reply;
                 tokio::time::sleep(Duration::from_millis(15)).await;
             }
         })
-        .await
+        .await;
+        match waited {
+            Ok(reply) => reply,
+            Err(_) => panic!("operation {id} still running at deadline; last reply: {last}"),
+        }
     }
 
     async fn wait_status(&self, check: impl Fn(&Value) -> bool) -> Value {
-        bounded(async {
+        let mut last = Value::Null;
+        let waited = tokio::time::timeout(WAIT, async {
             loop {
                 let status = self.request(json!({"command":"status"})).await;
                 assert_eq!(status["ok"], true);
@@ -384,10 +401,15 @@ impl Fixture {
                 if check(&status) {
                     return status;
                 }
+                last = status;
                 tokio::time::sleep(Duration::from_millis(15)).await;
             }
         })
-        .await
+        .await;
+        match waited {
+            Ok(status) => status,
+            Err(_) => panic!("status condition not met at deadline; last status: {last}"),
+        }
     }
 
     async fn finish(mut self) {
@@ -409,7 +431,9 @@ impl Fixture {
         self.child.kill().await.unwrap();
         if let Some(mut stderr) = self.child.stderr.take() {
             let mut bytes = Vec::new();
-            bounded(stderr.read_to_end(&mut bytes)).await.unwrap();
+            bounded(line!(), stderr.read_to_end(&mut bytes))
+                .await
+                .unwrap();
             no_secrets(&bytes);
             assert!(bytes.is_empty(), "botd wrote unexpected diagnostics");
         }
@@ -461,14 +485,15 @@ impl Drop for Fixture {
 
 async fn request(port: u16, mut value: Value) -> Value {
     value["secret"] = json!(SECRET);
-    let mut stream = bounded(TcpStream::connect(("127.0.0.1", port)))
+    let mut stream = bounded(line!(), TcpStream::connect(("127.0.0.1", port)))
         .await
         .unwrap();
     let mut bytes = serde_json::to_vec(&value).unwrap();
     bytes.push(b'\n');
-    bounded(stream.write_all(&bytes)).await.unwrap();
+    bounded(line!(), stream.write_all(&bytes)).await.unwrap();
     let mut bytes = Vec::new();
     bounded(
+        line!(),
         BufReader::new(stream)
             .take(64 * 1024 + 1)
             .read_until(b'\n', &mut bytes),
@@ -555,7 +580,7 @@ async fn live_pids(pids: &[u32]) -> BTreeSet<u32> {
 }
 
 async fn assert_exited(pids: &[u32]) {
-    bounded(async {
+    bounded(line!(), async {
         while !live_pids(pids).await.is_empty() {
             tokio::time::sleep(Duration::from_millis(30)).await;
         }
@@ -618,10 +643,13 @@ async fn update_cli(port: u16, command: &str, id: &str, plan: &Path, success: bo
         .spawn()
         .unwrap();
     let bootstrap = format!("{}\n", json!({"port":port,"secret":SECRET}));
-    bounded(child.stdin.take().unwrap().write_all(bootstrap.as_bytes()))
-        .await
-        .unwrap();
-    let output = bounded(child.wait_with_output()).await.unwrap();
+    bounded(
+        line!(),
+        child.stdin.take().unwrap().write_all(bootstrap.as_bytes()),
+    )
+    .await
+    .unwrap();
+    let output = bounded(line!(), child.wait_with_output()).await.unwrap();
     no_secrets(&output.stdout);
     no_secrets(&output.stderr);
     assert!(output.stderr.is_empty());
@@ -673,7 +701,7 @@ async fn typed_botctl_update_and_rollback_execute_real_gateways_and_audit_final_
             tokio::spawn(
                 async move { update_cli(port, command, &task_id, &task_plan, true).await },
             );
-        bounded(async {
+        bounded(line!(), async {
             loop {
                 let status = fixture
                     .request(json!({"command":"operation","operation_id":id}))
@@ -704,7 +732,7 @@ async fn typed_botctl_update_and_rollback_execute_real_gateways_and_audit_final_
         );
         let new = fixture.accept().await;
         assert_eq!(fixture.gateways[new].generation(), candidate);
-        let result = bounded(task).await.unwrap();
+        let result = bounded(line!(), task).await.unwrap();
         assert_eq!(result["operation"]["command"], command);
         assert_eq!(result["operation"]["bot_id"], "101");
         assert_eq!(result["operation"]["state"], "succeeded");
@@ -829,7 +857,7 @@ async fn prepared_real_gateway_is_standby_then_switch_preserves_old_rest_origin(
         .send(json!({"type":"prefix","id":25,"key":0,"content":"!ping",
         "rest_addr":endpoint.addr().to_string()}))
         .await;
-    bounded(async {
+    bounded(line!(), async {
         while fragmented.stats().rest_requests != 1 {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -919,7 +947,7 @@ async fn prepared_real_gateway_is_standby_then_switch_preserves_old_rest_origin(
         .send(json!({"type":"prefix","id":20,"key":0,"content":"!ping",
         "rest_addr":endpoint.addr().to_string()}))
         .await;
-    bounded(async {
+    bounded(line!(), async {
         while pending.stats().rest_requests != 1 {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -1246,7 +1274,7 @@ async fn switch_entry_rejects_missing_mock_or_budget_and_quorum_configuration() 
         if case != 1 {
             command.arg("--mock-identify-budget").arg(&limits);
         }
-        let output = bounded(command.output()).await.unwrap();
+        let output = bounded(line!(), command.output()).await.unwrap();
         assert!(
             !output.status.success(),
             "incomplete test-only opt-in accepted"
