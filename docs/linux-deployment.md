@@ -15,9 +15,12 @@
    --control-port 47321` で起動し、`botctl` は同じファイルと `--port 47321` で loopback へ接続します
    （「[管理 secret](#管理-secret)」）。secret ファイルの権限検査・systemd 実機での常駐接続は実機では未検証です。
    自動検出用 endpoint ファイルはなく、ポートは固定値を `--port` で指定します。
-2. **systemd Watchdog / `Type=notify` は未対応。** botd は `sd_notify` を実装していません
-   （src 内に該当コードなし）。unit では `Type=simple` とし、`Type=notify` と `WatchdogSec=` はコメントのまま
-   無効です。botd 側の対応後に有効化してください。生死監視は `Restart=on-failure`（プロセス終了の検知）のみです。
+2. **systemd Watchdog / `Type=notify` は実装済みだが、実 systemd では未検証のため unit では無効です。**
+   botd は既定の経路で `sd_notify`（`READY=1`、`WATCHDOG=1`、`STOPPING=1`。`src/src/sd_notify.rs`）に対応しています
+   （CI の統合試験で、一時ソケットへ READY と WATCHDOG が届くことを確認済み。Raft/クラスタ/Gateway 切替の
+   試験用モードは未対応）。unit は `Type=simple` のままで、`Type=notify` と `WatchdogSec=` はコメントです。
+   実機で有効化する場合は、unit のコメントを外し、`systemctl status` で `Active: active (running)` と
+   Watchdog による再起動の動作を確認してください。現状の生死監視は `Restart=on-failure`（プロセス終了の検知）のみです。
 3. **Gateway 子プロセスのログは journald に出ません。** botd は Gateway 子の stdout/stderr を `null` へ
    向けています（`src/src/daemon.rs`）。journald に出るのは botd 自身の標準出力（起動時の 1 行 JSON）と
    標準エラーのみです。
@@ -283,7 +286,7 @@ journalctl --disk-usage                             # 容量確認
 - 「botctl で操作できる」ことの実機検証: secret ファイル（`--secret-file`）の権限検査と systemd 配下の botd への
   `botctl` 接続は、実機の Ubuntu / systemd では未検証です（CI は模擬 Discord・`--no-autostart` の botd で確認）。
   稼働中の secret 再読込、役割・scope 付きの capability 指定、`LoadCredential=` 構成も対象外・未検証です。
-- systemd `Type=notify` / `WatchdogSec`（botd が `sd_notify` 未対応）。対応後に unit のコメントを外して有効化する。
+- systemd `Type=notify` / `WatchdogSec` の実機での動作確認（botd は `sd_notify` 対応済み。実 systemd では未検証のため unit では無効）。
 - Gateway 子プロセスのログ収集（journald に出ない）。
 - 本番での Raft quorum 有効化（拒否のまま）、分散 Identify・failover の本番統合。
 - 複数ホストでの実障害（ホスト停止・網分断・failover）。

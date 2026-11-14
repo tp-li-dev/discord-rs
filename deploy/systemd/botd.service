@@ -21,8 +21,9 @@ StartLimitBurst=5
 
 [Service]
 # --- 起動方式 ---
-# Type=notify と WatchdogSec= は botd が sd_notify 未対応のため【対応後に有効化】する。
-# 現状は Type=simple のまま。WatchdogSec を有効にすると通知が来ず誤って再起動されるので設定しない。
+# botd は sd_notify（READY/WATCHDOG/STOPPING）に対応済みだが、実 systemd では未検証のため無効のまま。
+# 有効化する場合は、実機で READY=1 が届き Watchdog が働くことを確認してから、下の2行のコメントを外す
+# （Type=simple を Type=notify に置き換える）。誤って WatchdogSec だけ有効にしないこと。
 #   Type=notify
 #   WatchdogSec=30s
 Type=simple
