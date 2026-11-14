@@ -1,5 +1,7 @@
-//! Local authenticated daemon control. Bootstrap capability arrives on anonymous stdin.
-//! The TCP listener is always loopback; it is not a remote management endpoint.
+//! Local authenticated daemon control. Bootstrap capability arrives on anonymous stdin
+//! (`--bootstrap-stdin`) or from a permission-checked file (`--secret-file`, for systemd).
+//! The TCP listener is always loopback; it is not a remote management endpoint. Its port
+//! is random unless `--control-port` is given (only with `--secret-file`).
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use src::daemon::control::{CommandRequest, ControlPlane, NOTE};
@@ -20,7 +22,7 @@ use tokio::{
 const REQUEST_LIMIT: u64 = 4096;
 const RESPONSE_LIMIT: usize = 64 * 1024;
 const DEADLINE: Duration = Duration::from_secs(3);
-const USAGE: &str = "usage: botd --file F --runtime-root ABS --gateway-program ABS --bootstrap-stdin [--no-autostart] [--mock-discord LOOPBACK_IP:PORT] [--allow-test-quorum] [--allow-raft-quorum --raft-store ABS --raft-rpc-listen LOOPBACK_IP:PORT --raft-rpc-peer ID=LOOPBACK_IP:PORT ... [--raft-create] [--raft-bootstrap]] [--allow-test-gateway-switch --mock-identify-budget F]";
+const USAGE: &str = "usage: botd --file F --runtime-root ABS --gateway-program ABS (--bootstrap-stdin | --secret-file ABS [--control-port PORT]) [--no-autostart] [--mock-discord LOOPBACK_IP:PORT] [--allow-test-quorum] [--allow-raft-quorum --raft-store ABS --raft-rpc-listen LOOPBACK_IP:PORT --raft-rpc-peer ID=LOOPBACK_IP:PORT ... [--raft-create] [--raft-bootstrap]] [--allow-test-gateway-switch --mock-identify-budget F]";
 
 struct Options {
     file: PathBuf,
@@ -33,6 +35,8 @@ struct Options {
     allow_test_gateway_switch: bool,
     mock_identify_budget: Option<PathBuf>,
     mock_recovery_max_restarts: Option<u32>,
+    secret_file: Option<PathBuf>,
+    control_port: u16,
 }
 
 fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'static str> {
@@ -53,12 +57,29 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
     let mut allow_test_gateway_switch = false;
     let mut mock_identify_budget = None;
     let mut mock_recovery_max_restarts = None;
+    let mut secret_file = None;
+    let mut control_port = None;
     while let Some(arg) = args.next() {
         let target = match arg.to_str() {
             Some("--file") if file.is_none() => &mut file,
             Some("--runtime-root") if runtime_root.is_none() => &mut runtime_root,
             Some("--gateway-program") if gateway_program.is_none() => &mut gateway_program,
             Some("--raft-store") if raft_store.is_none() => &mut raft_store,
+            Some("--secret-file") if secret_file.is_none() => &mut secret_file,
+            Some("--control-port") if control_port.is_none() => {
+                let port = args
+                    .next()
+                    .ok_or(USAGE)?
+                    .to_str()
+                    .ok_or(USAGE)?
+                    .parse::<u16>()
+                    .map_err(|_| "invalid --control-port")?;
+                if port == 0 {
+                    return Err("invalid --control-port");
+                }
+                control_port = Some(port);
+                continue;
+            }
             Some("--allow-raft-quorum") if !allow_raft_quorum => {
                 allow_raft_quorum = true;
                 continue;
@@ -200,9 +221,24 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
         allow_test_gateway_switch,
         mock_identify_budget,
         mock_recovery_max_restarts,
+        secret_file,
+        control_port: control_port.unwrap_or(0),
     };
-    if !bootstrap {
-        return Err("anonymous stdin bootstrap is required");
+    if bootstrap && options.secret_file.is_some() {
+        return Err("--bootstrap-stdin and --secret-file are mutually exclusive");
+    }
+    if !bootstrap && options.secret_file.is_none() {
+        return Err("anonymous stdin bootstrap or --secret-file is required");
+    }
+    if options
+        .secret_file
+        .as_ref()
+        .is_some_and(|path| !path.is_absolute())
+    {
+        return Err("secret file must be an absolute path");
+    }
+    if control_port.is_some() && options.secret_file.is_none() {
+        return Err("--control-port requires --secret-file");
     }
     if !options.runtime_root.is_absolute() || !options.gateway_program.is_absolute() {
         return Err("runtime root and gateway program must be absolute paths");
@@ -304,6 +340,28 @@ async fn read_bootstrap<R: AsyncRead + Unpin>(reader: R) -> io::Result<Bootstrap
     })
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "control bootstrap timed out"))?
+}
+
+/// secret の取得元。`--secret-file` があれば権限検査つきでファイルから、なければ匿名 stdin から読む。
+/// エラーは固定文字列のみ（secret・パス・OS のエラー文字列を含めない）。
+async fn load_bootstrap(secret_file: Option<&std::path::Path>) -> Result<Bootstrap, &'static str> {
+    match secret_file {
+        None => read_bootstrap(tokio::io::stdin())
+            .await
+            .map_err(|_| "invalid anonymous control bootstrap"),
+        Some(path) => {
+            let path = path.to_path_buf();
+            let secret =
+                tokio::task::spawn_blocking(move || src::secret_file::load_secret_file(&path))
+                    .await
+                    .map_err(|_| "secret file task failed")?
+                    .map_err(|error| error.as_str())?;
+            Ok(Bootstrap {
+                secret: *secret.expose_secret(),
+                access: None,
+            })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -618,10 +676,8 @@ async fn run() -> Result<(), &'static str> {
             .enable_mock_discord(address)
             .map_err(|_| "invalid mock Discord configuration")?;
     }
-    let bootstrap = read_bootstrap(tokio::io::stdin())
-        .await
-        .map_err(|_| "invalid anonymous control bootstrap")?;
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let bootstrap = load_bootstrap(options.secret_file.as_deref()).await?;
+    let listener = TcpListener::bind(("127.0.0.1", options.control_port))
         .await
         .map_err(|_| "cannot bind local daemon control")?;
     let port = listener
@@ -723,9 +779,7 @@ async fn run_raft_cluster(
 ) -> Result<(), &'static str> {
     // Authenticate the local owner before creating stores, binding cluster RPC,
     // or launching any child. No environment credentials enter this branch.
-    let bootstrap = read_bootstrap(tokio::io::stdin())
-        .await
-        .map_err(|_| "invalid anonymous control bootstrap")?;
+    let bootstrap = load_bootstrap(options.secret_file.as_deref()).await?;
     if bootstrap
         .access
         .as_ref()
@@ -733,7 +787,7 @@ async fn run_raft_cluster(
     {
         return Err("Raft cluster requires a full local administrator capability");
     }
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind(("127.0.0.1", options.control_port))
         .await
         .map_err(|_| "cannot bind local daemon control")?;
     let port = listener
@@ -839,9 +893,7 @@ async fn run_test_cluster(
         settings.lease_ms,
         settings.stop_margin_ms,
     )?;
-    let bootstrap = read_bootstrap(tokio::io::stdin())
-        .await
-        .map_err(|_| "invalid anonymous control bootstrap")?;
+    let bootstrap = load_bootstrap(options.secret_file.as_deref()).await?;
     // The experimental cluster exposes an aggregate view. Restrict it to its
     // original full local administrator capability until scoped views exist.
     if bootstrap
@@ -851,7 +903,7 @@ async fn run_test_cluster(
     {
         return Err("test cluster requires a full local administrator capability");
     }
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind(("127.0.0.1", options.control_port))
         .await
         .map_err(|_| "cannot bind local daemon control")?;
     let port = listener
@@ -953,10 +1005,8 @@ async fn run_test_gateway_switch(
         return Err("mock Identify budget exceeds limit");
     }
     let limits = serde_json::from_slice(&bytes).map_err(|_| "invalid mock Identify budget")?;
-    let bootstrap = read_bootstrap(tokio::io::stdin())
-        .await
-        .map_err(|_| "invalid anonymous control bootstrap")?;
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let bootstrap = load_bootstrap(options.secret_file.as_deref()).await?;
+    let listener = TcpListener::bind(("127.0.0.1", options.control_port))
         .await
         .map_err(|_| "cannot bind local daemon control")?;
     let port = listener
@@ -1351,6 +1401,43 @@ mod tests {
         args.pop();
         assert!(parse_options(args).is_err());
         assert!(parse_options([OsString::from("--file")]).is_err());
+    }
+
+    #[test]
+    fn secret_file_is_exclusive_with_stdin_bootstrap() {
+        let secret = std::env::current_dir().unwrap().join("botd.secret");
+        let mut base = options(&[]);
+        base.pop(); // drop --bootstrap-stdin
+        let with = |extra: &[&str]| {
+            let mut args = base.clone();
+            args.extend(extra.iter().map(OsString::from));
+            args
+        };
+        let secret_arg = secret.to_str().unwrap();
+        let parsed = parse_options(with(&["--secret-file", secret_arg])).unwrap();
+        assert_eq!(parsed.secret_file.as_deref(), Some(secret.as_path()));
+        assert_eq!(parsed.control_port, 0);
+        let parsed = parse_options(with(&[
+            "--secret-file",
+            secret_arg,
+            "--control-port",
+            "40123",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.control_port, 40123);
+        for extra in [
+            &["--secret-file", secret_arg, "--bootstrap-stdin"][..],
+            &["--secret-file", "relative.secret"],
+            &["--secret-file", secret_arg, "--secret-file", secret_arg],
+            &["--secret-file", secret_arg, "--control-port", "0"],
+            &["--secret-file", secret_arg, "--control-port", "65536"],
+            &["--secret-file", secret_arg, "--control-port", "x"],
+            &["--control-port", "40123", "--bootstrap-stdin"],
+            &["--secret-file"],
+            &[],
+        ] {
+            assert!(parse_options(with(extra)).is_err(), "{extra:?}");
+        }
     }
 
     #[test]
