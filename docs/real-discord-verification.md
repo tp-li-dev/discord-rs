@@ -4,6 +4,169 @@
 [architecture.md](architecture.md)、現状の制約は [known-limitations.md](known-limitations.md)
 を基準とする。今回の実装では実 Discord 接続・登録・Interaction・Identify・Resume を実行していない。
 
+## 最初の 30 分（初回実行の 1 ページ手順）
+
+> [!WARNING]
+> **実 Discord への接続は、このリポジトリではまだ一度も検証されていない。** この節は初回実行の
+> 手順書であり、各ステップの「期待される出力」は実装・既存文書からの想定で、実測の記録ではない。
+> 実行した結果は末尾の記録テンプレートに自分で記入する。結果が想定と違ったら成功扱いにせず止める。
+> 対応 OS は Linux（Ubuntu）のみ。以下は Ubuntu 上で、ビルド済みの成果物が `src/target/release/` にある状態で
+> `cd src` した後のコマンドである。ビルドは token を設定する前に行う
+> （`cargo build --release --locked --bin src --bin botd --bin botctl --bin register --bin discord_smoke`）。
+
+### 0. 前提と注意
+
+- **テスト用 Bot とテスト用ギルドだけ**を使う。本番ギルド・本番 Bot では実行しない（本番で行う場合はユーザーの事前承認が必須。
+  テストでの承認は流用できない）。同じ Bot token を使う他のプロセス・ホストが動いていないことを確認する。
+- **token はシェル履歴・チャット・リポジトリ・ログ・スクリーンショットに残さない。** コマンドラインに値を書かない。
+  対話シェルでは `read -s` で環境変数に入れる（入力は画面に出ず、履歴にも残らない）。
+
+  ```bash
+  read -rs DISCORD_TEST_BOT_TOKEN   # token を貼り付けて Enter（画面には何も出ない）
+  export DISCORD_TEST_BOT_TOKEN
+  ```
+
+  raw token のみ（`Bot ` の接頭辞・引用符・改行を含めない）。シェルを閉じれば消える。
+  systemd で動かす場合は `/etc/discord-rs/botd.env`（root:root 0600 または root:discord-rs 0640、`KEY=VALUE` 形式・`export` なし）に
+  `sudo -e` で書く（[linux-deployment.md](linux-deployment.md)）。手動起動で env ファイルを使う場合も 0600 にする。
+- **Developer Portal の設定**（テスト用 Application のみ）:
+  1. Application を作成し、Bot タブで Bot を作る。「Reset Token」で token を再生成し、表示された値をその場で上記の
+     `read -s` に貼る（再表示できない。漏れた可能性がある token は使わず再生成する）。
+  2. 特権 Gateway Intents（Bot タブ）で **Message Content Intent を有効にする。**
+     - 必要な機能: `!ping` などの prefix コマンド（メッセージ本文を読むため）。
+     - 必要でない機能: Slash コマンド（`/ping`）。Interaction で届くので本文を要しない。
+     - **ただし同梱 Gateway は Intent を固定で `GUILD_MESSAGES | MESSAGE_CONTENT` として要求する（`src/src/main.rs`）。**
+       Slash のみで使う場合でも、ポータルで無効のままだと Discord が接続を拒否すると想定される（Gateway close 4014。
+       コードに専用処理はなく、実際の見え方は未検証）。その場合 botd の `restarts` / `startup_failures` が増える（ステップ 4）。
+     - Presence / Server Members Intent は使わないので有効にしない。
+  3. ギルドへの招待（OAuth2 の URL Generator）: scope は `bot` と `applications.commands`。Bot 権限は最小限
+     （テストチャンネルでの View Channel / Send Messages / Read Message History 程度）。招待先はテストギルドだけ。
+  4. 控える値（非秘密）: Application ID、テストギルド ID（Discord の開発者モードで取得）、Bot のユーザー ID
+     （`bots.toml` の `bot_id` は u64 の 10 進文字列。UUID や任意文字列は実 Gateway の起動で失敗する）。
+
+### 1. 設定の検証（接続なし）
+
+`bots.toml` は 1 Bot・1 Shard の最小構成にする（[operator-guide.md](operator-guide.md) の例を参照。秘密値は書かない）。
+`token_env` は上で使う環境変数名（この手順では `DISCORD_TEST_BOT_TOKEN`）に合わせる。
+
+```bash
+./target/release/botctl config validate --file /abs/path/bots.toml --json
+./target/release/discord_smoke            # --apply なし = dry-run。ネットワーク接続なし
+```
+
+### 2. 認証だけの疎通（読み取り専用）
+
+```bash
+./target/release/discord_smoke --apply    # GET /gateway/bot と GET /users/@me の 2 件のみ。変更・WebSocket 接続なし
+```
+
+`--token-env NAME` で環境変数の名前を変えられる（値は渡せない）。失敗しても自動再実行はしない。人間も再実行しない（下表）。
+
+### 3. Slash コマンド登録
+
+`register` の token 環境変数名は **`DISCORD_TOKEN` 固定**（`discord_smoke` の `--token-env` は効かない）。引数は
+`<application-id> <global|guild-id> <command-name> [--apply]`。**テストギルドの ID を指定するギルド限定登録を使い、`global` は使わない**
+（グローバルは反映に時間がかかり、取消しも難しい）。コマンド名は `ping`（リンク済みコマンド。他に `greet`、`state_counter` 等がある）。
+
+```bash
+export DISCORD_TOKEN="$DISCORD_TEST_BOT_TOKEN"   # 履歴に残るのは変数名だけで、値は残らない
+./target/release/register <application-id> <guild-id> ping            # dry-run: 送信なし
+./target/release/register <application-id> <guild-id> ping --apply    # 1 件だけ upsert（同名は上書き）
+unset DISCORD_TOKEN
+```
+
+### 4. botd の起動（1 Shard）
+
+管理用の secret ファイル（token ではない）を作る。絶対パス・0600・botd を動かすユーザー所有で、既存ファイルは上書きされない。
+
+```bash
+./target/release/botctl secret generate --out "$HOME/botd.secret"
+mkdir -p "$HOME/botd-runtime"
+./target/release/botd --file /abs/path/bots.toml --runtime-root "$HOME/botd-runtime" \
+  --gateway-program "$(pwd)/target/release/src" --secret-file "$HOME/botd.secret" --control-port 47321
+```
+
+（フォアグラウンドで動くので、以降は別の端末で実行する。`bots.toml` は絶対パスで書く。systemd で動かす場合は
+[linux-deployment.md](linux-deployment.md) の unit を使い、`sudo systemctl start botd.service`、ログは `journalctl -u botd.service`。）
+**Identify はこの起動で 1 回だけ**行われる想定。起動し直すと消費が増えるので、確認なしに再起動しない。
+
+```bash
+./target/release/botctl status --secret-file "$HOME/botd.secret" --port 47321 --json
+```
+
+見る項目: 各プロセスの `state`（`Running` か）、`restarts`（0 のまま）、`restart_exhausted`（false）、`recovery` 内の `startup_failures`。
+`Running` は子プロセスの存在であり、Discord の READY を証明しない（READY は Discord 上の応答で確認する）。
+30 秒ほどおいて数回 status を見て、`restarts` が増えていないことを確認する。
+Gateway 子のログは botd が破棄するため journald にも出ない。出るのは botd 自身の出力だけ。
+
+### 5. Discord 上での確認
+
+テストギルドのテストチャンネルで `/ping` と `!ping` を実行する。どちらも `Pong!` 系の応答が **3 秒以内**に返ること
+（Slash は 3 秒以内に初回応答しないと Discord 側で失敗表示になる）。`!ping` は Message Content Intent が必要。
+Slash だけ成功し prefix だけ失敗する場合は、Intent の設定とチャンネル権限を疑う。
+
+### 6. 停止
+
+```bash
+./target/release/botctl stop <bot-name> --secret-file "$HOME/botd.secret" --port 47321 --json
+```
+
+その後 botd を SIGINT（フォアグラウンドなら Ctrl-C）で停止する。systemd なら `sudo systemctl stop botd.service`
+（unit は `KillSignal=SIGINT`）。`ps -C botd,src` で `botd` / `src` の孤児プロセスが残っていないことを確認する。
+
+### 各ステップの表
+
+| ステップ | 期待される出力（想定） | 失敗時に最初に見る場所 | ここで止める基準 |
+|---|---|---|---|
+| 1 設定検証 | `config validate` が成功（終了コード 0）。`discord_smoke` は `mode=dry_run config=valid ... requests=none` | `bots.toml` の `bot_id`（u64 の 10 進）・`token_env` の綴り | 検証エラー。直してやり直す（接続はしていない） |
+| 2 認証疎通 | `check=gateway_bot result=success kind=ok`、`check=current_user result=success kind=ok`、終了コード 0 | `kind` の値: `token_missing` / `token_format`（入力ミス）、`authentication`（401 = token 誤り） | **`authentication`（401）・`forbidden`（403）・`rate_limited`（429）は即停止。リトライしない。** 原因を確認し、ユーザー確認の上でのみ再実行 |
+| 3 登録 | dry-run は `Dry run: no request sent.`。apply は `Command registered.` | Application ID・guild ID・コマンド名。`register:` で始まる固定文言（タイムアウトは「結果不明」） | `unknown linked command`、HTTP 失敗・タイムアウト（登録の有無が不明）。**再送せず**、Discord クライアントのコマンド一覧で確認してから判断 |
+| 4 起動 | botd の標準出力に 1 行 JSON（`port` / `local_only` / `startup_ok`）。`status` が `Running`、`restarts` が 0 | `botctl status --json`、systemd なら `journalctl -u botd.service -n 100` | `restarts` / `startup_failures` の増加、`state` が `Failed`、`restart_exhausted` が true。botd を停止して原因確認（`bot_id` が数値か、Intent、token） |
+| 5 応答確認 | `/ping` と `!ping` に 3 秒以内に応答 | `status`、Portal の Intent、Bot のチャンネル権限 | 応答なし、二重応答、想定外チャンネルへの送信。停止する |
+| 6 停止 | `botctl stop` が成功、botd 終了、`ps -C botd,src` が空 | `botctl status`、`ps` | 子（`src`）が残る。ユーザー確認の上で整理する（予約の削除は事前確認が必要） |
+
+### 全体の中止基準
+
+次のいずれかが起きたら、その場で止めて先へ進まない。
+
+- 401 / 403 / 429 が 1 回でも出た（429 を自動再送しない。待機時間を推測しない）。
+- Identify が想定（1 回）より多く消費された疑い（再接続が繰り返される、`restarts` の増加）。
+- 無限再起動（`restarts` / `startup_failures` の増加、`state` が `Failed` のまま）。
+- 秘密らしい文字列がログ・端末・記録に出た。
+- 対象の Bot・ギルドが想定外、本番に影響した疑い、二重応答、応答が 3 秒を超える。
+
+### 中止した場合のロールバック
+
+1. botd を停止する（上の「停止」）。孤児 `src` が残れば消えるまで確認する。
+2. 環境変数を消す（`unset DISCORD_TEST_BOT_TOKEN DISCORD_TOKEN`）。env ファイルを使った場合は削除するか値を空にする。
+   token の漏洩・誤出力が疑われる場合は、**Developer Portal の「Reset Token」で再生成**する（旧 token は失効）。
+   出力を共有せず隔離し、値を転載しない。
+3. 登録した Slash コマンドの削除: 既存 `register` に削除機能はない。ギルド限定で 1 件だけ登録したので、
+   テスト Application を破棄するか、Discord クライアントでコマンドが残っていないか確認する。
+   Discord API の `DELETE` を手動で行う場合は、ユーザー確認の上、token をコマンドラインに載せない方法で行う。
+   この削除手順は本リポジトリで検証していない。
+4. 消費した Identify 予算は巻き戻せない。回復まで待つ。
+
+### 記録テンプレート（最小）
+
+秘密・生レスポンスの値は書かない。詳細版は本書末尾の「記録テンプレート」を使う。
+
+```text
+日時 / 担当者:
+コミット SHA（git rev-parse --short HEAD）:
+対象（テスト Bot・テストギルド）の非秘密な別名:
+ステップ1: 結果（成功/失敗/未実施）・気付き:
+ステップ2: 結果 / kind / 終了コード:
+ステップ3: dry-run 結果 / apply 結果（登録を Discord で確認したか）:
+ステップ4: state / restarts / startup_failures / Identify は 1 回か:
+ステップ5: /ping 応答時間（目視）/ !ping 応答 / 二重応答の有無:
+ステップ6: 停止結果 / 孤児プロセス:
+中止した場合: 理由 / ロールバック内容:
+秘密混入チェック済み:
+```
+
+以降の節は詳細版で、上の手順の根拠と個別の検証項目を含む。
+
 ## 前提と承認
 
 - 専用のテスト Bot・Application・テストギルド・テストチャンネルを使用する。
