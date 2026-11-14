@@ -212,6 +212,63 @@ jobs:
             sudo -u discord-rs env -i BOT_ID=ab100-alpha SHARD_ID=0 TOTAL_SHARDS=1 GENERATION_ID=1 timeout 5 /opt/discord-rs/bin/src --mock-discord 127.0.0.1:47400 </dev/null 2>&1 | head -20 || true
           fi
           test "$base" = 0 && test "$hard" = 0
+      - name: Automatic recovery under systemd (kill Gateway, kill botd)
+        run: |
+          set +e
+          set -uo pipefail
+          # Mock Discord only. Verifies that botd restarts a killed Gateway, and that
+          # systemd restarts a killed botd and the new botd reconciles the stale launch
+          # reservation (it must not stay stuck on ReservationExists).
+          python3 /tmp/collector.py >/dev/null 2>&1 &
+          sleep 1
+          status_json() {
+            sudo -u discord-rs /opt/discord-rs/bin/botctl status --secret-file /etc/discord-rs/botd.secret --port 47321 --json 2>/dev/null
+          }
+          all_running() {
+            status_json | python3 -c 'import json,sys; d=json.load(sys.stdin); ps=[p for b in d.get("bots",[]) for p in b.get("processes",[])]; sys.exit(0 if ps and all(p.get("state",{}).get("state") == "Running" for p in ps) else 1)'
+          }
+          wait_running() {
+            for i in $(seq 1 "$1"); do all_running && return 0; sleep 1; done
+            return 1
+          }
+          gateway_pid() { pgrep -u discord-rs -f 'src.* --bot-id 101' | head -1; }
+          fail=0
+          sudo rm -rf /var/lib/discord-rs/runtime
+          sudo systemctl start botd || { echo "botd failed to start"; sudo journalctl -u botd --no-pager | tail -30; exit 1; }
+          wait_running 45 || { echo "FAIL: not Running after start"; status_json | head -c 1500; fail=1; }
+          echo "--- 1. kill -9 the Gateway ---"
+          old=$(gateway_pid); echo "gateway pid before: $old"
+          sudo kill -9 "$old"
+          recovered=0
+          for i in $(seq 1 90); do
+            new=$(gateway_pid)
+            if [ -n "$new" ] && [ "$new" != "$old" ] && all_running; then recovered=1; break; fi
+            sleep 1
+          done
+          echo "gateway pid after: $(gateway_pid) recovered=$recovered"
+          if [ "$recovered" != 1 ]; then echo "FAIL: Gateway was not restarted"; status_json | head -c 2500; fail=1; fi
+          echo "--- 2. kill -9 botd itself ---"
+          main=$(systemctl show botd -p MainPID --value); echo "botd pid before: $main"
+          sudo kill -9 "$main"
+          back=0
+          for i in $(seq 1 120); do
+            now=$(systemctl show botd -p MainPID --value)
+            if [ "$now" != "0" ] && [ "$now" != "$main" ] && systemctl is-active --quiet botd && all_running; then back=1; break; fi
+            sleep 1
+          done
+          echo "botd pid after: $(systemctl show botd -p MainPID --value) back=$back NRestarts=$(systemctl show botd -p NRestarts --value)"
+          if [ "$back" != 1 ]; then
+            echo "FAIL: botd did not come back with a running Gateway"
+            sudo systemctl status botd --no-pager | head -20
+            status_json | head -c 2500
+            sudo journalctl -u botd --no-pager | tail -30
+            fail=1
+          fi
+          echo "leftover processes:"; ps -u discord-rs -o pid,ppid,etime,cmd | head -12
+          sudo systemctl stop botd
+          test "$(systemctl show botd -p Result --value)" = "success" || { echo "FAIL: unclean stop"; fail=1; }
+          ps -u discord-rs -o pid,cmd --no-headers | grep -q . && { echo "FAIL: processes left after stop"; ps -u discord-rs -o pid,ppid,cmd | head; fail=1; }
+          test "$fail" = 0
       - name: Journal
         if: always()
         run: sudo journalctl -u botd --no-pager | tail -80
