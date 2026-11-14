@@ -186,8 +186,11 @@ jobs:
             fi
             sleep 1
           done
-          echo "$out" | head -c 900; echo
+          echo "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(json.dumps({"shards": d.get("shards"), "bots": [[{k: v for k, v in p.items() if k != "identity"} for p in b.get("processes", [])] for b in d.get("bots", [])], "events": (d.get("recovery_events") or [])[-8:]}, indent=1)[:3500])' || echo "$out" | head -c 3000
           ps -u discord-rs -o pid,ppid,etime,cmd | head -20
+          echo "--- kernel/audit hints ---"
+          sudo journalctl -k --no-pager 2>/dev/null | grep -iE "seccomp|SIGSYS|audit.*syscall" | tail -5 || true
+          sudo journalctl -u botd --no-pager | grep -iE "signal|SIGSYS|exited|status=" | tail -8 || true
           test "$ok" = "1"
           sudo systemctl is-active botd
           sudo systemctl stop botd
