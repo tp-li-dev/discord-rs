@@ -40,6 +40,55 @@ use tokio::{
 };
 
 pub mod cluster_host;
+
+/// Size above which `gateway.log` is rotated to `gateway.log.1` at launch.
+const GATEWAY_LOG_MAX_BYTES: u64 = 1024 * 1024;
+
+/// Open (append, 0600) `<dir>/gateway.log` for a Gateway child's output.
+/// Rotates once to `gateway.log.1` when over `max_bytes` (one generation kept).
+/// Returns None, so the caller falls back to null, when the path is a symlink
+/// or not a regular file, or on any I/O error. The check-then-open is not
+/// atomic; the directory is daemon-owned state, not an attacker-writable one.
+fn open_gateway_log(dir: &Path, max_bytes: u64, generation: u64) -> Option<std::fs::File> {
+    let path = dir.join("gateway.log");
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) => {
+            if !meta.file_type().is_file() {
+                return None;
+            }
+            if meta.len() > max_bytes {
+                let old = dir.join("gateway.log.1");
+                if let Ok(m) = std::fs::symlink_metadata(&old)
+                    && !m.file_type().is_file()
+                {
+                    return None;
+                }
+                std::fs::rename(&path, &old).ok()?;
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return None,
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path).ok()?;
+    if !file.metadata().ok()?.file_type().is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .ok()?;
+    }
+    writeln!(file, "--- gateway generation {generation} ---").ok()?;
+    Some(file)
+}
 /// Authenticated update admission and off-loop audit/artifact work.
 pub mod update_control;
 
@@ -1319,6 +1368,64 @@ pub mod control {
     mod tests {
         use super::*;
 
+        fn log_dir(tag: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!("botd-glog-{}-{tag}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        #[test]
+        fn gateway_log_created_with_marker() {
+            let dir = log_dir("create");
+            drop(open_gateway_log(&dir, 1024, 7).expect("opened"));
+            let text = std::fs::read_to_string(dir.join("gateway.log")).unwrap();
+            assert_eq!(text, "--- gateway generation 7 ---\n");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(dir.join("gateway.log"))
+                    .unwrap()
+                    .permissions()
+                    .mode();
+                assert_eq!(mode & 0o777, 0o600);
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn gateway_log_rotates_once_when_oversized() {
+            let dir = log_dir("rotate");
+            std::fs::write(dir.join("gateway.log"), vec![b'x'; 100]).unwrap();
+            std::fs::write(dir.join("gateway.log.1"), b"older").unwrap();
+            drop(open_gateway_log(&dir, 50, 2).expect("opened"));
+            assert_eq!(
+                std::fs::read(dir.join("gateway.log.1")).unwrap(),
+                vec![b'x'; 100]
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.join("gateway.log")).unwrap(),
+                "--- gateway generation 2 ---\n"
+            );
+            // Under the limit: appended, not rotated.
+            drop(open_gateway_log(&dir, 1024, 3).expect("opened"));
+            let text = std::fs::read_to_string(dir.join("gateway.log")).unwrap();
+            assert!(text.contains("generation 2") && text.contains("generation 3"));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn gateway_log_symlink_falls_back_to_none() {
+            let dir = log_dir("symlink");
+            let target = dir.join("target");
+            std::fs::write(&target, b"keep").unwrap();
+            std::os::unix::fs::symlink(&target, dir.join("gateway.log")).unwrap();
+            assert!(open_gateway_log(&dir, 1024, 1).is_none());
+            assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
         fn plane(bot_count: usize, shard_count: u32) -> ControlPlane {
             let mut text =
                 "[cluster]\nid='local'\nmode='standalone'\n[node]\nid='one'\n".to_string();
@@ -2424,9 +2531,19 @@ impl<C: Clock> Daemon<C> {
             .env("TOTAL_SHARDS", entry.spec.total_shards.to_string())
             .env("GENERATION_ID", sequence.to_string())
             .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
             .kill_on_drop(false);
+        // Failure reasons (close codes etc.) go to gateway.log beside the
+        // shard's state; if it cannot be opened safely, fall back to null.
+        let (out, err) = match spec
+            .management_path
+            .parent()
+            .and_then(|dir| open_gateway_log(dir, GATEWAY_LOG_MAX_BYTES, *sequence))
+            .and_then(|file| file.try_clone().ok().map(|clone| (file, clone)))
+        {
+            Some((a, b)) => (Stdio::from(a), Stdio::from(b)),
+            None => (Stdio::null(), Stdio::null()),
+        };
+        command.stdout(out).stderr(err);
         #[cfg(windows)]
         command.env("SystemRoot", system_root);
         if let Some(address) = entry.mock_discord {

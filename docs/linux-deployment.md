@@ -21,9 +21,13 @@
    試験用モードは未対応）。unit は `Type=simple` のままで、`Type=notify` と `WatchdogSec=` はコメントです。
    実機で有効化する場合は、unit のコメントを外し、`systemctl status` で `Active: active (running)` と
    Watchdog による再起動の動作を確認してください。現状の生死監視は `Restart=on-failure`（プロセス終了の検知）のみです。
-3. **Gateway 子プロセスのログは journald に出ません。** botd は Gateway 子の stdout/stderr を `null` へ
-   向けています（`src/src/daemon.rs`）。journald に出るのは botd 自身の標準出力（起動時の 1 行 JSON）と
-   標準エラーのみです。
+3. **Gateway 子プロセスの出力は journald に出ず、ファイルに残ります。** botd は Gateway 子の stdout/stderr を
+   Shard の状態ディレクトリ直下の `gateway.log`（`<runtime root>/<bot>/shard-<n>/gateway.log`、管理 endpoint と
+   同じ場所）へ追記します。権限 0600。シンボリックリンクや通常ファイル以外なら使わず従来どおり破棄（null）へ
+   フォールバックし、起動は失敗させません。起動時に 1 MiB を超えていれば `gateway.log.1` へ 1 世代だけ
+   ローテーションし、起動ごとに `--- gateway generation N ---` の区切り行を書きます。接続失敗の理由
+   （close code 4004、4014 等）はここで確認します。journald に出るのは botd 自身の標準出力（起動時の 1 行 JSON）と
+   標準エラーのみです。この機能はローカル未ビルドで、CI での検証待ちです。
 4. **本番の Raft 有効化は拒否のままです。** `--allow-raft-quorum` は `--mock-discord` を必須とし、本番 backend
    起動は拒否されます。本手順では使いません。`--mock-discord`、`--allow-test-quorum`、
    `--allow-test-gateway-switch` 等の試験用オプションも unit には入れていません。
