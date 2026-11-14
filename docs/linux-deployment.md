@@ -306,3 +306,13 @@ journalctl --disk-usage                             # 容量確認
 - 孤児プロセスの再採用（未実装）、停電時の永続性、`--stop-children-on-exit` ＋ `SIGTERM` → `KillMode=mixed` 停止と
   古い予約の自動整理（`/proc` 走査）の実機での挙動（ローカル未ビルド、CI 検証待ち）。
 - `deploy/systemd/botd.service` の hardening 指定が各 Ubuntu バージョンで起動を妨げないこと。
+
+## 手元の Linux（WSL2 など）で実 systemd の確認を繰り返す
+systemd が動く Linux（WSL2 の Ubuntu 24.04 など）があれば、GitHub Actions の `systemd-smoke.yml` と同じ内容を、CI の往復なしで確認できる。
+
+```bash
+cd src && cargo build --release --bin botd --bin botctl --bin src     # Linux 側のディスク（WSL なら ~/ 以下）でビルドする
+sudo deploy/dev/wsl-systemd-smoke.sh /path/to/discord-rs
+```
+確認内容（模擬 Discord。token も外部への接続も使わない）：unit の起動（`Type=notify`、Watchdog）、Core ワーカーの `kill -9` → 補充、Gateway の `kill -9` → 再起動、botd の `kill -9` → systemd が再起動し古い起動予約を整理、`systemctl stop` → 子も含めて残らず停止。専用ユーザー、`/opt/discord-rs`、`/etc/discord-rs`、`/var/lib/discord-rs`、unit は、終了時にスクリプトが削除する（既存の導入があれば、触らずに中止する）。WSL では `systemd` が有効であること（`ps -p 1 -o comm=` が `systemd`）を確認する。
+

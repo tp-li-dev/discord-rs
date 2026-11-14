@@ -232,3 +232,8 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - 現状：模擬 Discord の試験モードのみ（状態機械、旧 Gateway の drain、単一 Active、共有 Identify 予算を実プロセス試験で確認）。通常の daemon では実更新を安全に拒否する。Core（Worker）のホットスワップは標準経路で使える。
 - 本番化に必要：(1) 旧 Gateway から新 Gateway への Discord セッション（session_id、シーケンス番号、resume_gateway_url）の保護された引き継ぎと、新 Gateway の Resume（新規 Identify を消費しない）。(2) 複数プロセス間の Identify 調整（現状はプロセス内のみ）。(3) 実 Discord での検証（Resume の成否、切替中のイベント欠落、Interaction の 3 秒）。
 - 進め方：設計は Astra（max）、実装は Luna（max、高速）、検証は stress ワークフローと実機。Codex の利用再開（2026-11-18 18:17 頃）後に着手する。
+
+## 2026-11-14（続き）：手元の WSL2（Ubuntu 24.04、systemd 動作）での実 systemd 確認
+- `deploy/dev/wsl-systemd-smoke.sh` を追加（Actions の `systemd-smoke.yml` と同じ内容を手元で繰り返せる）。WSL に build-essential・pkg-config・jq と Rust 1.90.0 を導入（ユーザー許可のうえ、`wsl -u root` で apt。Rust は一般ユーザー）。release ビルドは `-j 8` で 1 分 20 秒。
+- 結果（main 69f7f74、模擬 Discord）：unit の起動（Type=notify、Watchdog）、Core ワーカーの `kill -9`（補充、Gateway は不変）、Gateway の `kill -9`（再起動）、botd の `kill -9`（systemd が再起動、`NRestarts=1`、予約が整理され Gateway が復帰）、`systemctl stop`（`Result=success`、残りプロセス 0）がすべて成功。後片付け（専用ユーザー・/etc・/opt・/var/lib・unit・プロセス）が残らないことを確認。
+
