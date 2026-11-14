@@ -72,11 +72,11 @@
   - H1（実装済み、CI 検証待ち）：botd は Gateway 子の stdout/stderr を Shard 状態ディレクトリ直下の `gateway.log`（0600。シンボリックリンクなら null へフォールバック。起動時に 1 MiB 超で `gateway.log.1` へ 1 世代ローテーション。世代ごとに区切り行）へ追記する。journald には出ない。ローカル未ビルドで、実環境での確認は未実施。
   - H3：Gateway は `GUILD_MESSAGES | MESSAGE_CONTENT` を固定で要求する。MESSAGE_CONTENT は特権 Intent で、Developer Portal で有効化しないと 4014 で拒否される想定（実挙動は未検証）。Slash だけなら Intent 0 でも動作するはずだが、Intent を設定可能にする変更は未実施。
 - **中（未対応）**
-  - M1：Interaction の ACK を始める前に `begin_response_delivery` を待つため（`worker.rs` の RwLock）、Worker の世代入れ替えや reload 中は 3 秒期限を圧迫し得る。Defer を先に送るか、begin に短い期限を付ける。
-  - M2：同時 64 件超、未リンクのコマンド名、channel なし、未対応のオプション型では、ACK せず無応答になる。
-  - M3：返信が 2000 文字を超える、または不正だと `update_response` が失敗し、「考え中…」のまま残る（フォールバックなし）。
+  - M1（**実装済み・CI 検証待ち**）：Interaction は先に Defer の ACK を送り、ACK 確認後に `begin_response_delivery` を行う順序へ変更（`main.rs`。`interaction_flow::run` の状態機械と `Outcome` は無変更）。begin は 10 秒の期限付きで、失敗・期限切れ時は固定文言で `update_response` する。ACK 失敗時は begin しないため Worker への副作用もない。ローカル未ビルド。
+  - M2（**実装済み・CI 検証待ち**）：同時 64 件超、未リンク／非 ChatInput のコマンド、channel なしは、ephemeral の短い応答（interaction callback、1.5 秒の期限、失敗しても panic しない）を返す。過負荷時も新しいタスクは増やさず、イベントループ内で期限付きに送る（最悪でも 1 件 1.5 秒の背圧）。**未対応のオプション型（`slash_input` の `_`）は未区別**で、「このコマンドは使えません」の応答になる。ローカル未ビルド。
+  - M3（**実装済み・CI 検証待ち**）：純関数 `clamp_reply`（2000 文字超は 1997 文字＋`…`、空白のみ・空は固定文言）を prefix 応答・`!workers`・`update_response` の全送信で通す。単体試験あり（境界 2000/2001、マルチバイト、空）。Discord の実際の文字数判定との差は未検証。ローカル未ビルド。
   - M4：401 とネットワーク失敗が区別されず、無効 token でも supervisor の再起動（有界、最大 8 回、バックオフ 1〜30 秒）のたびに `/gateway/bot` を叩き直す。401 は再起動対象外にする専用の終了コードが望ましい。
-  - M5：`allowed_mentions` 未設定。Worker の応答にユーザー入力が含まれると `@everyone` / `@here` が実際にメンションされ得る（現在の標準 Cog の応答は固定文言）。
+  - M5（**実装済み・CI 検証待ち**）：Bot 発の全送信（prefix の `create_message`、`!workers`、`update_response`、ephemeral 応答）に `AllowedMentions::default()` を明示（メンション解析なし）。follow-up は現状使っていない。実 Discord での挙動は未検証。ローカル未ビルド。
   - M6：token の環境変数名が不一致（Gateway と `register` は `DISCORD_TOKEN`、`discord_smoke` の既定は `DISCORD_TEST_BOT_TOKEN`）。手順書に明記した。名前の統一は未実施。
 - **低**：再接続バックオフにジッターなし（上限約 255 秒、回数の上限なし）。Identify 枠が尽きていると起動後に最大 `reset_after`（最長 24 時間）黙って待つ。単体起動は SIGTERM 未処理。DM の prefix コマンドは動かない（DIRECT_MESSAGES Intent なし）。`register` の説明文が固定。Gateway 子の環境に token があり、`/proc/PID/environ` から同一ユーザーまたは root が読める。HTTP プロキシ非対応（twilight 側）。
 - **未実装（再掲）**：プロセス再起動をまたぐ Resume（session はメモリのみ。再起動は毎回新規 Identify）、複数プロセス・複数ホスト間の Identify 調整（プロセス内のみ）。
