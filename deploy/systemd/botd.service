@@ -93,6 +93,19 @@ CapabilityBoundingSet=
 AmbientCapabilities=
 # Gateway が Discord へ外向き接続するため AF_INET/AF_INET6 を許可。管理用は loopback TCP のみ。
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# 追加の硬化（systemd-analyze security の指摘に対応。2026-11-14 の実 systemd smoke で動作確認）。
+RemoveIPC=yes
+ProtectClock=yes
+ProtectKernelLogs=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictRealtime=yes
+SystemCallArchitectures=native
+# システムコールは @system-service のみ許可（通常のサーバ処理に必要な範囲）。@privileged と
+# @resources は除外する。Rust/Tokio、ファイル、ネットワーク、子プロセス起動は含まれる。
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
 
 [Install]
 WantedBy=multi-user.target
