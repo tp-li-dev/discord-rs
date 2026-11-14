@@ -95,9 +95,11 @@ impl MockIdentifyScheduler {
         shard: u32,
         now: Duration,
     ) -> Result<IdentifyDecision, &'static str> {
-        if now < self.last_now {
-            return Err("mock Identify clock regressed");
-        }
+        // Callers sample `now` before taking the lock that serializes this
+        // scheduler, so two Shards starting at once can arrive out of order. That is
+        // a race, not a clock fault: treat time as monotonic by clamping. Failing
+        // here would leave the losing Shard permanently Degraded (IdentifyUnavailable).
+        let now = now.max(self.last_now);
         self.last_now = now;
         let budget = self
             .bots

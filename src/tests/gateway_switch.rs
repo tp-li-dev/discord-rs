@@ -1118,3 +1118,35 @@ fn exhaustive_event_sequences_preserve_single_active_and_control_barriers() {
         seen.len()
     );
 }
+
+#[test]
+fn mock_identify_scheduler_tolerates_out_of_order_reservation_times() {
+    // Two Shards sample their time before locking the shared scheduler, so the one
+    // that locks second can carry an earlier `now`. That must not be an error.
+    let mut scheduler = MockIdentifyScheduler::new(vec![MockIdentifyLimit {
+        bot_id: 7,
+        total: 10,
+        remaining: 10,
+        reset_after_ms: 60_000,
+        max_concurrency: 2,
+        interval_ms: 5_000,
+    }])
+    .unwrap();
+    assert!(matches!(
+        scheduler.reserve(7, 0, Duration::from_millis(10)),
+        Ok(IdentifyDecision::Reserved)
+    ));
+    // Different bucket (shard 1 % 2), earlier timestamp than the previous call.
+    assert!(matches!(
+        scheduler.reserve(7, 1, Duration::from_millis(5)),
+        Ok(IdentifyDecision::Reserved)
+    ));
+    // Same bucket as shard 0 is still rate limited, using the clamped time.
+    match scheduler.reserve(7, 2, Duration::from_millis(6)) {
+        Ok(IdentifyDecision::Defer(deferral)) => {
+            assert!(deferral.retry_after <= Duration::from_millis(5_000));
+            assert!(deferral.retry_after > Duration::ZERO);
+        }
+        other => panic!("expected a rate limit deferral, got {other:?}"),
+    }
+}
