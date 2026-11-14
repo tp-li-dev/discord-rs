@@ -75,6 +75,37 @@ export DISCORD_TOKEN="$DISCORD_TEST_BOT_TOKEN"   # 履歴に残るのは変数�
 unset DISCORD_TOKEN
 ```
 
+### 3.5 【初回は推奨】Gateway を単体で起動して、出力を直接見る
+
+事前の静的レビュー（2026-11-14）で分かった、初回接続の落とし穴への対策。**botd 経由だと Gateway の標準出力・標準エラーが
+破棄される**（`daemon.rs` で `Stdio::null()`）ため、接続の失敗理由（認証失敗、特権 Intent 未許可など）が一切見えない。
+初回は、botd を使わず、Gateway（`src`）を単体で起動して、端末で出力を確認する。
+
+```bash
+# token は read -s で入力する（シェル履歴に残さない）。Gateway と register の既定名は DISCORD_TOKEN。
+read -rs DISCORD_TOKEN && export DISCORD_TOKEN
+./target/release/src      # Ctrl+C で停止
+```
+
+期待される出力: `Botを起動しています...` のあと `ログイン成功: <Bot の ID>`。
+失敗時に出る行（close code は秘密ではない数値）:
+
+| 出力 | 意味 | 対処 |
+|---|---|---|
+| `Gateway 切断: close code 4004` ＋ `Gateway が再接続できない切断で終了しました` | 認証失敗（token 誤り） | **ここで止める**。token を再生成し、リトライしない |
+| `Gateway 切断: close code 4014` ＋ 同上 | 特権 Intent が未許可（MESSAGE_CONTENT） | Developer Portal で Message Content Intent を有効化して再実行。Identify を 1 回消費している |
+| `Gateway 切断: close code 4010〜4013` ＋ 同上 | シャード/バージョン/Intent の指定不正 | 止めて報告する |
+| 何も出ずに終了 | 想定外 | 止めて報告する |
+
+注意:
+- **Gateway は `MESSAGE_CONTENT` を含む Intent を固定で要求する**（`GUILD_MESSAGES | MESSAGE_CONTENT`）。Slash コマンドだけを使う場合でも、
+  Developer Portal で **Message Content Intent を有効にしないと接続が拒否される（4014 の想定。実挙動は未検証）**。
+- **token の環境変数名が違うツールがある**: Gateway と `register` は `DISCORD_TOKEN`、`discord_smoke` の既定は `DISCORD_TEST_BOT_TOKEN`
+  （`--token-env` で変更可）。smoke だけ通って Gateway が `token_missing` になる場合は、名前の不一致を疑う。
+- 単体起動は `SIGTERM` を処理しない（`SIGINT`＝Ctrl+C のみ）。systemd で単体起動する構成にはしない（常駐は botd 経由）。
+- 失敗後に自動で再試行はしない（致命的な切断では、プロセスは終了する）。再実行する前に、原因を取り除くこと。
+- ここで `ログイン成功` まで確認できたら、Ctrl+C で止めてから、ステップ 4（botd 経由）に進む。Identify は、この単体起動で 1 回、botd の起動でもう 1 回消費する。
+
 ### 4. botd の起動（1 Shard）
 
 管理用の secret ファイル（token ではない）を作る。絶対パス・0600・botd を動かすユーザー所有で、既存ファイルは上書きされない。

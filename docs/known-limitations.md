@@ -63,3 +63,20 @@
 - 修正：時刻を単調に丸める（`max(now, last_now)`）。再現の単体試験を追加（`tests/gateway_switch.rs`）。修正後、Ubuntu で 20 回の反復がすべて成功した。
 - 注意：この競合は mock の予約器の問題だが、実運用の Identify 調整（共有予算）を実装する際も、時刻のサンプリングと直列化の順序に同じ落とし穴がある。判定の時刻は、直列化の内側で採ること。
 - **未解決（低頻度）**：`raft_botd_processes` の `raft_botd_death_persistent_rejoin_and_automatic_failback` が、強制終了した botd の再起動（rejoin）で、`Raft cluster configuration, storage or mTLS invalid` により起動に失敗したことがある（Ubuntu の CI で 40 回の反復中 1 回。その後の 20 回は全件成功）。当時は失敗の種別が 1 つの文言に丸められていたため原因は不明。診断のため、種別ごとの固定文言（秘密なし）を出すよう変更済み。次に再現したら、その文言で原因（InvalidConfig、Transport、Coordinator など）を特定する。この経路は試験用（模擬 Discord 限定、本番では起動拒否）。
+
+## 実 Discord 経路の事前レビュー（2026-11-14、静的レビューのみ。実接続は未実施）
+実接続（`--mock-discord` なし）のコードを、実行せずに読んで確認した結果。アカウント停止・BAN・token 漏洩につながる致命的な問題は見つからなかった（token は環境変数のみから読み、`Secret` で伏せ、Core/Worker には渡らない。認証失敗で反復ログインしない。429 は twilight-http が遵守、5xx で非冪等 POST を再送しない。`register` は既定 dry-run で、1 コマンドの upsert のみ）。以下は、実機で確認すべき点と、未対応の項目。
+
+- **対応済み**：致命的な切断（4004、4010〜4014）で理由を出さず終了していた → close code（数値のみ）と、再接続しない旨を標準エラーに出すようにした（`main.rs`。終了コードは変えない＝botd の再起動ループを避けるため）。初回は Gateway を単体で起動して出力を見る手順を `real-discord-verification.md` に追加（H1・H2 対策）。
+- **高（手順で回避。コードは未修正）**
+  - H1：botd 配下では Gateway の stdout/stderr が破棄される（`daemon.rs` の `Stdio::null()`）。接続の失敗理由が botd の出力にも journald にも出ない。恒久対策（Gateway の診断をファイル/journald へ）は未実装。
+  - H3：Gateway は `GUILD_MESSAGES | MESSAGE_CONTENT` を固定で要求する。MESSAGE_CONTENT は特権 Intent で、Developer Portal で有効化しないと 4014 で拒否される想定（実挙動は未検証）。Slash だけなら Intent 0 でも動作するはずだが、Intent を設定可能にする変更は未実施。
+- **中（未対応）**
+  - M1：Interaction の ACK を始める前に `begin_response_delivery` を待つため（`worker.rs` の RwLock）、Worker の世代入れ替えや reload 中は 3 秒期限を圧迫し得る。Defer を先に送るか、begin に短い期限を付ける。
+  - M2：同時 64 件超、未リンクのコマンド名、channel なし、未対応のオプション型では、ACK せず無応答になる。
+  - M3：返信が 2000 文字を超える、または不正だと `update_response` が失敗し、「考え中…」のまま残る（フォールバックなし）。
+  - M4：401 とネットワーク失敗が区別されず、無効 token でも supervisor の再起動（有界、最大 8 回、バックオフ 1〜30 秒）のたびに `/gateway/bot` を叩き直す。401 は再起動対象外にする専用の終了コードが望ましい。
+  - M5：`allowed_mentions` 未設定。Worker の応答にユーザー入力が含まれると `@everyone` / `@here` が実際にメンションされ得る（現在の標準 Cog の応答は固定文言）。
+  - M6：token の環境変数名が不一致（Gateway と `register` は `DISCORD_TOKEN`、`discord_smoke` の既定は `DISCORD_TEST_BOT_TOKEN`）。手順書に明記した。名前の統一は未実施。
+- **低**：再接続バックオフにジッターなし（上限約 255 秒、回数の上限なし）。Identify 枠が尽きていると起動後に最大 `reset_after`（最長 24 時間）黙って待つ。単体起動は SIGTERM 未処理。DM の prefix コマンドは動かない（DIRECT_MESSAGES Intent なし）。`register` の説明文が固定。Gateway 子の環境に token があり、`/proc/PID/environ` から同一ユーザーまたは root が読める。HTTP プロキシ非対応（twilight 側）。
+- **未実装（再掲）**：プロセス再起動をまたぐ Resume（session はメモリのみ。再起動は毎回新規 Identify）、複数プロセス・複数ホスト間の Identify 調整（プロセス内のみ）。

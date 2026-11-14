@@ -847,7 +847,16 @@ async fn live_events(
             biased;
             _ = &mut shutdown => break,
             _ = requests.join_next(), if !requests.is_empty() => continue,
-            result = shard.next_event(EventTypeFlags::all()) => match result { Some(result) => result, None => break },
+            result = shard.next_event(EventTypeFlags::all()) => match result {
+                Some(result) => result,
+                None => {
+                    // twilight ends the stream after a fatal close (4004 auth failed,
+                    // 4010-4014 invalid shard/version/intents). It never reconnects, so say
+                    // so: otherwise the process just vanishes after the start-up line.
+                    eprintln!("Gateway が再接続できない切断で終了しました（直前の close code を参照: 4004=認証失敗、4014=特権 Intent が未許可）");
+                    break;
+                }
+            },
         };
         match result {
             Ok(Event::Ready(ready)) => {
@@ -1046,6 +1055,14 @@ async fn live_events(
                         eprintln!("Interaction の応答処理に失敗しました（結果不明）: {outcome:?}");
                     }
                 });
+            }
+            Ok(Event::GatewayClose(frame)) => {
+                // Only the numeric close code: it is not a secret and tells the operator
+                // why Discord closed the connection (4004, 4014, 4000-series, ...).
+                match frame {
+                    Some(frame) => eprintln!("Gateway 切断: close code {}", frame.code),
+                    None => eprintln!("Gateway 切断: close code なし（接続の途絶）"),
+                }
             }
             Err(error) => eprintln!("{}", failure_message("Gateway error", &error)),
             _ => {}
