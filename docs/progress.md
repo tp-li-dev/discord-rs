@@ -214,3 +214,8 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - 実機で分かったこと：開発 PC のフォルダをコピーすると、`.gitignore` 対象の `worker-path.txt`（Windows のパス）と `workers/`（Windows の実行ファイル）が入り、Linux で `Workerのパスは絶対パスにしてください` が 2 秒ごとに出る（無害）。サーバには `git clone` で取得するか、これらを除く。`bots.toml` の `bot_id` は、botd 内の識別番号（数字）で、Discord の Bot の ID とは別（実際の ID は token から決まる）。
 - 検証していないこと：応答時間の計測値、長時間稼働、Resume、複数 Shard、レート制限が実際に出る場面、systemd 常駐での実 Discord 接続。
 
+
+## 2026-11-14（続き）：実機検証を受けた改善（CI 検証済み、実 Discord では未確認）
+- botd：Gateway 子の stdout/stderr を、Shard ごとの状態ディレクトリの `gateway.log`（0600、1 MiB 超で `gateway.log.1` へ 1 世代ローテーション、リンクや通常ファイル以外は従来どおり null）に残す。botd 経由でも、接続失敗の理由（close code など）が見える。
+- Gateway の応答経路（`main.rs` の live 経路）：全送信で `allowed_mentions` を無効化（`@everyone` の防止）、返信を 2000 文字にクランプ（`clamp_reply`、空は固定文言）、同時 64 件超・未リンクのコマンド・channel なしの場合に ephemeral の短い応答を返す、Interaction の ACK（defer）を先に送ってから応答の配信開始（`begin_response_delivery`）を待つ順序に変更（M1）。
+- 検証：CI（Ubuntu、clippy・試験 5 シャード・fmt）は成功。ただし統合試験は live 経路（`main.rs`）を通らないため、**実 Discord での再確認が必要**（特に M1 の順序変更）。再確認の手順は docs/real-discord-verification.md の 3.5・4・5。
