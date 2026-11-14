@@ -415,3 +415,10 @@ Linux実行・実Discord疎通・障害復旧・本番安全性の証拠とは�
 依存追加・commit・実 Discord へのリクエスト・登録は行っていない。
 Linux、実HTTP失敗時のヘッダ取得、実 Discord の3秒応答・Identify・Resume、
 分散予算・quorum/lease 統合は未検証。Slash削除の自動化とその他の手動試験の自動実行は本 bin の対象外。
+
+### 補足：初回実行で分かった注意（2026-11-14 の実機検証より）
+- **サーバにはリポジトリを `git clone` で置く**（開発 PC のフォルダをコピーしない）。コピーすると、Git 管理外の `src/worker-path.txt` と `src/workers/`（Windows のパスと実行ファイル）が入り、Linux では `Workerのパスは絶対パスにしてください` が 2 秒ごとに出る。無害だが、出たら `worker-path.txt*` と `workers/` を削除する。
+- **`bots.toml` の `bot_id` は botd 内の識別番号（先頭ゼロのない数字）** で、Discord の Bot の ID とは別。実際の Discord 側の ID は token から決まり、Gateway 起動時の `ログイン成功: <ID>` に出る。
+- **token をコマンドに書かない**: `read -rs 変数名` で入力する。誤って貼り付けた場合は、シェルの履歴を消し、Developer Portal で token を再生成する。
+- `botctl stop <name>` は、その Bot の Shard を止める操作で、botd 本体は動き続ける。botd を止めるのは、起動した端末での `Ctrl+C`（systemd なら `systemctl stop`）。
+

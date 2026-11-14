@@ -207,3 +207,10 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - 発見（運用上の落とし穴）：同梱の Gateway（`src`）は `--bot-id` が正規の 10 進 u64 でないと `launch_invalid` で即終了し、botd は子が起動のたびに落ちて再起動を繰り返す。botd は事前に検出しない（`--gateway-program` は差し替え可能で、試験用フィクスチャは文字列 ID を使うため。一律の事前検証は試験を壊すので取り消した）。docs/linux-deployment.md に症状と確認方法を明記。子の標準エラーは botd が破棄するため journald に出ない（既知の制約）。
 - smoke の初期版は `--no-autostart` で子を起動しておらず、Gateway の失敗を見逃していた。判定を『Running・再起動 0・Core ワーカー 2』に直して、子の起動まで検証する形にした。
 - 未検証：実 Discord、実機の systemd（ランナー外）、systemd 配下で Type=notify を既定にすること（unit では無効のまま。有効化は上記 smoke の drop-in で確認済みだが、出荷する unit の既定は Type=simple）。
+
+## 2026-11-14（続き）：実 Discord での初回検証（ユーザー実施、成功）
+- 環境：Oracle Cloud の Ubuntu、ユーザー自身のテスト用 Bot とテストギルド。手順は docs/real-discord-verification.md の「最初の 30 分」。
+- 結果：(1) `botctl config validate` が成功。(2) `discord_smoke --apply`（読み取り専用）で `gateway_bot`・`current_user` がともに成功し、レート制限ヘッダも正常。(3) `register`（ギルド限定、dry-run→`--apply`）で `ping` を登録。(4) Gateway を単体起動して `ログイン成功`、`/ping` と `!ping` の両方で `Pong! 🦀` が返った（Message Content Intent を有効化済み）。(5) botd 経由で起動し、`botctl status` で `Running`・再起動 0、`botctl stop` が 50ms で成功（`Exited` code 0、`restarts` 0、`startup_failures` 0）、Gateway 子プロセスが残らないことを確認。
+- 実機で分かったこと：開発 PC のフォルダをコピーすると、`.gitignore` 対象の `worker-path.txt`（Windows のパス）と `workers/`（Windows の実行ファイル）が入り、Linux で `Workerのパスは絶対パスにしてください` が 2 秒ごとに出る（無害）。サーバには `git clone` で取得するか、これらを除く。`bots.toml` の `bot_id` は、botd 内の識別番号（数字）で、Discord の Bot の ID とは別（実際の ID は token から決まる）。
+- 検証していないこと：応答時間の計測値、長時間稼働、Resume、複数 Shard、レート制限が実際に出る場面、systemd 常駐での実 Discord 接続。
+
