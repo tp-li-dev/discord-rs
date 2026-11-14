@@ -1,0 +1,6 @@
+# Shell scripts, systemd units and workflows must keep LF line endings: a CRLF breaks them on Linux.
+*.sh text eol=lf
+deploy/systemd/*.service text eol=lf
+deploy/bin/* text eol=lf
+.github/scripts/* text eol=lf
+.github/workflows/*.yml text eol=lf
