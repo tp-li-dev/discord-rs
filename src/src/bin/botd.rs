@@ -659,6 +659,16 @@ async fn run() -> Result<(), &'static str> {
         server.abort();
         return Err("cannot announce local daemon control");
     }
+    // systemd Type=notify: the control listener is bound and announced.
+    let notifier = src::sd_notify::Notifier::from_env();
+    let _ = notifier.ready();
+    let watchdog_every = src::sd_notify::watchdog_interval(
+        std::env::var("WATCHDOG_USEC").ok().as_deref(),
+        std::env::var("WATCHDOG_PID").ok().as_deref(),
+        std::process::id(),
+    )
+    .filter(|_| notifier.is_enabled());
+    let mut last_watchdog = tokio::time::Instant::now();
     let mut interval = tokio::time::interval(Duration::from_millis(25));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let result = loop {
@@ -668,6 +678,12 @@ async fn run() -> Result<(), &'static str> {
             }
             _ = interval.tick() => {
                 control.tick(&credentials).await;
+                // Sent only after the supervision tick completed, so a stalled
+                // loop stops pinging and systemd's WatchdogSec fires.
+                if watchdog_every.is_some_and(|every| last_watchdog.elapsed() >= every) {
+                    let _ = notifier.watchdog();
+                    last_watchdog = tokio::time::Instant::now();
+                }
                 audit.note_upstream_dropped(control.recovery_events_dropped());
                 for event in control.take_recovery_events() { audit.submit(&event); }
                 for job in updates.drain() {
@@ -696,6 +712,7 @@ async fn run() -> Result<(), &'static str> {
             _ = &mut server => break Err("local daemon control stopped"),
         }
     };
+    let _ = notifier.stopping();
     server.abort();
     result
 }
