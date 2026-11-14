@@ -1,0 +1,91 @@
+# botd 常駐用 systemd unit（Ubuntu のみ対応）。
+# 手順は docs/linux-deployment.md。この unit は実機の systemd では未検証。
+#
+# 配置の前提（docs/linux-deployment.md のとおりに作成する）:
+#   /opt/discord-rs/bin/botd, botctl, src(Gateway), botd-launcher   root:root 0755
+#   /etc/discord-rs/bots.toml     配置設定（秘密値なし）            root:discord-rs 0640
+#   /etc/discord-rs/botd.env      token 等（EnvironmentFile）        root:discord-rs 0640 または 0600
+#   /var/lib/discord-rs           状態（StateDirectory が 0700 で作成）
+#
+# token はこのファイルに書かない。token_env に対応する環境変数は botd.env にだけ置く。
+# （botd は環境変数から token を読み、そのBot用Gatewayにだけ渡す。Core には渡さない。）
+
+[Unit]
+Description=discord-rs botd (Gateway/Core shard supervisor)
+After=network-online.target
+Wants=network-online.target
+# 起動失敗の連続で無限に再起動しない（Restart=on-failure と併用）
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+# --- 起動方式 ---
+# Type=notify と WatchdogSec= は botd が sd_notify 未対応のため【対応後に有効化】する。
+# 現状は Type=simple のまま。WatchdogSec を有効にすると通知が来ず誤って再起動されるので設定しない。
+#   Type=notify
+#   WatchdogSec=30s
+Type=simple
+
+User=discord-rs
+Group=discord-rs
+
+# botd は匿名 stdin の secret 受渡し(--bootstrap-stdin)が必須。botd-launcher が secret を生成して渡す。
+# 制約: この構成では botctl から接続できない（docs/linux-deployment.md「できないこと」参照）。
+ExecStart=/opt/discord-rs/bin/botd-launcher /opt/discord-rs/bin/botd \
+    --file /etc/discord-rs/bots.toml \
+    --runtime-root /var/lib/discord-rs/runtime \
+    --gateway-program /opt/discord-rs/bin/src \
+    --bootstrap-stdin
+
+# 秘密は別ファイル。先頭 "-" は付けない（ファイルが無ければ起動失敗にする）。
+EnvironmentFile=/etc/discord-rs/botd.env
+
+# 状態は /var/lib/discord-rs（0700, discord-rs 所有）。runtime-root はその配下。
+StateDirectory=discord-rs discord-rs/runtime
+StateDirectoryMode=0700
+# /run/discord-rs（現状 botd は使用しない。将来の socket 等のために確保）
+RuntimeDirectory=discord-rs
+RuntimeDirectoryMode=0700
+UMask=0077
+
+# --- 停止 ---
+# botd は SIGINT(ctrl_c) のみを停止要求として処理する（src/src/bin/botd.rs）。systemd 既定の
+# SIGTERM では botd の停止処理に入らないため SIGINT を使う。主プロセスにのみ送り、残りは
+# 停止完了時／時間切れ時に systemd が cgroup ごと SIGKILL する。
+KillSignal=SIGINT
+KillMode=mixed
+TimeoutStopSec=60
+
+# --- 再起動 ---
+Restart=on-failure
+RestartSec=5s
+
+# --- 資源 ---
+LimitNOFILE=65536
+
+# --- ログは journald（stdout/stderr をそのまま渡す）---
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=botd
+
+# --- サンドボックス ---
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# StateDirectory は自動で書込可になるが、範囲を明示する（状態ディレクトリのみ）。
+ReadWritePaths=/var/lib/discord-rs
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictNamespaces=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+# Gateway が Discord へ外向き接続するため AF_INET/AF_INET6 を許可。管理用は loopback TCP のみ。
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
