@@ -88,7 +88,8 @@ sudo install -o root -g discord-rs -m 0640 src/examples/placement.toml /etc/disc
 
 `/etc/discord-rs/bots.toml` の書式は [運用ガイド](operator-guide.md) の例と
 `src/examples/placement.toml` を参照してください。`node.id` に一致する primary の Shard だけがそのホストで
-起動します。`bot_id` は u64 の正規 10 進文字列、`token_env` は Bot ごとに別名にします。
+起動します。`bot_id` は u64 の正規 10 進文字列（Discord の ID。先頭ゼロや符号は不可）、`token_env` は Bot ごとに別名にします。
+同梱の Gateway（`src`）は、`--bot-id` が正規の数値でないと `invalid gateway launch arguments [launch_invalid]` で即座に終了します。botd はこれを事前に検出せず（`--gateway-program` は差し替え可能なため）、子が起動のたびに落ちて再起動を繰り返します。`status` の `processes` に `startup_failures` が増え続け、`state` が `Failed`（`ChildExited`、`code` 1）になっていたら、まず `bot_id` を確認してください。子の標準エラーは botd が破棄するので journald には出ません。
 編集後にオフライン検査します（daemon へ接続せず、token や Discord 接続は確認しません）。
 
 ```sh
