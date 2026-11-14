@@ -180,11 +180,19 @@ jobs:
             ok=0
             for i in $(seq 1 45); do
               out=$(sudo -u discord-rs /opt/discord-rs/bin/botctl status --secret-file /etc/discord-rs/botd.secret --port 47321 --json || true)
-              if echo "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); ps=[p for b in d.get("bots",[]) for p in b.get("processes",[])]; sys.exit(0 if ps and all(p.get("recovery",{}).get("stable") is True and p.get("recovery",{}).get("restarts",1) == 0 for p in ps) else 1)'; then
+              if echo "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); ps=[p for b in d.get("bots",[]) for p in b.get("processes",[])]; sys.exit(0 if ps and all(p.get("state",{}).get("state") == "Running" and p.get("restarts",1) == 0 for p in ps) else 1)'; then
                 ok=1; break
               fi
               sleep 1
             done
+            if [ "$ok" = 1 ]; then
+              sleep 10
+              out=$(sudo -u discord-rs /opt/discord-rs/bin/botctl status --secret-file /etc/discord-rs/botd.secret --port 47321 --json || true)
+              echo "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); ps=[p for b in d.get("bots",[]) for p in b.get("processes",[])]; sys.exit(0 if ps and all(p.get("state",{}).get("state") == "Running" and p.get("restarts",1) == 0 for p in ps) else 1)' || ok=0
+              workers=$(pgrep -u discord-rs -fc "src --worker" || true)
+              echo "core workers running: $workers"
+              [ "$workers" = 2 ] || ok=0
+            fi
             echo "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(json.dumps({"shards": d.get("shards"), "procs": [[{k: v for k, v in p.items() if k != "identity"} for p in b.get("processes", [])] for b in d.get("bots", [])]}, indent=1)[:1500])' || true
             ps -u discord-rs -o pid,ppid,etime,cmd | head -12
             echo "--- Gateway stderr ($name) ---"
