@@ -144,6 +144,11 @@ Slash だけ成功し prefix だけ失敗する場合は、Intent の設定と�
 
 ### 6. 停止
 
+> **手動で起動した botd は、必ず `botctl stop` を先に実行してから `Ctrl+C` で止める**。botd は終了時に子プロセス（Gateway と Core ワーカー）を kill しない設計（子が残る可能性があるため、起動予約を保持して重複起動を防ぐ）。
+> 先に botd だけを止めると、Gateway とワーカーが残って Bot がオンラインのままになり、予約ファイル（`*.botd-reservation`）も残って、次の botd の起動を妨げる。
+> 残った場合: `pgrep -af "target/release/(botd|src)"` で PID を確認 → Gateway 本体の PID を `kill`（ワーカーは子なので一緒に終わる。残れば `kill -9`）→ プロセスがないことを確認してから `find <runtime-root> -name "*.botd-reservation" -delete`。
+> systemd で動かす場合は `systemctl stop`（`KillMode=mixed`）が残りも含めて止める。
+
 ```bash
 ./target/release/botctl stop <bot-name> --secret-file "$HOME/botd.secret" --port 47321 --json
 ```

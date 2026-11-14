@@ -219,3 +219,11 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - botd：Gateway 子の stdout/stderr を、Shard ごとの状態ディレクトリの `gateway.log`（0600、1 MiB 超で `gateway.log.1` へ 1 世代ローテーション、リンクや通常ファイル以外は従来どおり null）に残す。botd 経由でも、接続失敗の理由（close code など）が見える。
 - Gateway の応答経路（`main.rs` の live 経路）：全送信で `allowed_mentions` を無効化（`@everyone` の防止）、返信を 2000 文字にクランプ（`clamp_reply`、空は固定文言）、同時 64 件超・未リンクのコマンド・channel なしの場合に ephemeral の短い応答を返す、Interaction の ACK（defer）を先に送ってから応答の配信開始（`begin_response_delivery`）を待つ順序に変更（M1）。
 - 検証：CI（Ubuntu、clippy・試験 5 シャード・fmt）は成功。ただし統合試験は live 経路（`main.rs`）を通らないため、**実 Discord での再確認が必要**（特に M1 の順序変更）。再確認の手順は docs/real-discord-verification.md の 3.5・4・5。
+
+## 2026-11-14（続き）：改善版の実機再確認（ユーザー実施、成功）
+- 同じサーバ（Oracle Cloud の Ubuntu）、同じテスト用 Bot で、ソースのアーカイブ（`git archive`、約 1MB）を展開してビルド。(1) Gateway を単体起動して `ログイン成功`、`/ping` と `!ping` が返る、`Workerのパス…` の警告は出ない（Windows 由来のファイルを含まないため）。(2) botd 経由で起動し、`state: Running`、`restarts: 0`、`startup_failures: 0`。`gateway.log`（0600、`--- gateway generation 1 ---` と `ログイン成功` を含む）が Shard ディレクトリにできた。`/ping` と `!ping` が返った。
+- 実機で出た問題と原因：(a) `bots.toml` を移動したため `cannot load daemon configuration`（ファイルのパス違い）。(b) botd を起動した端末に、`token_env` の名前（`DISCORD_TEST_BOT_TOKEN`）で token を設定していなかったため `MissingCredential`・`state: Failed`・`restart_exhausted: true`（`gateway.log` は子の起動前の失敗のため作られない）。手順書の例の名前が実際の `token_env` と食い違っていたことが混乱の元だったので、手順書に明記した。
+- botd の停止順序：botd だけを `Ctrl+C` で止めると、Gateway とワーカーが残り（既知の設計）、起動予約ファイルも残る。`botctl stop` を先に実行する順序を手順書に明記し、残った場合の手順（kill と予約ファイルの削除）を追記した。
+- 検証していないこと：応答時間の計測値、長時間稼働、Resume、複数 Shard、systemd 常駐での実 Discord 接続、レート制限が実際に出る場面。
+- 改善候補（未着手）：botd が終了時に、自分が起動した子を、確認つきで停止する（または `botctl shutdown` のような一括停止）。現状は、手動運用で停止順序を守る必要がある。
+
