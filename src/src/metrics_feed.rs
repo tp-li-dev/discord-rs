@@ -90,6 +90,8 @@ pub fn channel(capacity: usize) -> Option<(FeedSender, FeedReceiver)> {
 }
 impl FeedSender {
     /// Never waits for the collector. Returns false on saturation or disconnect.
+    // fetch_update is deprecated (renamed try_update) on new toolchains but try_update is unstable on the pinned 1.90.0; keep fetch_update and silence the warning.
+    #[allow(deprecated)]
     pub fn observe(&self, observation: Observation) -> bool {
         match self.tx.try_send(observation) {
             Ok(()) => true,

@@ -27,6 +27,8 @@ impl CounterState {
         self.ready_events.load(Ordering::Relaxed)
     }
 
+    // fetch_update is deprecated (renamed try_update) on new toolchains but try_update is unstable on the pinned 1.90.0; keep fetch_update and silence the warning.
+    #[allow(deprecated)]
     fn increment(&self) -> BotResult<u64> {
         self.value
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
