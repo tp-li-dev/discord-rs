@@ -2,8 +2,9 @@
 # 手順は docs/linux-deployment.md。この unit は実機の systemd では未検証。
 #
 # 配置の前提（docs/linux-deployment.md のとおりに作成する）:
-#   /opt/discord-rs/bin/botd, botctl, src(Gateway), botd-launcher   root:root 0755
+#   /opt/discord-rs/bin/botd, botctl, src(Gateway)   root:root 0755
 #   /etc/discord-rs/bots.toml     配置設定（秘密値なし）            root:discord-rs 0640
+#   /etc/discord-rs/botd.secret   管理用 secret（16進 64 文字）     discord-rs:discord-rs 0600
 #   /etc/discord-rs/botd.env      token 等（EnvironmentFile）        root:discord-rs 0640 または 0600
 #   /var/lib/discord-rs           状態（StateDirectory が 0700 で作成）
 #
@@ -29,13 +30,18 @@ Type=simple
 User=discord-rs
 Group=discord-rs
 
-# botd は匿名 stdin の secret 受渡し(--bootstrap-stdin)が必須。botd-launcher が secret を生成して渡す。
-# 制約: この構成では botctl から接続できない（docs/linux-deployment.md「できないこと」参照）。
-ExecStart=/opt/discord-rs/bin/botd-launcher /opt/discord-rs/bin/botd \
+# 管理用 secret は --secret-file で渡す（64 文字の 16 進 1 行。discord-rs 所有・モード 0600 か 0400 のみ受理。
+# 満たさなければ botd は起動を拒否する）。管理用 loopback ポートは --control-port で固定し、botctl は
+# 同じ secret ファイルと --port で接続する（docs/linux-deployment.md「管理 secret」）。
+# 作成: sudo /opt/discord-rs/bin/botctl secret generate --out /etc/discord-rs/botd.secret
+#       sudo chown discord-rs:discord-rs /etc/discord-rs/botd.secret
+# secret は argv・環境変数に載せない（ここに書くのはファイルのパスだけ）。
+ExecStart=/opt/discord-rs/bin/botd \
     --file /etc/discord-rs/bots.toml \
     --runtime-root /var/lib/discord-rs/runtime \
     --gateway-program /opt/discord-rs/bin/src \
-    --bootstrap-stdin
+    --secret-file /etc/discord-rs/botd.secret \
+    --control-port 47321
 
 # 秘密は別ファイル。先頭 "-" は付けない（ファイルが無ければ起動失敗にする）。
 EnvironmentFile=/etc/discord-rs/botd.env

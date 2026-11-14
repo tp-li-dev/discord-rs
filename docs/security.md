@@ -192,7 +192,7 @@ Worker の stdout は JSON IPC 専用で、通常の content/state や設定を�
 
 ## botd / botctl のローカル管理境界
 
-`botd` は loopback のみで受け付け、匿名 stdin で渡された非ゼロの32バイト共有資格情報を要求と定数時間比較してから操作を管理キューに渡す。`botctl` は bootstrap 情報を読みこの資格情報を送信する。これは `manage` の viewer / admin と別の経路で、更新capabilityにはrole・shard scopeと監査が接続されるが、全操作で利用者ごとの役割分離・永続監査を提供しない。資格情報や bootstrap ファイルを閲覧可能な主体から保護する必要がある。`--force` の確認は権限認証の代替ではない。遠隔管理や mTLS とこのローカル listener は接続されていない。`src/src/bin/botd.rs` の `authenticated_status_returns_snapshot_without_secret`、`status_is_dispatched_only_after_authentication` と `src/tests/botctl_daemon.rs` がローカル経路の一部を検証する。Windows ACL はサポート外、複数ホストでの利用は未検証。
+`botd` は loopback のみで受け付け、匿名 stdin（`--bootstrap-stdin`）または権限検査済みの secret ファイル（`--secret-file`。通常ファイル・モード 0600/0400・所有者検査。[linux-deployment.md](linux-deployment.md)）で渡された非ゼロの32バイト共有資格情報を要求と定数時間比較してから操作を管理キューに渡す。`botctl` は bootstrap 情報を読みこの資格情報を送信する。これは `manage` の viewer / admin と別の経路で、更新capabilityにはrole・shard scopeと監査が接続されるが、全操作で利用者ごとの役割分離・永続監査を提供しない。資格情報や bootstrap ファイルを閲覧可能な主体から保護する必要がある。`--force` の確認は権限認証の代替ではない。遠隔管理や mTLS とこのローカル listener は接続されていない。`src/src/bin/botd.rs` の `authenticated_status_returns_snapshot_without_secret`、`status_is_dispatched_only_after_authentication` と `src/tests/botctl_daemon.rs` がローカル経路の一部を検証する。Windows ACL はサポート外、複数ホストでの利用は未検証。
 
 ## Daemon 間 mTLS TCP Transport（2026-11-12）
 

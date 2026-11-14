@@ -1,6 +1,7 @@
 //! Authenticated local daemon client, with offline configuration/update planning.
-//! Bootstrap capabilities are supplied through anonymous stdin, never argv,
-//! environment variables or a persistent endpoint file.
+//! Bootstrap capabilities are supplied through anonymous stdin, or (for a systemd-resident
+//! botd) a permission-checked secret file via `--secret-file` with the daemon's fixed
+//! `--port`. Never argv values, environment variables or an endpoint file.
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use src::local_control::DaemonControlEnvelope;
@@ -15,7 +16,7 @@ use tokio::{
 
 const REQUEST_LIMIT: usize = 4096;
 const RESPONSE_LIMIT: usize = 64 * 1024;
-const USAGE: &str = "usage: botctl ps|status [BOT]|inspect BOT|shards BOT|start BOT|stop BOT|restart BOT|operation ID --bootstrap-stdin [--json] [--timeout 30s]; botctl config validate --file F [--json]; botctl update|rollback BOT --plan manifest.json [--component core|gateway|all] [--rolling] [--dry-run | --yes --bootstrap-stdin] [--json]";
+const USAGE: &str = "usage: botctl ps|status [BOT]|inspect BOT|shards BOT|start BOT|stop BOT|restart BOT|operation ID (--bootstrap-stdin | --secret-file ABS --port PORT) [--json] [--timeout 30s]; botctl config validate --file F [--json]; botctl secret generate --out ABS [--json]; botctl update|rollback BOT --plan manifest.json [--component core|gateway|all] [--rolling] [--dry-run | --yes (--bootstrap-stdin | --secret-file ABS --port PORT)] [--json]";
 const OFFLINE_NOTE: &str =
     "オフライン設定検証のみ。daemon・実稼働状態・認証・quorum/leaseは検証していません。";
 
@@ -29,6 +30,9 @@ struct Options {
     yes: bool,
     plan: Option<PathBuf>,
     component: Component,
+    secret_file: Option<PathBuf>,
+    port: Option<u16>,
+    out: Option<PathBuf>,
 }
 
 fn valid_operation_id(value: &str) -> bool {
@@ -68,6 +72,9 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
     let mut component = None;
     let mut dry_run = false;
     let mut rolling = false;
+    let mut secret_file = None;
+    let mut port = None;
+    let mut out = None;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         match arg.to_str() {
@@ -77,6 +84,33 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
             Some("--yes") if !yes => yes = true,
             Some("--dry-run") if !dry_run => dry_run = true,
             Some("--rolling") if !rolling => rolling = true,
+            Some(flag @ ("--secret-file" | "--out"))
+                if (flag == "--secret-file" && secret_file.is_none())
+                    || (flag == "--out" && out.is_none()) =>
+            {
+                let value = args
+                    .next()
+                    .filter(|v| !v.is_empty() && !v.to_string_lossy().starts_with('-'))
+                    .ok_or("--secret-file and --out require a path")?;
+                let value = PathBuf::from(value);
+                if !value.is_absolute() {
+                    return Err("--secret-file and --out require an absolute path");
+                }
+                if flag == "--secret-file" {
+                    secret_file = Some(value);
+                } else {
+                    out = Some(value);
+                }
+            }
+            Some("--port") if port.is_none() => {
+                let value = args
+                    .next()
+                    .and_then(|v| v.to_str())
+                    .and_then(|v| v.parse::<u16>().ok())
+                    .filter(|p| *p != 0)
+                    .ok_or("--port requires a nonzero TCP port")?;
+                port = Some(value);
+            }
             Some("--plan") if plan.is_none() => {
                 let value = args
                     .next()
@@ -128,6 +162,7 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
     }
     let (command, bot) = match words.as_slice() {
         ["config", "validate"] => ("config", None),
+        ["secret", "generate"] => ("secret", None),
         ["ps"] => ("ps", None),
         ["status"] => ("status", None),
         ["status", bot] => ("status", Some((*bot).to_owned())),
@@ -150,6 +185,49 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
     if bot.as_ref().is_some_and(|bot| bot.is_empty()) {
         return Err("Bot selector must not be empty");
     }
+    if bootstrap && secret_file.is_some() {
+        return Err("--bootstrap-stdin and --secret-file are mutually exclusive");
+    }
+    if secret_file.is_some() != port.is_some() {
+        return Err("--secret-file and --port must be specified together");
+    }
+    if command == "secret" {
+        if out.is_none() {
+            return Err("secret generate requires --out");
+        }
+        if bootstrap
+            || secret_file.is_some()
+            || file.is_some()
+            || timeout.is_some()
+            || operation_id.is_some()
+            || force
+            || yes
+            || plan.is_some()
+            || component.is_some()
+            || dry_run
+            || rolling
+        {
+            return Err("secret generate is offline and accepts only --out and --json");
+        }
+        return Ok(Options {
+            command,
+            bot,
+            file,
+            operation_id,
+            timeout: Duration::from_secs(30),
+            force,
+            yes,
+            plan,
+            component: Component::default(),
+            secret_file,
+            port,
+            out,
+        });
+    }
+    if out.is_some() {
+        return Err("--out is only supported for secret generate");
+    }
+    let auth = bootstrap || secret_file.is_some();
     if force && command != "stop" {
         return Err("--force is supported only for stop");
     }
@@ -186,27 +264,29 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
         if dry_run && yes {
             return Err("--dry-run and --yes are mutually exclusive");
         }
-        if yes && !bootstrap {
-            return Err("update/rollback execution requires authenticated --bootstrap-stdin");
-        }
-        if !yes && bootstrap {
+        if yes && !auth {
             return Err(
-                "update/rollback dry-run is offline; omit --bootstrap-stdin or specify --yes",
+                "update/rollback execution requires authenticated --bootstrap-stdin or --secret-file",
+            );
+        }
+        if !yes && auth {
+            return Err(
+                "update/rollback dry-run is offline; omit --bootstrap-stdin/--secret-file or specify --yes",
             );
         }
     } else if command == "config" {
         if file.is_none() {
             return Err("--file is required for config validate");
         }
-        if bootstrap || timeout.is_some() {
+        if auth || port.is_some() || timeout.is_some() {
             return Err("config validate is offline; daemon connection options are not supported");
         }
     } else {
         if file.is_some() {
             return Err("--file is only supported for config validate; live commands require botd");
         }
-        if !bootstrap {
-            return Err("daemon connection requires --bootstrap-stdin");
+        if !auth {
+            return Err("daemon connection requires --bootstrap-stdin or --secret-file");
         }
     }
     Ok(Options {
@@ -219,6 +299,9 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
         yes,
         plan,
         component: component.unwrap_or_default(),
+        secret_file,
+        port,
+        out,
     })
 }
 
@@ -266,6 +349,40 @@ async fn read_bootstrap() -> Result<Bootstrap, &'static str> {
         return Err("invalid anonymous control bootstrap");
     }
     Ok(bootstrap)
+}
+
+/// `--secret-file` 経路: 権限検査つきでファイルから secret を読み、port は `--port` で受け取る。
+/// エラーは理由の種別のみ（secret・パス・OS のエラー文字列を含めない）。
+async fn load_bootstrap(
+    secret_file: Option<&std::path::Path>,
+    port: Option<u16>,
+) -> Result<Bootstrap, &'static str> {
+    let (Some(path), Some(port)) = (secret_file, port) else {
+        return read_bootstrap().await;
+    };
+    let path = path.to_path_buf();
+    let secret = tokio::task::spawn_blocking(move || src::secret_file::load_secret_file(&path))
+        .await
+        .map_err(|_| "secret file task failed")?
+        .map_err(|error| error.as_str())?;
+    Ok(Bootstrap {
+        port,
+        secret: *secret.expose_secret(),
+    })
+}
+
+fn secret_generate(path: &std::path::Path) -> Value {
+    match src::secret_file::generate_secret_file(path) {
+        Ok(()) => json!({
+            "ok": true,
+            "offline": true,
+            "created": true,
+            "note": "secret を 16 進 1 行・モード 0600 で新規作成しました。値は表示しません。"
+        }),
+        Err(error) => {
+            json!({"ok": false, "offline": true, "created": false, "error": error.as_str()})
+        }
+    }
 }
 
 fn contains_control_secret(value: &Value, secret: &[u8; 32]) -> bool {
@@ -480,6 +597,9 @@ async fn run(options: Options) -> Value {
         return config_validate(options.file.as_ref().expect("validated config path"))
             .unwrap_or_else(|error| json!({"ok": false, "offline": true, "error": error}));
     }
+    if options.command == "secret" {
+        return secret_generate(options.out.as_ref().expect("validated output path"));
+    }
     if matches!(options.command, "update" | "rollback") {
         return run_update(options).await;
     }
@@ -503,7 +623,12 @@ async fn run_live(
         };
     }
     let id = options.operation_id.as_deref();
-    let bootstrap = match timeout_at(deadline, read_bootstrap()).await {
+    let bootstrap = match timeout_at(
+        deadline,
+        load_bootstrap(options.secret_file.as_deref(), options.port),
+    )
+    .await
+    {
         Ok(Ok(bootstrap)) => bootstrap,
         Ok(Err(error)) => return failure(error, id, None),
         Err(_) => return failure("control bootstrap timed out; no request sent", id, None),

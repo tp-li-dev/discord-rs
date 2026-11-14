@@ -75,6 +75,22 @@ botd --file local-bots.toml --runtime-root ABS_RUNTIME --gateway-program ABS_GAT
 
 各JSONはUTF-8、末尾改行付きです。`botctl` は `127.0.0.1` の公告ポートへ接続し、各要求を認証します。接続情報はそのdaemonの存続期間だけ使用してください。自動検出用endpointファイル、一般用途の常駐ランチャー、OSサービス登録は提供していません。ローカルbootstrapのアクセス設定にはroleとShard scopeがあります。仕様のUnix socket / Named Pipeへの移行、OSユーザー権限の検証、遠隔管理は未接続です。別途mTLS transportの試験実装がありますが、本daemonの遠隔管理を提供しません。TCPを転送・公開して遠隔管理には使用しないでください。
 
+#### secretファイル（systemd常駐・再接続用）
+
+常駐させる `botd` には、匿名stdinの代わりに secret ファイルで管理 secret を渡せます（`--bootstrap-stdin` とは排他。どちらも無ければ起動エラー）。
+
+```text
+botctl secret generate --out ABS_SECRET
+botd --file local-bots.toml --runtime-root ABS_RUNTIME --gateway-program ABS_GATEWAY --secret-file ABS_SECRET --control-port PORT
+botctl status --secret-file ABS_SECRET --port PORT --json
+```
+
+- ファイルは 32 byte を 64 文字の 16 進で書いた 1 行（前後の空白・改行は可、生バイナリは不可）。`botctl secret generate --out` が `/dev/urandom` 由来の値をモード 0600 で新規作成します（既存ファイルは上書きしません。値は表示しません）。
+- 読込前に、絶対パス・通常ファイル（最終要素がシンボリックリンクでない、追加のハードリンクがない）・モード 0600 または 0400・所有者が実効ユーザー（root 所有は 0400 かつ環境変数 `CREDENTIALS_DIRECTORY` 配下のときだけ）を検査します。違反、長さ不正、16 進以外、全ゼロなど極端に弱い値は、理由の種別だけを出して拒否します（secret・パスは出しません）。Linux/Unix のみで、他の OS では拒否します。
+- `--control-port` を指定すると管理用 loopback ポートを固定でき（既定はランダム）、`botctl` は同じ `--port` で接続します。`--secret-file` と `--port` は必ず併用し、`--bootstrap-stdin` とは併用できません。この経路の capability は従来の secret のみの起動と同じローカル管理者権限です（role・scope の指定はできません）。
+- ローテーションは新しい secret を作成して置換し、botd を再起動します（稼働中の再読込はありません）。
+- 手順の詳細は [linux-deployment.md](linux-deployment.md)。
+
 既定ではdaemon起動時にローカルShardを起動します。`--no-autostart` を追加すると、起動を `botctl start` まで保留できます。`startup_ok` は初回起動要求の結果であり、以後の実状態は `status` で確認します。Gatewayの環境は初期化し、通常モードではそのBot用のtokenとBot/Shard/起動世代だけを注入します。`PATH` や他Botの環境は継承しません（過去のWindows開発機用コードには `SystemRoot` を追加継承する処理が存在しますが、Windowsはサポート外です）。identity用4変数はtoken参照名に使えません。
 
 Gatewayが起動するWorkerはさらに `env_clear` するため、任意名のBot tokenもCoreへ渡しません。状態・Worker更新監視ファイル・計画上のIPC/管理パスはBot/Shard別です。業務状態はメモリ内であり、状態パスの割当が永続化やGateway再起動時の復元を意味するわけではありません。
@@ -105,7 +121,7 @@ cargo test --offline --test e2e_shard_runtime
 
 ### 状態表示と操作
 
-以下のコマンドは、上記ランチャーが各プロセスのstdinへ接続情報を渡す前提です。Bot名・完全ID・一意なID接頭辞をdaemon側の `botref` で解決します。名前と別BotのID接頭辞の衝突を含め、複数一致はエラーです。
+以下のコマンドは、上記ランチャーが各プロセスのstdinへ接続情報を渡す前提です（systemd 常駐の botd へは各コマンドに `--bootstrap-stdin` の代わりに `--secret-file ABS_SECRET --port PORT` を付けます）。Bot名・完全ID・一意なID接頭辞をdaemon側の `botref` で解決します。名前と別BotのID接頭辞の衝突を含め、複数一致はエラーです。
 
 ```text
 botctl ps --bootstrap-stdin --json

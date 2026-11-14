@@ -11,12 +11,10 @@
 
 ## 先に知っておくべき制約
 
-1. **botctl で操作できません。** `botd` は起動時に匿名 stdin から 32 byte の管理 secret を読む
-   `--bootstrap-stdin` が必須で、`botctl` も同じ secret を匿名 stdin で渡す設計です
-   （[運用ガイド](operator-guide.md)）。自動検出用 endpoint ファイルや、secret を保管して `botctl` へ渡す
-   常駐ランチャーは未提供です。`deploy/bin/botd-launcher` は secret を毎回生成して botd へ渡すだけで、
-   secret を保持しないため、systemd 配下の botd へ `botctl ps` 等で接続する手段は現状ありません。
-   したがって本手順で得られるのは「systemd が botd を常駐・自動再起動させる」ことまでです。
+1. **botctl で操作できます（secret ファイル経由）。** unit は `botd --secret-file /etc/discord-rs/botd.secret
+   --control-port 47321` で起動し、`botctl` は同じファイルと `--port 47321` で loopback へ接続します
+   （「[管理 secret](#管理-secret)」）。secret ファイルの権限検査・systemd 実機での常駐接続は実機では未検証です。
+   自動検出用 endpoint ファイルはなく、ポートは固定値を `--port` で指定します。
 2. **systemd Watchdog / `Type=notify` は未対応。** botd は `sd_notify` を実装していません
    （src 内に該当コードなし）。unit では `Type=simple` とし、`Type=notify` と `WatchdogSec=` はコメントのまま
    無効です。botd 側の対応後に有効化してください。生死監視は `Restart=on-failure`（プロセス終了の検知）のみです。
@@ -63,7 +61,6 @@ sudo install -d -o root -g root -m 0755 /opt/discord-rs/bin
 sudo install -o root -g root -m 0755 src/target/release/botd   /opt/discord-rs/bin/botd
 sudo install -o root -g root -m 0755 src/target/release/botctl /opt/discord-rs/bin/botctl
 sudo install -o root -g root -m 0755 src/target/release/src    /opt/discord-rs/bin/src
-sudo install -o root -g root -m 0755 deploy/bin/botd-launcher  /opt/discord-rs/bin/botd-launcher
 
 # 設定（秘密値を含めない配置設定）
 sudo install -d -o root -g discord-rs -m 0750 /etc/discord-rs
@@ -78,6 +75,7 @@ sudo install -o root -g discord-rs -m 0640 src/examples/placement.toml /etc/disc
 | `/etc/discord-rs/` | root:discord-rs | 0750 | |
 | `/etc/discord-rs/bots.toml` | root:discord-rs | 0640 | 秘密値は書かない |
 | `/etc/discord-rs/botd.env` | root:discord-rs | 0640 または root:root 0600 | token を含む。systemd が root で読むため 0600 でも読める |
+| `/etc/discord-rs/botd.secret` | discord-rs:discord-rs | 0600（0400 も可） | 管理用 secret。botd/botctl が所有者・モードを検査する（下記「管理 secret」） |
 | `/var/lib/discord-rs`（状態） | discord-rs:discord-rs | 0700 | unit の `StateDirectory=` が作成・維持する |
 
 `/opt` 配下に実行ファイルを置く場合、Gateway（`src`）は botd の `--gateway-program` に絶対パスで渡します
@@ -105,6 +103,41 @@ sudo -e /etc/discord-rs/botd.env     # 変数名は bots.toml の token_env に�
 書かないでください。botd は `token_env` の環境変数から token を読み、そのBot用 Gateway にだけ渡します。Core
 （Worker）へ token は渡りません。
 
+### 管理 secret
+
+`botctl` が接続するための管理 secret（32 byte。64 文字の 16 進 1 行）をファイルで渡します。この unit は
+`ExecStart` で `--secret-file /etc/discord-rs/botd.secret --control-port 47321` を指定します（`LoadCredential=` は使わない
+方式に統一。コードは root 所有 0400 の `$CREDENTIALS_DIRECTORY` 配下も受理しますが、その構成は本手順の対象外で未検証です）。
+
+作成と配置（初回のみ。secret の値は表示されません）:
+
+```sh
+sudo /opt/discord-rs/bin/botctl secret generate --out /etc/discord-rs/botd.secret   # 0600 で新規作成。既存ファイルは上書きしない
+sudo chown discord-rs:discord-rs /etc/discord-rs/botd.secret                       # 所有者 = botd を動かすユーザー
+sudo ls -l /etc/discord-rs/botd.secret                                              # -rw------- discord-rs discord-rs を確認
+```
+
+botd は次をすべて満たさないと起動を拒否します（理由の種別だけを journald に出し、パスや値は出しません）:
+絶対パスの通常ファイル（シンボリックリンク・追加のハードリンクは不可）、モードが 0600 または 0400、所有者が botd の実効
+ユーザー（`discord-rs`）、64 文字の 16 進、全ゼロなど極端に弱い値でないこと。`botctl` も同じ検査をします。
+
+- **botctl の実行**: secret ファイルは `discord-rs` 所有の 0600 なので、そのユーザーで実行します。
+  `sudo -u discord-rs /opt/discord-rs/bin/botctl status --secret-file /etc/discord-rs/botd.secret --port 47321 --json`
+  （`--port` は unit の `--control-port` と一致させる）。管理 listener は 127.0.0.1 のみで、外部へ公開・転送しない
+  でください。ポートが他の用途と衝突する場合は unit と `--port` の両方を変更します。
+- **secret の保護**: ファイルをバックアップする場合は暗号化した保管庫へ。チャット・チケット・シェル履歴に貼らない。
+  この secret を知る主体は botd をローカルで完全に操作できます（role・scope は付与されません）。
+- **ローテーション**: 稼働中の再読込はありません。新しいファイルを作って置き換え、botd を再起動します。
+  ```sh
+  sudo /opt/discord-rs/bin/botctl secret generate --out /etc/discord-rs/botd.secret.new
+  sudo chown discord-rs:discord-rs /etc/discord-rs/botd.secret.new
+  sudo mv /etc/discord-rs/botd.secret.new /etc/discord-rs/botd.secret
+  sudo systemctl restart botd.service      # 再起動で Gateway が一時的に切れる（無停止ではない）
+  ```
+  古い secret は再起動後に無効になります。旧ファイルのコピーが残っていないか確認してください。
+- 検査しないもの: 途中ディレクトリのシンボリックリンク、POSIX ACL、ファイルシステム側の強制。`/etc/discord-rs` は
+  root 所有の 0750 のままにしてください。
+
 ## unit の設置と systemd 操作
 
 ```sh
@@ -123,7 +156,7 @@ sudo systemctl disable botd.service
 
 unit の要点（`deploy/systemd/botd.service` 内のコメントも参照）:
 
-- 起動引数は `--file`、`--runtime-root`、`--gateway-program`、`--bootstrap-stdin`（`src/src/bin/botd.rs` の USAGE）。
+- 起動引数は `--file`、`--runtime-root`、`--gateway-program`、`--secret-file`、`--control-port`（`src/src/bin/botd.rs` の USAGE）。
   `--runtime-root` は `/var/lib/discord-rs/runtime`（`StateDirectory=` で作成）。
 - `User=discord-rs`、`NoNewPrivileges=yes`、`ProtectSystem=strict`、`ProtectHome=yes`、`PrivateTmp=yes`、
   `ReadWritePaths=/var/lib/discord-rs`、`EnvironmentFile=/etc/discord-rs/botd.env`、
@@ -153,9 +186,19 @@ ps -o pid,user,cmd -C botd,src
 
 ## botctl での確認
 
-`botctl` の `ps`/`status`/`inspect`/`shards`/`start`/`stop`/`restart`/`operation` は、daemon の管理 secret を
-匿名 stdin で渡すことを要求します。**systemd 配下の botd にはその secret を渡せない**（上記の制約 1）ため、
-この構成では実行できません。使えるのは次のオフライン検査だけです。
+`botctl` の `ps`/`status`/`inspect`/`shards`/`start`/`stop`/`restart`/`operation` は、「[管理 secret](#管理-secret)」の
+secret ファイルと固定ポートで systemd 配下の botd に接続して実行できます（`discord-rs` ユーザーで実行）。
+
+```sh
+B="sudo -u discord-rs /opt/discord-rs/bin/botctl"
+S="--secret-file /etc/discord-rs/botd.secret --port 47321 --json"
+$B ps $S
+$B status MUSIC_BOT $S
+$B restart MUSIC_BOT $S --timeout 30s
+```
+
+`status` の `Running` は子プロセスの存在観測であり、Discord への接続（READY）を証明しません（運用ガイド）。
+オフライン検査は secret 不要です。
 
 ```sh
 /opt/discord-rs/bin/botctl config validate --file /etc/discord-rs/bots.toml --json
@@ -197,11 +240,11 @@ journalctl --disk-usage                             # 容量確認
   `--rolling` を指定できます。manifest は 64 KiB 以下の JSON で、パスは manifest のあるディレクトリから解決し、
   対象成果物の SHA-256 を照合します。秘密情報を含めないでください。
 - **既定は dry-run** で、`--dry-run` と同じ扱いです。dry-run はオフラインで、daemon に接続せず、`--bootstrap-stdin`
-  を付けるとエラーです。
-- `--yes --bootstrap-stdin` を付けたときだけ検証後に認証付きで daemon へ要求を送ります（`--dry-run` と同時指定は不可、
-  `--operation-id` は `--yes` が必要）。**通常 runtime（本番の botd）は更新実行を拒否します**（「update execution is
-  unavailable in the default runtime」）。実行経路は模擬 Discord の試験専用 runtime のみです。したがって本番で
-  `--yes` を付けても更新は実行されず、また systemd 配下の botd へは secret を渡せないため実行自体できません。
+  や `--secret-file` を付けるとエラーです。
+- `--yes` と認証（`--bootstrap-stdin` または `--secret-file ... --port ...`）を付けたときだけ検証後に認証付きで daemon へ
+  要求を送ります（`--dry-run` と同時指定は不可、`--operation-id` は `--yes` が必要）。**通常 runtime（本番の botd）は
+  更新実行を拒否します**（「update execution is unavailable in the default runtime」）。実行経路は模擬 Discord の
+  試験専用 runtime のみです。したがって本番で `--yes` を付けても更新は実行されません。
   dry-run の出力を更新の成否とみなさないでください。
 
 ```sh
@@ -237,7 +280,9 @@ journalctl --disk-usage                             # 容量確認
 
 ## できないこと・未検証事項
 
-- botctl から systemd 配下の botd への接続・操作（secret の保管と受渡しを行う常駐ランチャーが未提供）。
+- 「botctl で操作できる」ことの実機検証: secret ファイル（`--secret-file`）の権限検査と systemd 配下の botd への
+  `botctl` 接続は、実機の Ubuntu / systemd では未検証です（CI は模擬 Discord・`--no-autostart` の botd で確認）。
+  稼働中の secret 再読込、役割・scope 付きの capability 指定、`LoadCredential=` 構成も対象外・未検証です。
 - systemd `Type=notify` / `WatchdogSec`（botd が `sd_notify` 未対応）。対応後に unit のコメントを外して有効化する。
 - Gateway 子プロセスのログ収集（journald に出ない）。
 - 本番での Raft quorum 有効化（拒否のまま）、分散 Identify・failover の本番統合。
@@ -245,4 +290,3 @@ journalctl --disk-usage                             # 容量確認
 - 無停止更新、`botctl update`/`rollback` の本番実行、原子的 rollback。
 - 孤児プロセスの再採用、停電時の永続性、`SIGINT` → `KillMode=mixed` 停止の実機での挙動。
 - `deploy/systemd/botd.service` の hardening 指定が各 Ubuntu バージョンで起動を妨げないこと。
-- `deploy/bin/botd-launcher` の here-document が一時ファイルを作らないこと（dash の実装依存）。
