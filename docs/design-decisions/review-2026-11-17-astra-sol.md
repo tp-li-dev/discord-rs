@@ -19,10 +19,10 @@
 
 ## T2 結果不明の操作と nonce（`08-unknown-outcome-operations.md`）
 
-**公式で確認された事実（出典：`docs.discord.com/developers/resources/message#create-message`）：**
+**公式ドキュメントと SDK ソースで確認した事実。** [Discord Create Message](https://docs.discord.com/developers/resources/message#create-message)。
 - `nonce` は整数または文字列で、**25 文字まで**。`enforce_nonce=true` で、**同じ作者・同じ nonce**を、**過去数分**で一意性を確認する。重複したら、既存のメッセージを返し、新しく作らない。**期間の正確な値は、公式に書かれていない。**
 - **twilight-http 0.18.0**：`CreateMessage::nonce(u64)` はある。**`enforce_nonce` の指定はない。** `payload_json` は、`attachments` 以外の他のフィールドを置き換える。
-- **discord.py**（`discord/http.py`）：全体で**5 回まで**。429 は `retry_after` だけ待つ（グローバルの制限の待ちあり）。**500/502/504/524 は、`1 + 2×回数` 秒で再試行**。他の 5xx は例外にする。接続のリセットの再試行は、`errno` が **54 または 10054** のときだけ。**また、`Messageable.send` は、既定でランダムな nonce を付け、HTTP の組み立てで `enforce_nonce` を有効にする**（`08` の「discord.py は重複を許容している」という比較は、広すぎた）。
+- **discord.py v2.6.4**：HTTP 送信は初回を含めて最大 5 試行。再試行の条件を満たす 429 は `retry_after` を待つ。500・502・504・524 および一部の接続リセット（`errno` 54 または 10054）はバックオフして再試行する。通常の `Messageable.send` は、指定がなければ呼び出しごとに nonce を 1 回生成し、`enforce_nonce=true` とともに送る。同じ呼び出しの HTTP 再試行では nonce を再利用する。[Messageable.send](https://github.com/Rapptz/discord.py/blob/v2.6.4/discord/abc.py#L1554-L1575)、[handle_message_parameters](https://github.com/Rapptz/discord.py/blob/v2.6.4/discord/http.py#L194-L196)、[HTTPClient.request](https://github.com/Rapptz/discord.py/blob/v2.6.4/discord/http.py#L589-L723)。
 - webhook の実行、interaction の応答・追加応答には、**nonce の保証が文書化されていない**。初期応答は 3 秒の期限、トークンは 15 分。編集・リアクションにも nonce の保護はない（編集の再試行は、新しい編集を上書きし得る。リアクションの再実行は、後の削除を取り消し得る）。
 
 **一致した指摘（設計）：**
@@ -40,10 +40,10 @@
 **公式で確認された事実（出典：`docs.discord.com/developers/events/gateway` ほか）：**
 - `session_start_limit`：`total`（許される開始の数）、`remaining`、`reset_after`（ミリ秒）、`max_concurrency`。**実際の値を読む**（例の 1000/999/14400000/1 を固定で持たない）。
 - Identify は、**バケット（`shard_id % max_concurrency`）ごとに 5 秒に 1 回**。通常の上限は、**全シャード合計で 24 時間に 1000 回**（Resume を除く。大きな Bot は増える）。上限に達すると、セッションが切られ、token がリセットされる。
-- op 7 は、即時の再接続・Resume の要求。4000 は再接続を許すが、Resume の成功は約束しない。4007/4009 は、新しいセッションが必要。**1006 は、サーバーが送る close code ではなく、ローカルの異常終了の印**（RFC 6455。Discord は、close code がない切断では、Resume を試すよう勧めている）。
+- `1006` は Close フレームを受信せずに接続が終わったことを表す WebSocket の予約値で、Close フレームには載らない。Discord の `4000` は原因不明の切断で再接続可、`4007`・`4009` では新規セッションが必要、`4004` では再接続不可。Gateway の op 7 Reconnect は再接続と Resume を求めるイベントで、Close フレームとは別に届く。`1006` や `4000` だけでは op 7 の受信や Resume の成否は分からない。[RFC 6455 §7.1.5・§7.4.1](https://www.rfc-editor.org/rfc/rfc6455.html#section-7.1.5)、[Discord Gateway Close Event Codes](https://docs.discord.com/developers/topics/opcodes-and-status-codes#gateway-close-event-codes)、[Discord Gateway Resuming](https://docs.discord.com/developers/events/gateway#resuming)。
 - Resume は、`session_id`、`resume_gateway_url`、最後に受け取った Dispatch の連番が必要。**欠けたイベントは順に再送され、`RESUMED` で終わる。ただし、受け取った後でローカルで落としたイベントは回復しない。** op 9 の `d=true` は再度の Resume が可能、`false` は新しいセッションが必要。
 
-**私たちの記録との照合：** 13 回の再接続（11 回の op 7→4000、1 回の 1006、原因不明の Resume 1 回）がすべて Resume で、Identify 0 回、は、文書化された挙動と矛盾しない（頻度・所要時間の保証は、そこからは出ない）。**「すべて 1 秒以内」は、ログが秒単位（`utc_stamp` が秒に切り捨て）なので、証明できていない**（`progress.md` の「0〜1 秒」は、その意味に限定すべき）。**1006 を「Discord の要求」と読める記述は、訂正が必要**（私の分析は、「通信の途絶」と書いており、概ね合っているが、番号の意味を明記する）。
+**Oracle の 2026-11-17 の記録：** op 7 → 4000 に続く Resume 成功が 11 件、1006 に続く Resume 成功が 1 件、直前の切断行がない Resume 成功が 1 件。前二者の時刻差は、秒に切り捨てたログの表示上で 0〜1 秒だった。実測の復帰時間がすべて 1 秒未満かは未確認。新しい `READY` は記録されていない。失敗した Identify の試行回数は未確認。これらは接続復帰の観測で、`gateway-update` の所要時間は別計測（`progress.md` の単一 Shard で約 1.1 秒、2 Shard で約 31 秒の記録など）。
 
 **Astra が指摘した、具体的な穴：** `main.rs`（プロセス内のキュー）と `daemon.rs`（プロセスの起動の予算）は、**実際の Identify の送信を、Gateway プロセスをまたいで調整していない**。2 つのシャードが、無効なセッションの後に、独立して再 Identify し得る。**実際の Identify の送信を、botd 側の Bot ごとの 1 つのスケジューラーで調整**すべき（起動・手動・復旧の経路を含む）。また、`Ready` を数えることは、新しいセッションの成功を示すだけで、失敗した Identify の試行がゼロであることは示さない（Identify の送信、Resume の試行と結果、セッションの喪失を、token・セッション ID なしで計測する）。
 
