@@ -23,6 +23,7 @@ const MAX_JOURNAL: u64 = 16 * 1024 * 1024;
 const MAX_LINE: usize = 4096;
 const RECORD_SPACE: u64 = MAX_LINE as u64 + 1;
 const JOURNAL_VERSION: u8 = 2;
+const RETRY_JOURNAL_SPACE: Duration = Duration::from_millis(100);
 const UNAVAILABLE: LocalAdmission = LocalAdmission::Exhausted {
     retry_after: Duration::MAX,
 };
@@ -286,16 +287,19 @@ impl Budget {
         if reserved_restart && !self.restart_space.remove(&gateway.key) {
             return UNAVAILABLE;
         }
-        if self
-            .append(
-                now,
-                Action::Launch {
-                    gateway: gateway.clone(),
-                },
-            )
-            .is_err()
-        {
-            return UNAVAILABLE;
+        match self.append(
+            now,
+            Action::Launch {
+                gateway: gateway.clone(),
+            },
+        ) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                return LocalAdmission::Pending {
+                    retry_after: RETRY_JOURNAL_SPACE,
+                };
+            }
+            Err(_) => return UNAVAILABLE,
         }
         if reserved_restart {
             self.first_grant_space
@@ -339,10 +343,13 @@ impl Budget {
             converts_launch,
         };
         self.release_first_grant_space(&gateway.key, &gateway.generation);
-        if self.append(now, action).is_err() {
-            return (State::Unavailable, Reply::Unavailable);
+        match self.append(now, action) {
+            Ok(()) => (State::Granted, Reply::Permit(expires_ns)),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                (State::Waiting, Reply::Wait(nanos(RETRY_JOURNAL_SPACE)))
+            }
+            Err(_) => (State::Unavailable, Reply::Unavailable),
         }
-        (State::Granted, Reply::Permit(expires_ns))
     }
 
     fn release_first_grant_space(&mut self, key: &ShardKey, generation: &LaunchGeneration) {
@@ -360,9 +367,12 @@ impl Budget {
         };
         record.sha256 = record.checksum()?;
         let mut bytes = serde_json::to_vec(&record)?;
-        if bytes.len() > MAX_LINE || bytes.len() as u64 + 1 > self.unreserved_bytes() {
-            // Full unreserved space must not disable another Bot's reserved writes.
+        if bytes.len() > MAX_LINE || bytes.len() as u64 + 1 > self.limit.saturating_sub(self.len) {
             return Err(io::Error::other("Identify grant journal full"));
+        }
+        if bytes.len() as u64 + 1 > self.unreserved_bytes() {
+            // A pending restart owns the remaining room and can still release it.
+            return Err(io::ErrorKind::WouldBlock.into());
         }
         bytes.push(b'\n');
         let result = (|| {

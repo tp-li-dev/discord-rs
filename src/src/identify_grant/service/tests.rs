@@ -251,7 +251,12 @@ fn other_records_cannot_consume_restart_launch_and_first_grant_space() {
     unrelated.key.bot_id = "43".into();
     budget.limit = budget.len + 2 * RECORD_SPACE;
     assert!(budget.reserve_restart_space(std::slice::from_ref(&replacement.key)));
-    assert_eq!(budget.launch(unrelated.clone(), secs(0), 1), UNAVAILABLE);
+    assert_eq!(
+        budget.launch(unrelated.clone(), secs(0), 1),
+        LocalAdmission::Pending {
+            retry_after: RETRY_JOURNAL_SPACE
+        }
+    );
     assert_eq!(
         budget.launch_with_reservation(replacement.clone(), secs(0), 1, true),
         LocalAdmission::Granted
@@ -265,13 +270,17 @@ fn other_records_cannot_consume_restart_launch_and_first_grant_space() {
     budget.limit = budget.len + RECORD_SPACE;
     assert_eq!(
         budget.identify(&unrelated, secs(0), false, false, false).0,
-        State::Unavailable
+        State::Waiting
     );
     assert_eq!(
         budget.identify(&replacement, secs(0), true, false, false).0,
         State::Granted
     );
     assert!(budget.first_grant_space.is_empty());
+    assert_eq!(
+        budget.identify(&unrelated, secs(0), false, false, false).0,
+        State::Granted
+    );
 }
 
 #[test]
