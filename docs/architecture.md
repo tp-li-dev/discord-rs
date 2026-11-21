@@ -584,6 +584,7 @@ failover = ["server-a", "server-b"]
 - Daemonは設定世代・ハッシュ・署名（任意）を追跡し、全ノードが同じ意図した配置を参照できるようにする。
 - 同じ `(bot_id, shard_id)` が複数のprimaryとして設定された場合など、**不整合設定でActiveを起動しない**。
 - 秘密情報は設定ファイルに直接貼り付けない。環境変数・OS Secret Store・限定権限ファイル等を利用する。
+- Bot の資格情報参照名 `token_env` は `^[A-Z][A-Z0-9_]{2,63}$` に従い、アンダースコアで区切った要素に `TOKEN` を含める。`LD_`、`PYTHON`、`RUST_` などのプロセス設定用名前空間と内部用 `DISCORD_RS_GATEWAY_TOKEN` は予約する。`DISCORD_TEST_BOT_TOKEN` と `TOKEN_ALPHA` はそのまま使える。規則外の既存名は設定と資格情報の供給元を同時に改名する。botd が起動する Gateway には内部名だけで値を渡す。
 
 ---
 

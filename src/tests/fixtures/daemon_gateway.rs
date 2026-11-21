@@ -18,21 +18,22 @@ fn main() {
         .map(|pair| (pair[0].as_str(), pair[1].as_str()))
         .collect();
     let bot = args["--bot-id"];
-    let (token_name, value) = match bot {
-        "ab100-alpha" => ("TOKEN_ALPHA", "dummy-alpha"),
-        "ab200-beta" => ("TOKEN_BETA", "dummy-beta"),
+    let value = match bot {
+        "ab100-alpha" => "dummy-alpha",
+        "ab200-beta" => "dummy-beta",
         _ => std::process::exit(81),
     };
     let mock = args.get("--mock-discord") == Some(&"127.0.0.1:9");
     if words.len() != if mock { 16 } else { 14 } {
         std::process::exit(80);
     }
+    let token_name = "DISCORD_RS_GATEWAY_TOKEN";
     let isolated = args["--token-env"] == token_name
-        && (mock || std::env::var(token_name).ok().as_deref() == Some(value))
+        && std::env::var(token_name).ok().as_deref() == (!mock).then_some(value)
         && ["TOKEN_ALPHA", "TOKEN_BETA", "DISCORD_TOKEN", "PATH"]
             .iter()
-            .filter(|name| mock || **name != token_name)
-            .all(|name| std::env::var_os(name).is_none());
+            .all(|name| std::env::var_os(name).is_none())
+        && std::env::vars_os().all(|(name, other)| other != value || name == token_name);
     if !isolated {
         std::process::exit(82);
     }

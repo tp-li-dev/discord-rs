@@ -94,7 +94,10 @@ fn multiple_bots_and_shards_keep_credentials_and_paths_separate() {
             "B_TOKEN"
         };
         assert_eq!(spec.gateway.environment.credential_refs, [token]);
-        assert_eq!(argument(&spec.gateway.args, "--token-env"), token);
+        assert_eq!(
+            argument(&spec.gateway.args, "--token-env"),
+            src::placement::GATEWAY_TOKEN_ENV
+        );
         assert!(
             !spec
                 .core
@@ -201,8 +204,8 @@ fn invalid_and_ambiguous_inputs_fail_without_echoing_input() {
         );
     }
     assert!(plan(&[valid.clone(), valid.clone()], &root()).is_err());
-    assert!(plan(&[valid.clone(), intent("B", 0, "a_token")], &root()).is_err());
-    assert!(plan(&[valid.clone(), intent("A", 1, "OTHER")], &root()).is_err());
+    assert!(plan(&[valid.clone(), intent("B", 0, "A_TOKEN")], &root()).is_err());
+    assert!(plan(&[valid.clone(), intent("A", 1, "OTHER_TOKEN")], &root()).is_err());
     let mut other = intent("A", 1, "A_TOKEN");
     other.total_shards = 3;
     assert!(plan(&[valid.clone(), other], &root()).is_err());

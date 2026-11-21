@@ -3255,6 +3255,9 @@ pub mod control {
             }
             if op.command != "core-restart" {
                 for key in &op.targets {
+                    if self.daemon.entries[key].journal_start_pending {
+                        let _ = self.daemon.stop(key, StopMode::WaitForExit);
+                    }
                     self.daemon.hold_restart(key, false);
                 }
             }
@@ -3834,7 +3837,7 @@ pub mod control {
                         self.daemon
                             .start_inner(key, credentials, StartKind::Restart)
                     } else {
-                        self.daemon.start(key, credentials)
+                        self.daemon.start_inner(key, credentials, StartKind::Manual)
                     }
                 } else {
                     if self.daemon.has_child(key) {
@@ -3847,6 +3850,10 @@ pub mod control {
                     }
                 };
                 match result {
+                    Err(DaemonError::IdentifyJournalPending) if op.phase == Phase::Starting => {
+                        op.next -= 1;
+                        return;
+                    }
                     Err(error) => {
                         op.errors.insert(key.clone(), error);
                         if op.phase == Phase::Stopping && op.is_restart() {
@@ -7082,6 +7089,8 @@ pub mod control {
             for _ in 0..9 {
                 daemon.local_identify.record("id-0", at);
             }
+            let (_, clock) = tokio::sync::watch::channel(Duration::from_secs(60));
+            let clock = MonotonicClock::with_manual_time(clock);
             let mut host = ProcessRecoveryHost {
                 entries: &mut daemon.entries,
                 credentials: &no_credentials,
@@ -7089,7 +7098,9 @@ pub mod control {
                 sequence: &mut daemon.sequence,
                 manual: Some(&other),
                 reserved_restart: None,
-                now: Duration::from_secs(60),
+                clock: &clock,
+                last_now: &mut daemon.last_now,
+                clock_failed: &mut daemon.clock_failed,
                 local_identify: &mut daemon.local_identify,
                 errors: BTreeMap::new(),
             };
@@ -7236,6 +7247,243 @@ pub mod control {
                     yes: true,
                     ..request("restart-all", 0, id)
                 }
+            }
+
+            #[tokio::test]
+            async fn launch_rejects_a_denied_reference_even_after_spec_validation() {
+                let (mut plane, _) = fixture(1, 1, 10);
+                let key = key(0, 0);
+                // Emulate an invalid runtime spec reaching the launch boundary
+                // after the normal planner and daemon validation have run.
+                plane
+                    .daemon
+                    .entries
+                    .get_mut(&key)
+                    .unwrap()
+                    .spec
+                    .gateway
+                    .environment
+                    .credential_refs[0] = "LD_PRELOAD".into();
+                let forbidden_read = |_: &str| -> Option<OsString> {
+                    panic!("launch read an invalid credential reference")
+                };
+                assert_eq!(
+                    plane.daemon.start(&key, &forbidden_read),
+                    Err(DaemonError::InvalidSpec)
+                );
+                assert!(!plane.daemon.has_child(&key));
+            }
+
+            #[tokio::test]
+            async fn recovery_pass_stall_does_not_backdate_the_next_identify_launch() {
+                use std::sync::Arc;
+                use std::sync::atomic::{AtomicUsize, Ordering};
+
+                // The first recovery-pass observation happens before the stall.
+                // All later observations are after it until the clock is advanced.
+                struct StallClock(Arc<AtomicUsize>);
+                impl Clock for StallClock {
+                    fn now(&self) -> Duration {
+                        let sample = self.0.fetch_add(1, Ordering::Relaxed);
+                        Duration::from_secs(match sample {
+                            0..=2 => 0,
+                            3..100 => 30,
+                            _ => 60,
+                        })
+                    }
+                    fn sleep_until(&self, _: Duration) -> crate::supervisor::Sleep<'_> {
+                        Box::pin(std::future::pending())
+                    }
+                }
+
+                let (plane, _) = fixture(1, 2, 10);
+                let specs = plane
+                    .daemon
+                    .entries
+                    .values()
+                    .map(|entry| entry.spec.clone())
+                    .collect();
+                let samples = Arc::new(AtomicUsize::new(0));
+                let mut daemon = Daemon::with_clock(
+                    specs,
+                    RestartPolicy::default(),
+                    StallClock(Arc::clone(&samples)),
+                )
+                .unwrap();
+                for entry in daemon.entries.values_mut() {
+                    daemon.recovery.register(entry.recovery_key, 0).unwrap();
+                    entry.started = true;
+                    entry.snapshot.desired_running = true;
+                }
+                let keys = [key(0, 0), key(0, 1)];
+                let running = |daemon: &Daemon<StallClock>| {
+                    keys.iter().filter(|key| daemon.has_child(key)).count()
+                };
+                daemon.poll(&credentials).unwrap();
+                assert_eq!(running(&daemon), 1);
+                daemon.poll(&credentials).unwrap();
+                assert_eq!(
+                    running(&daemon),
+                    1,
+                    "the clock has not moved since the first launch"
+                );
+
+                samples.store(100, Ordering::Relaxed);
+                daemon.poll(&credentials).unwrap();
+                assert_eq!(running(&daemon), 2);
+                for key in keys {
+                    daemon.stop(&key, StopMode::WaitForExit).unwrap();
+                    let recovery_key = daemon.entries[&key].recovery_key;
+                    let child = daemon.recovery.child_mut(recovery_key).unwrap().unwrap();
+                    child.kill().await.unwrap();
+                }
+                daemon.poll(&credentials).unwrap();
+            }
+
+            #[tokio::test]
+            async fn admission_detects_regression_from_the_recovery_observation() {
+                use std::sync::atomic::{AtomicUsize, Ordering};
+
+                struct RegressingClock(AtomicUsize);
+                impl Clock for RegressingClock {
+                    fn now(&self) -> Duration {
+                        Duration::from_secs(match self.0.fetch_add(1, Ordering::Relaxed) {
+                            0..=2 => 0, // constructor and start of the recovery pass
+                            3 => 30,    // recovery has decided the child is eligible
+                            _ => 29,    // admission regressed within this same pass
+                        })
+                    }
+                    fn sleep_until(&self, _: Duration) -> crate::supervisor::Sleep<'_> {
+                        Box::pin(std::future::pending())
+                    }
+                }
+
+                let (plane, _) = fixture(1, 1, 10);
+                let specs = plane
+                    .daemon
+                    .entries
+                    .values()
+                    .map(|entry| entry.spec.clone())
+                    .collect();
+                let mut daemon = Daemon::with_clock(
+                    specs,
+                    RestartPolicy::default(),
+                    RegressingClock(AtomicUsize::new(0)),
+                )
+                .unwrap();
+                let key = key(0, 0);
+                let entry = daemon.entries.get_mut(&key).unwrap();
+                daemon.recovery.register(entry.recovery_key, 0).unwrap();
+                entry.started = true;
+                entry.snapshot.desired_running = true;
+
+                let no_spawn = |_: &str| -> Option<OsString> {
+                    panic!("regressed admission must not launch a child")
+                };
+                assert_eq!(daemon.poll(&no_spawn), Err(DaemonError::ClockRegressed));
+                assert!(!daemon.has_child(&key));
+                assert_eq!(daemon.poll(&no_spawn), Err(DaemonError::ClockRegressed));
+            }
+
+            #[tokio::test]
+            async fn lifetime_restart_limit_refuses_restart_and_restart_all_before_any_stop() {
+                let (mut plane, time) = fixture(2, 1, 10);
+                let first = key(0, 0);
+                let limited = key(1, 0);
+                plane.daemon.start(&first, &credentials).unwrap();
+                plane.daemon.start(&limited, &credentials).unwrap();
+                let max = RestartPolicy::default().max_restarts as usize;
+                for attempt in 1..=max {
+                    time.send_replace(Duration::from_secs(31 * attempt as u64));
+                    assert_eq!(plane.request(&request("restart", 1, attempt))["ok"], true);
+                    assert_eq!(
+                        complete(&mut plane, attempt).await["operation"]["state"],
+                        "succeeded"
+                    );
+                }
+                let state = plane
+                    .daemon
+                    .recovery
+                    .snapshot(plane.daemon.entries[&limited].recovery_key)
+                    .unwrap();
+                assert_eq!(state.restart.restarts as usize, max);
+                let pids = [running_pid(&plane, &first), running_pid(&plane, &limited)];
+                time.send_replace(Duration::from_secs(3600));
+
+                assert_eq!(
+                    plane.request(&request("restart", 1, 100))["error"],
+                    "RestartBudget"
+                );
+                assert_eq!(plane.request(&restart_all(101))["error"], "RestartBudget");
+                plane.tick(&credentials).await;
+                assert_eq!(plane.operations.len(), max);
+                assert!(
+                    plane
+                        .daemon
+                        .entries
+                        .values()
+                        .all(|entry| !entry.restart_held)
+                );
+                assert_eq!(
+                    [running_pid(&plane, &first), running_pid(&plane, &limited)],
+                    pids
+                );
+                cleanup(&mut plane).await;
+            }
+
+            #[cfg(target_os = "linux")]
+            #[tokio::test]
+            async fn restart_all_refuses_when_only_one_replacement_fits_in_the_journal() {
+                let (mut plane, _) = fixture(2, 1, 10);
+                plane.daemon.set_local_identify_policy(LocalIdentifyPolicy {
+                    min_interval: Duration::ZERO,
+                    ..Default::default()
+                });
+                let root =
+                    std::env::temp_dir().join(format!("igr-r-{:016x}", getrandom::u64().unwrap()));
+                plane.daemon.enable_identify_send_grants(&root).unwrap();
+                let first = key(0, 0);
+                let second = key(1, 0);
+                plane.daemon.start(&first, &credentials).unwrap();
+                plane.daemon.start(&second, &credentials).unwrap();
+                let pids = [running_pid(&plane, &first), running_pid(&plane, &second)];
+                plane
+                    .daemon
+                    .local_identify
+                    .send_grants
+                    .as_mut()
+                    .unwrap()
+                    .limit_journal_remaining(2);
+
+                assert_eq!(
+                    plane.request(&restart_all(1))["error"],
+                    "IdentifyUnavailable"
+                );
+                plane.tick(&credentials).await;
+                assert!(plane.operations.is_empty());
+                assert!(
+                    plane
+                        .daemon
+                        .entries
+                        .values()
+                        .all(|entry| !entry.restart_held)
+                );
+                assert_eq!(
+                    [running_pid(&plane, &first), running_pid(&plane, &second)],
+                    pids
+                );
+
+                // The denial rolled back both Bots' reservations. One replacement fits.
+                assert_eq!(plane.request(&request("restart", 0, 2))["ok"], true);
+                assert_eq!(
+                    complete(&mut plane, 2).await["operation"]["state"],
+                    "succeeded"
+                );
+                assert_ne!(running_pid(&plane, &first), pids[0]);
+                assert_eq!(running_pid(&plane, &second), pids[1]);
+                cleanup(&mut plane).await;
+                drop(plane);
+                std::fs::remove_dir_all(root).unwrap();
             }
 
             #[tokio::test]
@@ -7938,6 +8186,9 @@ pub enum DaemonError {
     InvalidState,
     IdentifyDeferred,
     IdentifyUnavailable,
+    IdentifyJournalPending,
+    RestartBudget,
+    RestartDeferred,
     NoRuntime,
     MissingCredential,
     MissingSystemEnvironment,
@@ -8025,6 +8276,7 @@ struct Entry {
     started: bool,
     graceful_stop: Option<Result<(), DaemonError>>,
     restart_held: bool,
+    journal_start_pending: bool,
     /// Protect the next real Identify for this update's fallback recovery.
     update_fallback_reserved: bool,
     /// Only explicit local test configuration may select this. Never infer the
@@ -8052,8 +8304,7 @@ struct Entry {
 #[cfg(unix)]
 struct Candidate {
     child: Child,
-    #[cfg(target_os = "linux")]
-    launch_sequence: u64,
+    identity: ProcessIdentity,
     started: std::time::Instant,
     ready_marker: PathBuf,
     /// Written by the standby once it has attached to every Core (it is then the Gateway
@@ -8180,10 +8431,10 @@ impl Entry {
         launch: GatewayLaunch,
         generation: LaunchGeneration,
         reserved_restart: bool,
-    ) -> crate::local_identify::LocalAdmission {
+    ) -> Result<crate::local_identify::LocalAdmission, crate::local_identify::JournalPending> {
         use crate::local_identify::LocalAdmission;
         if self.mock_discord.is_some() {
-            return LocalAdmission::Granted;
+            return Ok(LocalAdmission::Granted);
         }
         let standby = match launch {
             GatewayLaunch::Active => false,
@@ -8227,7 +8478,9 @@ struct ProcessRecoveryHost<'a, S> {
     sequence: &'a mut u64,
     manual: Option<&'a ShardKey>,
     reserved_restart: Option<&'a ShardKey>,
-    now: Duration,
+    clock: &'a dyn Clock,
+    last_now: &'a mut Duration,
+    clock_failed: &'a mut bool,
     local_identify: &'a mut crate::local_identify::LocalIdentifyRegistry,
     errors: BTreeMap<ShardKey, DaemonError>,
 }
@@ -8243,6 +8496,10 @@ impl<S: CredentialSource> RecoveryHost for ProcessRecoveryHost<'_, S> {
         false
     }
     fn try_acquire_identify(&mut self, key: ChildKey) -> IdentifyAdmission {
+        self.try_acquire_identify_at(key, *self.last_now)
+    }
+
+    fn try_acquire_identify_at(&mut self, key: ChildKey, observed: Duration) -> IdentifyAdmission {
         use crate::local_identify::LocalAdmission;
         // A single local update owns the Bot's fallback opportunity until commit, a
         // pre-activation abort, or its recovery's Identify grant. Defer OTHER starts
@@ -8289,13 +8546,19 @@ impl<S: CredentialSource> RecoveryHost for ProcessRecoveryHost<'_, S> {
             .get_or_insert_with(std::time::Instant::now);
         let reserved_restart = self.reserved_restart == Some(&entry.snapshot.key);
         let decision = if blocked && !reserved_restart {
-            LocalAdmission::Pending {
+            Ok(LocalAdmission::Pending {
                 retry_after: Duration::ZERO,
-            }
+            })
         } else {
+            let now = self.clock.now();
+            if *self.clock_failed || now < observed.max(*self.last_now) {
+                *self.clock_failed = true;
+                return IdentifyAdmission::Pending;
+            }
+            *self.last_now = now;
             entry.acquire_identify(
                 self.local_identify,
-                self.now,
+                now,
                 GatewayLaunch::Active,
                 LaunchGeneration {
                     daemon_instance: self.instance,
@@ -8305,7 +8568,7 @@ impl<S: CredentialSource> RecoveryHost for ProcessRecoveryHost<'_, S> {
             )
         };
         match decision {
-            LocalAdmission::Granted => {
+            Ok(LocalAdmission::Granted) => {
                 entry.update_fallback_reserved = false;
                 entry.admission_since = None;
                 if let Some(feed) = &entry.feed {
@@ -8317,7 +8580,8 @@ impl<S: CredentialSource> RecoveryHost for ProcessRecoveryHost<'_, S> {
             }
             denial if self.manual == Some(&entry.snapshot.key) => {
                 let error = match denial {
-                    LocalAdmission::Exhausted { .. } => DaemonError::IdentifyUnavailable,
+                    Err(_) => DaemonError::IdentifyJournalPending,
+                    Ok(LocalAdmission::Exhausted { .. }) => DaemonError::IdentifyUnavailable,
                     _ => DaemonError::IdentifyDeferred,
                 };
                 self.errors.insert(entry.snapshot.key.clone(), error);
@@ -8325,8 +8589,8 @@ impl<S: CredentialSource> RecoveryHost for ProcessRecoveryHost<'_, S> {
                 // stopped slot reusable for a later management operation.
                 IdentifyAdmission::Pending
             }
-            LocalAdmission::Pending { .. } => IdentifyAdmission::Pending,
-            LocalAdmission::Exhausted { .. } => IdentifyAdmission::Unavailable,
+            Ok(LocalAdmission::Exhausted { .. }) => IdentifyAdmission::Unavailable,
+            Ok(LocalAdmission::Pending { .. }) | Err(_) => IdentifyAdmission::Pending,
         }
     }
     fn cancel_identify(&mut self, _: ChildKey) {}
@@ -8348,11 +8612,17 @@ impl<S: CredentialSource> RecoveryHost for ProcessRecoveryHost<'_, S> {
             Ok(child) => Ok(child),
             Err(error) => {
                 #[cfg(target_os = "linux")]
-                if self.local_identify.send_grants.is_some() && *self.sequence == previous_sequence
-                {
-                    // Admission already recorded this generation, even if validation
-                    // failed before launch could allocate it.
-                    *self.sequence = previous_sequence.saturating_add(1);
+                if let Some(service) = &mut self.local_identify.send_grants {
+                    // This generation was charged even if validation failed before spawn.
+                    let sequence = previous_sequence.saturating_add(1);
+                    *self.sequence = sequence;
+                    service.release_first_grant_space(
+                        &entry.snapshot.key,
+                        &LaunchGeneration {
+                            daemon_instance: self.instance,
+                            sequence,
+                        },
+                    );
                 }
                 self.errors.insert(entry.snapshot.key.clone(), error);
                 Err(std::io::Error::other("child launch failed"))
@@ -8453,6 +8723,7 @@ fn validate_specs(specs: &[ShardRuntimeSpec]) -> Result<(), DaemonError> {
                 if !env_name(name)
                     || value.contains('\0')
                     || name.eq_ignore_ascii_case("SYSTEMROOT")
+                    || name.eq_ignore_ascii_case(crate::placement::GATEWAY_TOKEN_ENV)
                     || credential_names.contains(&name.to_ascii_uppercase())
                     || !names.insert(name.to_ascii_uppercase())
                 {
@@ -8541,6 +8812,7 @@ impl<C: Clock> Daemon<C> {
                         started: false,
                         graceful_stop: None,
                         restart_held: false,
+                        journal_start_pending: false,
                         update_fallback_reserved: false,
                         mock_discord: None,
                         feed,
@@ -8742,9 +9014,20 @@ impl<C: Clock> Daemon<C> {
     fn reserve_restart_identify(&mut self, targets: &[ShardKey]) -> Result<(), DaemonError> {
         use crate::local_identify::LocalAdmission;
         let now = self.now()?;
+        self.sequence
+            .checked_add(targets.len() as u64)
+            .ok_or(DaemonError::GenerationExhausted)?;
         let mut slots_by_bot = BTreeMap::new();
         for key in targets {
             let entry = &self.entries[key];
+            self.recovery
+                .check_replacement(entry.recovery_key, now)
+                .map_err(|reason| match reason {
+                    DegradedReason::RestartBudget => DaemonError::RestartBudget,
+                    DegradedReason::RestartWindow => DaemonError::RestartDeferred,
+                    DegradedReason::GenerationExhausted => DaemonError::GenerationExhausted,
+                    _ => DaemonError::InvalidState,
+                })?;
             if self.gateway_update_fallback_pending(&key.bot_id) {
                 return Err(DaemonError::IdentifyDeferred);
             }
@@ -8775,10 +9058,23 @@ impl<C: Clock> Daemon<C> {
             }
             return Err(error);
         }
+        #[cfg(target_os = "linux")]
+        if let Some(service) = &mut self.local_identify.send_grants
+            && !service.reserve_restart_space(targets)
+        {
+            for bot in reserved {
+                self.local_identify.release_restart(bot);
+            }
+            return Err(DaemonError::IdentifyUnavailable);
+        }
         Ok(())
     }
 
     fn release_restart_identify(&mut self, targets: &[ShardKey]) {
+        #[cfg(target_os = "linux")]
+        if let Some(service) = &mut self.local_identify.send_grants {
+            service.release_restart_space(targets);
+        }
         for key in targets {
             self.local_identify.release_restart(&key.bot_id);
         }
@@ -8836,9 +9132,9 @@ impl<C: Clock> Daemon<C> {
             generation.clone(),
             false,
         ) {
-            LocalAdmission::Granted => {}
-            LocalAdmission::Pending { .. } => return Ok(false),
-            LocalAdmission::Exhausted { .. } => return Err(DaemonError::IdentifyUnavailable),
+            Ok(LocalAdmission::Granted) => {}
+            Ok(LocalAdmission::Pending { .. }) | Err(_) => return Ok(false),
+            Ok(LocalAdmission::Exhausted { .. }) => return Err(DaemonError::IdentifyUnavailable),
         }
         #[cfg(target_os = "linux")]
         if self.local_identify.send_grants.is_some() {
@@ -8846,7 +9142,12 @@ impl<C: Clock> Daemon<C> {
             // admission followed by a missing credential or a spawn error.
             self.sequence = sequence;
         }
-        let name = &spec.environment.credential_refs[0];
+        let [name] = spec.environment.credential_refs.as_slice() else {
+            return Err(DaemonError::InvalidSpec);
+        };
+        if !crate::placement::valid_token_env(name) {
+            return Err(DaemonError::InvalidSpec);
+        }
         // The explicit loopback simulation takes no credential, exactly like a normal launch.
         let credential = if entry.mock_discord.is_none() {
             Some(
@@ -8905,19 +9206,31 @@ impl<C: Clock> Daemon<C> {
                 .arg("--mock-discord")
                 .arg(address.to_string())
                 .env_remove("DISCORD_TOKEN")
-                .env_remove(name);
+                .env_remove(crate::placement::GATEWAY_TOKEN_ENV);
         } else if let Some(credential) = credential {
-            command.env(name, credential);
+            command.env(crate::placement::GATEWAY_TOKEN_ENV, credential);
         }
         #[cfg(target_os = "linux")]
         let grant_fd = self
             .local_identify
             .send_grants
             .as_mut()
-            .map(|service| service.attach(&mut command, key, generation, true))
+            .map(|service| service.attach(&mut command, key, generation.clone(), true))
             .transpose()
             .map_err(|_| DaemonError::SpawnFailed)?;
+        let launch_observed_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| DaemonError::TimeOverflow)?
+            .as_millis();
         let child = command.spawn().map_err(|_| DaemonError::SpawnFailed)?;
+        let identity = ProcessIdentity {
+            key: key.clone(),
+            pid: child
+                .id()
+                .expect("newly spawned candidate has a process id"),
+            generation,
+            launch_observed_unix_ms,
+        };
         #[cfg(target_os = "linux")]
         drop(grant_fd);
         if entry.mock_discord.is_none() {
@@ -8926,8 +9239,7 @@ impl<C: Clock> Daemon<C> {
         self.sequence = sequence;
         entry.candidate = Some(Candidate {
             child,
-            #[cfg(target_os = "linux")]
-            launch_sequence: sequence,
+            identity,
             started: std::time::Instant::now(),
             ready_marker: marker,
             active_marker,
@@ -8970,6 +9282,8 @@ impl<C: Clock> Daemon<C> {
     /// Abandons a standby Gateway that has not been activated.
     #[cfg(unix)]
     pub fn cancel_gateway_update(&mut self, key: &ShardKey) {
+        #[cfg(target_os = "linux")]
+        self.cancel_journal_launch(key, true);
         if let Some(entry) = self.entries.get_mut(key)
             && let Some(mut candidate) = entry.candidate.take()
         {
@@ -9084,10 +9398,6 @@ impl<C: Clock> Daemon<C> {
     /// (killed after a grace period).
     #[cfg(unix)]
     pub async fn commit_gateway_update(&mut self, key: &ShardKey) -> Result<(), DaemonError> {
-        let sequence = self
-            .sequence
-            .checked_add(1)
-            .ok_or(DaemonError::GenerationExhausted)?;
         let entry = self.entries.get_mut(key).ok_or(DaemonError::UnknownShard)?;
         let Some(candidate) = entry.candidate.take() else {
             return Err(DaemonError::InvalidState);
@@ -9101,7 +9411,6 @@ impl<C: Clock> Daemon<C> {
             }
         };
         let _ = std::fs::remove_file(&candidate.active_marker);
-        let pid = candidate.child.id();
         match self.recovery.replace_ready(
             entry.recovery_key,
             expected,
@@ -9111,13 +9420,7 @@ impl<C: Clock> Daemon<C> {
             Ok(mut old) => {
                 #[cfg(target_os = "linux")]
                 if let Some(service) = &mut self.local_identify.send_grants {
-                    service.promote(
-                        key,
-                        &LaunchGeneration {
-                            daemon_instance: self.instance,
-                            sequence: candidate.launch_sequence,
-                        },
-                    );
+                    service.promote(key, &candidate.identity.generation);
                 }
                 if let Some(pipe) = old.stdin.as_mut() {
                     let _ = tokio::time::timeout(Duration::from_millis(500), async {
@@ -9131,14 +9434,7 @@ impl<C: Clock> Daemon<C> {
                     child: old,
                     since: std::time::Instant::now(),
                 });
-                self.sequence = sequence;
-                if let (Some(pid), Some(identity)) = (pid, entry.snapshot.identity.as_mut()) {
-                    identity.pid = pid;
-                    identity.generation = LaunchGeneration {
-                        daemon_instance: self.instance,
-                        sequence,
-                    };
-                }
+                entry.snapshot.identity = Some(candidate.identity);
                 entry.graceful_stop = None;
                 entry.update_fallback_reserved = false;
                 Ok(())
@@ -9155,6 +9451,14 @@ impl<C: Clock> Daemon<C> {
     /// behind. The Gateway that is active is stopped by the normal graceful path.
     #[cfg(unix)]
     pub fn abandon_gateway_updates(&mut self) {
+        #[cfg(target_os = "linux")]
+        if let Some(service) = &mut self.local_identify.send_grants {
+            for key in self.entries.keys() {
+                if let Some(sequence) = service.cancel_launch(key, true) {
+                    self.sequence = sequence;
+                }
+            }
+        }
         for entry in self.entries.values_mut() {
             entry.update_fallback_reserved = false;
             if let Some(mut candidate) = entry.candidate.take() {
@@ -9338,7 +9642,31 @@ impl<C: Clock> Daemon<C> {
         key: &ShardKey,
         credentials: &impl CredentialSource,
     ) -> Result<(), DaemonError> {
-        self.start_inner(key, credentials, StartKind::Manual)
+        loop {
+            let result = self.start_inner(key, credentials, StartKind::Manual);
+            #[cfg(target_os = "linux")]
+            if result == Err(DaemonError::IdentifyJournalPending)
+                && let Some(service) = &mut self.local_identify.send_grants
+            {
+                if !service.wait_for_write() {
+                    // A different operation owns an already durable launch.
+                    self.stop(key, StopMode::WaitForExit)?;
+                    return Err(DaemonError::IdentifyDeferred);
+                }
+                continue;
+            }
+            return result;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn cancel_journal_launch(&mut self, key: &ShardKey, standby: bool) {
+        if let Some(service) = &mut self.local_identify.send_grants
+            && let Some(sequence) = service.cancel_launch(key, standby)
+        {
+            // A submitted generation remains charged if the operation is cancelled.
+            self.sequence = sequence;
+        }
     }
 
     fn start_inner(
@@ -9352,29 +9680,32 @@ impl<C: Clock> Daemon<C> {
             return Err(DaemonError::InvalidState);
         }
         let entry = self.entries.get_mut(key).ok_or(DaemonError::UnknownShard)?;
-        if entry.snapshot.desired_running {
-            return Err(DaemonError::InvalidState);
+        if !entry.journal_start_pending {
+            if entry.snapshot.desired_running {
+                return Err(DaemonError::InvalidState);
+            }
+            if entry.started {
+                self.recovery
+                    .start_stopped(entry.recovery_key)
+                    .map_err(|_| DaemonError::InvalidState)?;
+            } else {
+                self.recovery
+                    .register(entry.recovery_key, 0)
+                    .map_err(|_| DaemonError::InvalidState)?;
+            }
+            entry.started = true;
+            entry.snapshot.desired_running = true;
         }
-        if entry.started {
-            self.recovery
-                .start_stopped(entry.recovery_key)
-                .map_err(|_| DaemonError::InvalidState)?;
-        } else {
-            self.recovery
-                .register(entry.recovery_key, 0)
-                .map_err(|_| DaemonError::InvalidState)?;
-        }
-        entry.started = true;
-        entry.snapshot.desired_running = true;
         // The accepted management operation owns this one launch. Its hold is
         // restored before the next automatic poll; no budget is reset.
         self.recovery
             .hold(entry.recovery_key, false)
             .map_err(|_| DaemonError::InvalidState)?;
         let result = self.poll_recovery(credentials, Some(key), kind);
-        let entry = &self.entries[key];
+        let entry = self.entries.get_mut(key).unwrap();
+        entry.journal_start_pending = result == Err(DaemonError::IdentifyJournalPending);
         let _ = self.recovery.hold(entry.recovery_key, entry.restart_held);
-        if kind == StartKind::Manual
+        if kind != StartKind::Automatic
             && matches!(
                 result,
                 Err(DaemonError::IdentifyDeferred | DaemonError::IdentifyUnavailable)
@@ -9399,7 +9730,12 @@ impl<C: Clock> Daemon<C> {
         if !safe_path(Path::new(&spec.program)) {
             return Err(DaemonError::InvalidProgram);
         }
-        let name = &spec.environment.credential_refs[0];
+        let [name] = spec.environment.credential_refs.as_slice() else {
+            return Err(DaemonError::InvalidSpec);
+        };
+        if !crate::placement::valid_token_env(name) {
+            return Err(DaemonError::InvalidSpec);
+        }
         let credential = if entry.mock_discord.is_none() {
             Some(
                 credentials
@@ -9517,9 +9853,9 @@ impl<C: Clock> Daemon<C> {
                 .arg("--mock-discord")
                 .arg(address.to_string())
                 .env_remove("DISCORD_TOKEN")
-                .env_remove(name);
+                .env_remove(crate::placement::GATEWAY_TOKEN_ENV);
         } else if let Some(credential) = credential {
-            command.env(name, credential);
+            command.env(crate::placement::GATEWAY_TOKEN_ENV, credential);
         }
         // Terminal Ctrl-C must target the daemon's foreground group, not its
         // independently supervised Gateway units. This is not a service manager
@@ -9635,15 +9971,23 @@ impl<C: Clock> Daemon<C> {
             sequence: &mut self.sequence,
             manual: requested.filter(|_| kind != StartKind::Automatic),
             reserved_restart: requested.filter(|_| kind == StartKind::Restart),
-            now: self.last_now,
+            clock: &*self.clock,
+            last_now: &mut self.last_now,
+            clock_failed: &mut self.clock_failed,
             local_identify: &mut self.local_identify,
             errors: BTreeMap::new(),
         };
         let mut events = self.recovery.poll(&mut host);
         let errors = host.errors;
+        if self.clock_failed && first_error.is_none() {
+            first_error = self.now().err();
+        }
         for (key, error) in errors {
             if requested.is_none_or(|requested| requested == &key) {
                 first_error.get_or_insert(error);
+            }
+            if error == DaemonError::IdentifyJournalPending {
+                continue;
             }
             let entry = self.entries.get_mut(&key).unwrap();
             entry.snapshot.state = ProcessState::Failed { error, code: None };
@@ -9652,6 +9996,7 @@ impl<C: Clock> Daemon<C> {
                 DaemonError::ReservationExists
                     | DaemonError::ReservationIo
                     | DaemonError::InvalidProgram
+                    | DaemonError::InvalidSpec
                     | DaemonError::NoRuntime
                     | DaemonError::GenerationExhausted
                     | DaemonError::TimeOverflow
@@ -9774,7 +10119,10 @@ impl<C: Clock> Daemon<C> {
     /// Force requires the caller's explicit operator authorization. No kill or
     /// stop is issued on daemon Drop or when only a status client disconnects.
     pub fn stop(&mut self, key: &ShardKey, mode: StopMode) -> Result<(), DaemonError> {
+        #[cfg(target_os = "linux")]
+        self.cancel_journal_launch(key, false);
         let entry = self.entries.get_mut(key).ok_or(DaemonError::UnknownShard)?;
+        entry.journal_start_pending = false;
         entry.snapshot.desired_running = false;
         entry.snapshot.retry_at_ms = None;
         entry.admission_since = None;

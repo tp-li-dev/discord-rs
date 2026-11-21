@@ -149,6 +149,12 @@ pub trait RecoveryHost {
     /// metadata refresh uses rest_budget separately, never as an Identify permit.
     fn try_acquire_identify(&mut self, key: ChildKey) -> IdentifyAdmission;
 
+    /// The host may resample at admission. A new sample must be no earlier
+    /// than the recovery observation that made this child eligible.
+    fn try_acquire_identify_at(&mut self, key: ChildKey, _observed: Duration) -> IdentifyAdmission {
+        self.try_acquire_identify(key)
+    }
+
     /// Cancel any pending queue request on hold/stop/authority loss. Admissions
     /// already consumed remain spent. Must be idempotent and not block.
     fn cancel_identify(&mut self, key: ChildKey);
@@ -261,6 +267,21 @@ impl Entry {
         }
     }
 
+    fn restart_denial(&self, now: Duration, policy: RestartPolicy) -> Option<DegradedReason> {
+        if !self.attempted {
+            return None;
+        }
+        if self.restart.restarts >= policy.max_restarts {
+            return Some(DegradedReason::RestartBudget);
+        }
+        let recent = self
+            .recent
+            .iter()
+            .skip_while(|at| now.saturating_sub(**at) >= policy.window)
+            .count();
+        (recent >= policy.max_restarts_in_window as usize).then_some(DegradedReason::RestartWindow)
+    }
+
     fn budget_available(
         &mut self,
         now: Duration,
@@ -277,14 +298,7 @@ impl Entry {
         {
             self.recent.pop_front();
         }
-        let reason = if self.restart.restarts >= policy.max_restarts {
-            Some(DegradedReason::RestartBudget)
-        } else if self.recent.len() >= policy.max_restarts_in_window as usize {
-            Some(DegradedReason::RestartWindow)
-        } else {
-            None
-        };
-        if let Some(reason) = reason {
+        if let Some(reason) = self.restart_denial(now, policy) {
             self.degrade(now, reason, events);
             return false;
         }
@@ -507,6 +521,30 @@ impl<C: Clock> ChildRecovery<C> {
         entry.stable = false;
         if !matches!(entry.state, RecoveryState::Degraded(_)) {
             entry.state = RecoveryState::Stopping;
+        }
+        Ok(())
+    }
+
+    /// Check the same allowance as the next launch without changing the running process.
+    pub(crate) fn check_replacement(
+        &self,
+        key: ChildKey,
+        now: Duration,
+    ) -> Result<(), DegradedReason> {
+        let Some(entry) = self.entries.get(&key) else {
+            return Ok(()); // Unregistered: this will be the first launch.
+        };
+        if let RecoveryState::Degraded(reason) = entry.state {
+            return Err(reason);
+        }
+        if let Some(reason) = entry.restart_denial(now, self.config.restart) {
+            return Err(reason);
+        }
+        if now < entry.not_before {
+            return Err(DegradedReason::RestartWindow);
+        }
+        if entry.generation.max(entry.generation_floor) == u64::MAX {
+            return Err(DegradedReason::GenerationExhausted);
         }
         Ok(())
     }
@@ -773,7 +811,7 @@ impl<C: Clock> ChildRecovery<C> {
                     host.cancel_identify(entry.key);
                     StartMode::GatewayResume
                 }
-                ChildRole::Gateway => match host.try_acquire_identify(entry.key) {
+                ChildRole::Gateway => match host.try_acquire_identify_at(entry.key, now) {
                     IdentifyAdmission::Granted => StartMode::GatewayIdentify,
                     IdentifyAdmission::Pending => {
                         entry.defer(now, DeferralReason::IdentifyBudget, &mut events);

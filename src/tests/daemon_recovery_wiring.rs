@@ -210,12 +210,16 @@ fn process_only_gateway_fixture() {
     }
     let bot = std::env::var("BOT_ID").unwrap();
     let expected = match bot.as_str() {
-        "A" => ("TOKEN_A", "wiring-fixture-a-only", "TOKEN_B"),
-        "B" => ("TOKEN_B", "wiring-fixture-b-only", "TOKEN_A"),
+        "A" => "wiring-fixture-a-only",
+        "B" => "wiring-fixture-b-only",
         _ => std::process::exit(91),
     };
-    if std::env::var(expected.0).ok().as_deref() != Some(expected.1)
-        || std::env::var_os(expected.2).is_some()
+    if std::env::var(src::placement::GATEWAY_TOKEN_ENV)
+        .ok()
+        .as_deref()
+        != Some(expected)
+        || std::env::var_os("TOKEN_A").is_some()
+        || std::env::var_os("TOKEN_B").is_some()
         || std::env::var_os("DISCORD_TOKEN").is_some()
         || std::env::var_os("PATH").is_some()
     {

@@ -5,11 +5,12 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::File,
     io::{self, Read, Write},
     os::{fd::AsRawFd, unix::net::UnixStream},
     path::Path,
+    sync::mpsc::{self, Receiver, SyncSender, TryRecvError},
     time::Duration,
 };
 use tokio::process::Command;
@@ -20,6 +21,9 @@ mod tests;
 const JOURNAL_NAME: &str = "identify-send-grants.jsonl";
 const MAX_JOURNAL: u64 = 16 * 1024 * 1024;
 const MAX_LINE: usize = 4096;
+const RECORD_SPACE: u64 = MAX_LINE as u64 + 1;
+const JOURNAL_VERSION: u8 = 2;
+const RETRY_JOURNAL_SPACE: Duration = Duration::from_millis(100);
 const UNAVAILABLE: LocalAdmission = LocalAdmission::Exhausted {
     retry_after: Duration::MAX,
 };
@@ -47,6 +51,25 @@ struct Record {
     version: u8,
     at_ns: u64,
     action: Action,
+    sha256: String,
+}
+
+impl Record {
+    fn checksum(&self) -> io::Result<String> {
+        use std::fmt::Write as _;
+        let canonical = serde_json::to_vec(&(self.version, self.at_ns, &self.action))?;
+        let hash = rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256
+            .tls13()
+            .expect("ring TLS 1.3 cipher suite")
+            .common
+            .hash_provider
+            .hash(&canonical);
+        let mut hex = String::with_capacity(64);
+        for byte in hash.as_ref() {
+            write!(hex, "{byte:02x}").expect("writing to a String");
+        }
+        Ok(hex)
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -66,11 +89,45 @@ enum Action {
     },
 }
 
-/// The one writer for the shared launch/send history. Calls take the current
+struct WriteRequest {
+    bytes: Vec<u8>,
+    ack: SyncSender<io::Result<()>>,
+}
+
+/// The worker owns the append descriptor and never touches daemon state.
+fn start_writer(
+    mut file: File,
+    mut before_sync: impl FnMut() + Send + 'static,
+) -> io::Result<SyncSender<WriteRequest>> {
+    let (sender, receiver) = mpsc::sync_channel::<WriteRequest>(1);
+    std::thread::Builder::new()
+        .name("identify-journal".into())
+        .spawn(move || {
+            while let Ok(request) = receiver.recv() {
+                let result = file.write_all(&request.bytes).and_then(|()| {
+                    before_sync();
+                    file.sync_all()
+                });
+                let failed = result.is_err();
+                let _ = request.ack.send(result);
+                if failed {
+                    break;
+                }
+            }
+        })?;
+    Ok(sender)
+}
+
+/// The admission state for the shared launch/send history. Calls take the current
 /// boot-relative time explicitly so replay and fault cases can be tested.
 struct Budget {
     journal: File,
+    writer: Option<SyncSender<WriteRequest>>,
+    write_ack: Option<Receiver<io::Result<()>>>,
     len: u64,
+    limit: u64,
+    restart_space: HashSet<ShardKey>,
+    first_grant_space: HashMap<ShardKey, LaunchGeneration>,
     policy: LocalIdentifyPolicy,
     history: HashMap<String, LocalIdentifyAdmission>,
     boot: Option<String>,
@@ -103,7 +160,12 @@ impl Budget {
         let complete = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
         let mut budget = Self {
             journal,
+            writer: None,
+            write_ack: None,
             len: complete as u64,
+            limit: MAX_JOURNAL,
+            restart_space: HashSet::new(),
+            first_grant_space: HashMap::new(),
             policy,
             history: HashMap::new(),
             boot: None,
@@ -116,7 +178,10 @@ impl Budget {
             if line.len() > MAX_LINE {
                 return Err(invalid_journal());
             }
-            let record = serde_json::from_slice(line).map_err(|_| invalid_journal())?;
+            let record: Record = serde_json::from_slice(line).map_err(|_| invalid_journal())?;
+            if record.version != JOURNAL_VERSION || record.sha256 != record.checksum()? {
+                return Err(invalid_journal());
+            }
             budget.replay(record)?;
         }
         if complete < bytes.len() {
@@ -186,14 +251,61 @@ impl Budget {
         }
     }
 
-    fn launch(&mut self, gateway: Gateway, now: Duration, slots: usize) -> LocalAdmission {
-        let admission = self.check(&gateway.key.bot_id, now, slots);
-        if admission == LocalAdmission::Granted
-            && self.append(now, Action::Launch { gateway }).is_err()
+    fn unreserved_bytes(&self) -> u64 {
+        let records = 2 * self.restart_space.len() + self.first_grant_space.len();
+        self.limit
+            .saturating_sub(self.len + RECORD_SPACE * records as u64)
+    }
+
+    fn reserve_restart_space(&mut self, targets: &[ShardKey]) -> bool {
+        if self.failed
+            || self.unreserved_bytes() < 2 * RECORD_SPACE * targets.len() as u64
+            || targets.iter().any(|key| self.restart_space.contains(key))
         {
+            return false;
+        }
+        self.restart_space.extend(targets.iter().cloned());
+        true
+    }
+
+    #[cfg(test)]
+    fn launch(&mut self, gateway: Gateway, now: Duration, slots: usize) -> LocalAdmission {
+        self.launch_with_reservation(gateway, now, slots, false)
+    }
+
+    fn launch_with_reservation(
+        &mut self,
+        gateway: Gateway,
+        now: Duration,
+        slots: usize,
+        reserved_restart: bool,
+    ) -> LocalAdmission {
+        let admission = self.check(&gateway.key.bot_id, now, slots);
+        if admission != LocalAdmission::Granted {
+            return admission;
+        }
+        if reserved_restart && !self.restart_space.remove(&gateway.key) {
             return UNAVAILABLE;
         }
-        admission
+        match self.append(
+            now,
+            Action::Launch {
+                gateway: gateway.clone(),
+            },
+        ) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                return LocalAdmission::Pending {
+                    retry_after: RETRY_JOURNAL_SPACE,
+                };
+            }
+            Err(_) => return UNAVAILABLE,
+        }
+        if reserved_restart {
+            self.first_grant_space
+                .insert(gateway.key, gateway.generation);
+        }
+        LocalAdmission::Granted
     }
 
     fn identify(
@@ -230,27 +342,56 @@ impl Budget {
             expires_ns,
             converts_launch,
         };
-        if self.append(now, action).is_err() {
-            return (State::Unavailable, Reply::Unavailable);
+        self.release_first_grant_space(&gateway.key, &gateway.generation);
+        match self.append(now, action) {
+            Ok(()) => (State::Granted, Reply::Permit(expires_ns)),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                (State::Waiting, Reply::Wait(nanos(RETRY_JOURNAL_SPACE)))
+            }
+            Err(_) => (State::Unavailable, Reply::Unavailable),
         }
-        (State::Granted, Reply::Permit(expires_ns))
+    }
+
+    fn release_first_grant_space(&mut self, key: &ShardKey, generation: &LaunchGeneration) {
+        if self.first_grant_space.get(key) == Some(generation) {
+            self.first_grant_space.remove(key);
+        }
     }
 
     fn append(&mut self, at: Duration, action: Action) -> io::Result<()> {
-        let record = Record {
-            version: VERSION,
+        let mut record = Record {
+            version: JOURNAL_VERSION,
             at_ns: nanos(at),
             action,
+            sha256: String::new(),
         };
+        record.sha256 = record.checksum()?;
+        let mut bytes = serde_json::to_vec(&record)?;
+        if bytes.len() > MAX_LINE || bytes.len() as u64 + 1 > self.limit.saturating_sub(self.len) {
+            return Err(io::Error::other("Identify grant journal full"));
+        }
+        if bytes.len() as u64 + 1 > self.unreserved_bytes() {
+            // A pending restart owns the remaining room and can still release it.
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        bytes.push(b'\n');
         let result = (|| {
-            let mut bytes = serde_json::to_vec(&record)?;
-            if bytes.len() > MAX_LINE || self.len + bytes.len() as u64 + 1 > MAX_JOURNAL {
-                return Err(io::Error::other("Identify grant journal full"));
+            let len = bytes.len() as u64;
+            if let Some(writer) = &self.writer {
+                debug_assert!(self.write_ack.is_none(), "one submitted write at a time");
+                let (ack, result) = mpsc::sync_channel(1);
+                writer
+                    .try_send(WriteRequest { bytes, ack })
+                    .map_err(|_| io::Error::other("Identify grant journal worker unavailable"))?;
+                self.write_ack = Some(result);
+            } else {
+                // Startup replay and its boot marker finish before the owner loop.
+                self.journal.write_all(&bytes)?;
+                self.journal.sync_all()?;
             }
-            bytes.push(b'\n');
-            self.journal.write_all(&bytes)?;
-            self.journal.sync_all()?;
-            self.len += bytes.len() as u64;
+            // Conservatively count a submitted write immediately. Its result
+            // cannot reach a Gateway or authorize spawn before the worker ACK.
+            self.len += len;
             self.replay(record)
         })();
         if result.is_err() {
@@ -260,9 +401,6 @@ impl Budget {
     }
 
     fn replay(&mut self, record: Record) -> io::Result<()> {
-        if record.version != VERSION {
-            return Err(invalid_journal());
-        }
         let at = Duration::from_nanos(record.at_ns);
         if let Action::Boot {
             boot_id,
@@ -358,44 +496,224 @@ struct Peer {
     state: State,
 }
 
+impl Peer {
+    fn reply(&mut self, (state, reply): (State, Reply)) -> bool {
+        self.state = state;
+        self.socket.write_all(&reply.encode()).is_ok() && state != State::Unavailable
+    }
+}
+
+struct PendingLaunch {
+    gateway: Gateway,
+    standby: bool,
+    durable: bool,
+}
+
+enum WriteTarget {
+    Launch,
+    Grant { gateway: Gateway, expires_ns: u64 },
+}
+
+struct PendingWrite {
+    ack: Receiver<io::Result<()>>,
+    target: WriteTarget,
+}
+
 pub(crate) struct Service {
     budget: Budget,
     peers: Vec<Peer>,
+    launch: Option<PendingLaunch>,
+    launch_waiting: bool,
+    write: Option<PendingWrite>,
 }
 
 impl Service {
     pub(crate) fn open(root: &Path, policy: LocalIdentifyPolicy) -> io::Result<Self> {
         let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+        Self::with_writer(Budget::open(root, boot.trim(), boot_now()?, policy)?, || {})
+    }
+
+    fn with_writer(
+        mut budget: Budget,
+        before_sync: impl FnMut() + Send + 'static,
+    ) -> io::Result<Self> {
+        budget.writer = Some(start_writer(budget.journal.try_clone()?, before_sync)?);
         Ok(Self {
-            budget: Budget::open(root, boot.trim(), boot_now()?, policy)?,
+            budget,
             peers: Vec::new(),
+            launch: None,
+            launch_waiting: false,
+            write: None,
         })
     }
 
     pub(crate) fn check(&mut self, bot: &str, slots: usize) -> LocalAdmission {
+        self.settle_write(false);
         match self.observe_clock() {
             Some(now) => self.budget.check(bot, now, slots),
             None => UNAVAILABLE,
         }
     }
 
+    /// An in-flight write defers launch on the owner loop. Exactly one launch
+    /// owns the next process sequence until its ACK is consumed or cancelled.
     pub(crate) fn launch(
         &mut self,
         key: &ShardKey,
         generation: LaunchGeneration,
-        slots: usize,
-    ) -> LocalAdmission {
+        standby: bool,
+        reserved_restart: bool,
+    ) -> Result<LocalAdmission, crate::local_identify::JournalPending> {
+        use crate::local_identify::JournalPending;
+        self.settle_write(false);
         let Some(now) = self.observe_clock() else {
-            return UNAVAILABLE;
+            return Ok(UNAVAILABLE);
         };
-        self.budget.launch(
-            Gateway {
-                key: key.clone(),
-                generation,
-            },
-            now,
-            slots,
-        )
+        if self.budget.observe(now).is_err() {
+            return Ok(UNAVAILABLE);
+        }
+        if let Some(launch) = &self.launch {
+            if launch.gateway.key != *key || launch.standby != standby || !launch.durable {
+                return Err(JournalPending);
+            }
+            if launch.gateway.generation != generation {
+                self.fail_journal();
+                return Ok(UNAVAILABLE);
+            }
+            self.launch = None;
+            return Ok(LocalAdmission::Granted);
+        }
+        if self.write.is_some() {
+            self.launch_waiting = true;
+            return Err(JournalPending);
+        }
+        self.launch_waiting = false;
+        let gateway = Gateway {
+            key: key.clone(),
+            generation,
+        };
+        let slots = if standby { 2 } else { 1 };
+        let admission =
+            self.budget
+                .launch_with_reservation(gateway.clone(), now, slots, reserved_restart);
+        if self.queue_ack(WriteTarget::Launch) {
+            self.launch = Some(PendingLaunch {
+                gateway,
+                standby,
+                durable: false,
+            });
+            return Err(JournalPending);
+        }
+        Ok(admission)
+    }
+
+    pub(crate) fn cancel_launch(&mut self, key: &ShardKey, standby: bool) -> Option<u64> {
+        if self
+            .launch
+            .as_ref()
+            .is_some_and(|launch| launch.gateway.key == *key && launch.standby == standby)
+        {
+            let launch = self.launch.take().unwrap();
+            self.budget
+                .release_first_grant_space(key, &launch.gateway.generation);
+            return Some(launch.gateway.generation.sequence);
+        }
+        None
+    }
+
+    fn queue_ack(&mut self, target: WriteTarget) -> bool {
+        if let Some(ack) = self.budget.write_ack.take() {
+            debug_assert!(self.write.is_none());
+            self.write = Some(PendingWrite { ack, target });
+            return true;
+        }
+        false
+    }
+
+    fn fail_journal(&mut self) {
+        self.budget.failed = true;
+        eprintln!("{}", super::JOURNAL_UNAVAILABLE_LOG);
+    }
+
+    /// Only the direct, synchronous Daemon::start compatibility API waits.
+    /// The daemon control plane and automatic recovery always use try_recv.
+    pub(crate) fn wait_for_write(&mut self) -> bool {
+        let was_pending = self.write.is_some();
+        self.settle_write(true);
+        was_pending
+    }
+
+    fn settle_write(&mut self, wait: bool) {
+        let Some(write) = &self.write else {
+            return;
+        };
+        let result = if wait {
+            write.ack.recv().map_err(|_| TryRecvError::Disconnected)
+        } else {
+            write.ack.try_recv()
+        };
+        if matches!(result, Err(TryRecvError::Empty)) {
+            return;
+        }
+        let target = self.write.take().unwrap().target;
+        if !matches!(result, Ok(Ok(()))) {
+            self.fail_journal();
+        }
+        match target {
+            WriteTarget::Launch => {
+                if let Some(launch) = &mut self.launch {
+                    launch.durable = !self.budget.failed;
+                }
+            }
+            WriteTarget::Grant {
+                gateway,
+                expires_ns,
+            } => {
+                let state_and_reply = match self.observe_clock() {
+                    Some(now) if self.budget.observe(now).is_ok() => {
+                        if nanos(now) < expires_ns {
+                            (State::Granted, Reply::Permit(expires_ns))
+                        } else {
+                            (
+                                State::Waiting,
+                                Reply::Wait(nanos(Duration::from_millis(25))),
+                            )
+                        }
+                    }
+                    _ => (State::Unavailable, Reply::Unavailable),
+                };
+                self.peers.retain_mut(|peer| {
+                    if peer.gateway != gateway {
+                        return true;
+                    }
+                    peer.first = false; // The submitted charge is never refunded.
+                    peer.reply(state_and_reply)
+                });
+            }
+        }
+    }
+
+    pub(crate) fn reserve_restart_space(&mut self, targets: &[ShardKey]) -> bool {
+        self.budget.reserve_restart_space(targets)
+    }
+
+    pub(crate) fn release_restart_space(&mut self, targets: &[ShardKey]) {
+        for key in targets {
+            self.budget.restart_space.remove(key);
+        }
+    }
+
+    pub(crate) fn release_first_grant_space(
+        &mut self,
+        key: &ShardKey,
+        generation: &LaunchGeneration,
+    ) {
+        self.budget.release_first_grant_space(key, generation);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn limit_journal_remaining(&mut self, records: u64) {
+        self.budget.limit = self.budget.len + RECORD_SPACE * records;
     }
 
     fn observe_clock(&mut self) -> Option<Duration> {
@@ -450,23 +768,35 @@ impl Service {
                 peer.standby = false;
                 true
             } else {
+                self.budget
+                    .release_first_grant_space(&peer.gateway.key, &peer.gateway.generation);
                 false
             }
         });
     }
 
     pub(crate) fn poll(&mut self, reservations: impl Fn(&str) -> (bool, bool)) {
-        self.poll_with_clock(reservations, boot_now);
-    }
-
-    fn poll_with_clock(
-        &mut self,
-        reservations: impl Fn(&str) -> (bool, bool),
-        now: impl Fn() -> io::Result<Duration>,
-    ) {
+        self.settle_write(false);
+        if self.write.is_some() {
+            return;
+        }
+        // Give a management launch waiting for this writer a tick to submit
+        // before another peer starts a new sync.
+        if std::mem::take(&mut self.launch_waiting) {
+            return;
+        }
         let budget = &mut self.budget;
+        let standby_launch_bot = self
+            .launch
+            .as_ref()
+            .filter(|launch| launch.standby)
+            .map(|launch| launch.gateway.key.bot_id.as_str());
+        let mut grant = None;
         self.peers.sort_by_key(|peer| peer.standby);
         self.peers.retain_mut(|peer| {
+            if grant.is_some() {
+                return true;
+            }
             let mut request = [0; 2];
             match peer.socket.read(&mut request) {
                 Ok(1) if request[0] == VERSION => {}
@@ -478,22 +808,42 @@ impl Service {
                 {
                     return true;
                 }
-                _ => return false,
+                _ => {
+                    budget.release_first_grant_space(&peer.gateway.key, &peer.gateway.generation);
+                    return false;
+                }
             }
             let (restart, fallback) = reservations(&peer.gateway.key.bot_id);
-            let (state, reply) = match now() {
-                Ok(now) => budget.identify(&peer.gateway, now, peer.first, restart, fallback),
+            let (state, reply) = match boot_now() {
+                Ok(now) => budget.identify(
+                    &peer.gateway,
+                    now,
+                    peer.first,
+                    restart,
+                    fallback || standby_launch_bot == Some(peer.gateway.key.bot_id.as_str()),
+                ),
                 Err(_) => {
                     budget.failed = true;
                     (State::Unavailable, Reply::Unavailable)
                 }
             };
-            peer.state = state;
-            if state == State::Granted {
-                peer.first = false;
+            if let Reply::Permit(expires_ns) = reply {
+                grant = Some(WriteTarget::Grant {
+                    gateway: peer.gateway.clone(),
+                    expires_ns,
+                });
+                peer.state = State::Waiting;
+                return true;
             }
-            peer.socket.write_all(&reply.encode()).is_ok() && state != State::Unavailable
+            let keep = peer.reply((state, reply));
+            if !keep {
+                budget.release_first_grant_space(&peer.gateway.key, &peer.gateway.generation);
+            }
+            keep
         });
+        if let Some(grant) = grant {
+            assert!(self.queue_ack(grant), "grant has a pending durable write");
+        }
     }
 
     pub(crate) fn status(&self, key: &ShardKey) -> serde_json::Value {

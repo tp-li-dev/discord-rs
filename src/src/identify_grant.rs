@@ -11,7 +11,7 @@ pub const GATEWAY_FD_FLAG: &str = "--identify-grant-v1-fd";
 const VERSION: u8 = 1;
 const REPLY_LEN: usize = 10;
 const PERMIT_TTL: Duration = Duration::from_secs(2);
-const RPC_TIMEOUT: Duration = Duration::from_secs(2);
+const JOURNAL_UNAVAILABLE_LOG: &str = "Identify send grant journal unavailable";
 const UNAVAILABLE_LOG: &str = "Identify send grant unavailable";
 
 #[derive(Clone, Copy)]

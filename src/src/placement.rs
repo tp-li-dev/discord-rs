@@ -116,6 +116,7 @@ pub struct BotPlacement {
     pub name: String,
     pub bot_id: String,
     pub application_id: String,
+    #[serde(deserialize_with = "deserialize_token_env")]
     pub token_env: String,
     pub total_shards: ShardCount,
     #[serde(default)]
@@ -141,6 +142,63 @@ impl fmt::Display for PlacementError {
     }
 }
 impl std::error::Error for PlacementError {}
+
+/// Private credential slot in processes started by botd.
+pub const GATEWAY_TOKEN_ENV: &str = "DISCORD_RS_GATEWAY_TOKEN";
+
+/// Provisioning names have a dedicated TOKEN component and may not use
+/// namespaces interpreted by the loader, runtimes, or process setup.
+pub fn valid_token_env(name: &str) -> bool {
+    (3..=64).contains(&name.len())
+        && name.as_bytes()[0].is_ascii_uppercase()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+        && name.split('_').any(|part| part == "TOKEN")
+        && ![
+            GATEWAY_TOKEN_ENV,
+            "GCONV_PATH",
+            "LOCPATH",
+            "NLSPATH",
+            "HOSTALIASES",
+            "RES_OPTIONS",
+            "PATH",
+            "HOME",
+            "SHELL",
+            "IFS",
+            "BASH_ENV",
+            "ENV",
+            "NODE_OPTIONS",
+            "GLIBC_TUNABLES",
+            "SYSTEMROOT",
+        ]
+        .contains(&name)
+        && ![
+            "LD_",
+            "DYLD_",
+            "MALLOC_",
+            "GLIBC_",
+            "PYTHON",
+            "NODE_",
+            "RUST_",
+            "SSL_CERT_",
+            "BASH_",
+            "GCONV_",
+            "RES_",
+            "NSS_",
+        ]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+}
+
+fn deserialize_token_env<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    let name = String::deserialize(d)?;
+    if valid_token_env(&name) {
+        Ok(name)
+    } else {
+        Err(serde::de::Error::custom("invalid token_env reference"))
+    }
+}
 
 /// Checks identities and placement after resolving each automatic shard count
 /// from Discord. Missing resolution is an error, never permission to start.
@@ -171,13 +229,7 @@ pub fn validate(
                 "duplicate bot name, bot_id or application_id".into(),
             ));
         }
-        // Restrict references to portable environment variable names, never token values.
-        let mut chars = bot.token_env.chars();
-        if !chars
-            .next()
-            .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
-            || !chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
-        {
+        if !valid_token_env(&bot.token_env) {
             return Err(PlacementError("invalid token_env reference".into()));
         }
         let total = match bot.total_shards {
@@ -348,6 +400,25 @@ mod tests {
         b.shard_placement[0].failover.push("a".into());
         assert!(validate(&[b], &counts).is_err());
     }
+    #[test]
+    fn credential_names_are_checked_during_deserialization() {
+        let mut config_bot = serde_json::to_value(bot()).unwrap();
+        for allowed in ["DISCORD_TEST_BOT_TOKEN", "TOKEN_ALPHA"] {
+            config_bot["token_env"] = allowed.into();
+            assert!(serde_json::from_value::<BotPlacement>(config_bot.clone()).is_ok());
+        }
+        for denied in [
+            "LD_PRELOAD",
+            "LD_CUSTOM_TOKEN",
+            "GCONV_PATH",
+            "PYTHON_TOKEN",
+            GATEWAY_TOKEN_ENV,
+        ] {
+            config_bot["token_env"] = denied.into();
+            assert!(serde_json::from_value::<BotPlacement>(config_bot.clone()).is_err());
+        }
+    }
+
     #[test]
     fn loads_sample_and_checks_timing_and_auto_resolution() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/placement.toml");

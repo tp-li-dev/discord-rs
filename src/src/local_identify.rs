@@ -203,6 +203,10 @@ impl LocalIdentifyAdmission {
     }
 }
 
+/// Runtime journal work is still outstanding. The owner retries on a later tick.
+#[derive(Debug)]
+pub(crate) struct JournalPending;
+
 /// Independent history per Bot ID.
 #[derive(Default)]
 pub struct LocalIdentifyRegistry {
@@ -253,29 +257,29 @@ impl LocalIdentifyRegistry {
         now: Duration,
         standby: bool,
         reserved_restart: bool,
-    ) -> LocalAdmission {
+    ) -> Result<LocalAdmission, JournalPending> {
         let bot = &key.bot_id;
         #[cfg(target_os = "linux")]
         if let Some(service) = &mut self.send_grants {
             if !reserved_restart && self.restart_slots.contains_key(bot) {
-                return LocalAdmission::Pending {
+                return Ok(LocalAdmission::Pending {
                     retry_after: Duration::ZERO,
-                };
+                });
             }
-            let admission = service.launch(key, _generation, if standby { 2 } else { 1 });
+            let admission = service.launch(key, _generation, standby, reserved_restart)?;
             if admission == LocalAdmission::Granted && reserved_restart {
                 self.take_restart_slot(bot);
             }
-            return admission;
+            return Ok(admission);
         }
-        if reserved_restart {
+        Ok(if reserved_restart {
             self.consume_restart(bot, now);
             LocalAdmission::Granted
         } else if standby {
             self.try_acquire_standby(bot, now)
         } else {
             self.try_acquire(bot, now)
-        }
+        })
     }
 
     #[cfg(target_os = "linux")]

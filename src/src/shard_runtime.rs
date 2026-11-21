@@ -72,23 +72,6 @@ impl fmt::Display for RuntimePlanError {
 }
 impl std::error::Error for RuntimePlanError {}
 
-fn token_reference(value: &str) -> bool {
-    let mut chars = value.chars();
-    chars
-        .next()
-        .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
-        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
-        && ![
-            "BOT_ID",
-            "SHARD_ID",
-            "TOTAL_SHARDS",
-            "GENERATION_ID",
-            "SYSTEMROOT",
-            test_switch::LAUNCH_ENV,
-        ]
-        .contains(&value.to_ascii_uppercase().as_str())
-}
-
 /// Generate a deterministic plan beneath a native absolute root (Path::join,
 /// never shell strings). IDs are encoded injectively into portable components.
 /// The root is trusted deployment configuration; no filesystem is accessed.
@@ -117,7 +100,7 @@ pub fn plan(
             || intent.bot_id.chars().any(char::is_control)
             || intent.total_shards == 0
             || intent.shard_id >= intent.total_shards
-            || !token_reference(&intent.token_env)
+            || !crate::placement::valid_token_env(&intent.token_env)
         {
             return Err(RuntimePlanError("invalid shard intent"));
         }
@@ -171,7 +154,7 @@ pub fn plan(
             if role == Role::Gateway {
                 args.extend([
                     OsString::from("--token-env"),
-                    OsString::from(&intent.token_env),
+                    OsString::from(crate::placement::GATEWAY_TOKEN_ENV),
                 ]);
             }
             processes.push(ProcessSpec {

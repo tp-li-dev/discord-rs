@@ -58,6 +58,231 @@ fn gateway(shard_id: u32, sequence: u64) -> Gateway {
     }
 }
 
+#[tokio::test]
+async fn cancelling_an_in_flight_launch_keeps_its_charge_and_releases_the_writer() {
+    use tokio::sync::oneshot;
+    use tokio::time::{sleep, timeout};
+
+    let root = Root::new();
+    let budget = Budget::open(
+        &root.0,
+        BOOT,
+        boot_now().unwrap(),
+        LocalIdentifyPolicy::default(),
+    )
+    .unwrap();
+    let (entered, entered_sync) = oneshot::channel();
+    let (release, release_sync) = mpsc::channel();
+    let mut entered = Some(entered);
+    let mut service = Service::with_writer(budget, move || {
+        if let Some(entered) = entered.take() {
+            entered.send(()).unwrap();
+            release_sync.recv_timeout(secs(5)).unwrap();
+        }
+    })
+    .unwrap();
+    let first = gateway(0, 1);
+    let mut other = gateway(0, 2);
+    other.key.bot_id = "43".into();
+
+    assert!(
+        service
+            .launch(&first.key, first.generation.clone(), false, false)
+            .is_err()
+    );
+    timeout(secs(3), entered_sync).await.unwrap().unwrap();
+    assert!(
+        service
+            .launch(&first.key, first.generation.clone(), false, false)
+            .is_err(),
+        "launch must wait for a durable record"
+    );
+    assert_eq!(service.cancel_launch(&first.key, false), Some(1));
+    assert!(
+        service
+            .launch(&other.key, other.generation.clone(), false, false)
+            .is_err()
+    );
+    release.send(()).unwrap();
+
+    timeout(secs(3), async {
+        loop {
+            match service.launch(&other.key, other.generation.clone(), false, false) {
+                Ok(result) => {
+                    assert_eq!(result, LocalAdmission::Granted);
+                    break;
+                }
+                Err(_) => sleep(Duration::from_millis(5)).await,
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        service.check(&first.key.bot_id, 1),
+        LocalAdmission::Pending { .. }
+    ));
+    let journal = std::fs::read_to_string(root.path()).unwrap();
+    let generations: Vec<u64> = journal
+        .lines()
+        .map(|line| serde_json::from_str::<Record>(line).unwrap())
+        .filter_map(|record| match record.action {
+            Action::Launch { gateway } => Some(gateway.generation.sequence),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(generations, [1, 2]);
+}
+
+#[tokio::test]
+async fn slow_sync_keeps_the_owner_and_both_grant_channels_live() {
+    use crate::identify_grant::GrantQueue;
+    use tokio::sync::oneshot;
+    use tokio::time::{Instant, sleep, timeout};
+    use twilight_gateway_queue::{InMemoryQueue, Queue};
+
+    let root = Root::new();
+    let policy = LocalIdentifyPolicy {
+        min_interval: Duration::ZERO,
+        max_per_window: 4,
+        ..Default::default()
+    };
+    let budget = Budget::open(&root.0, BOOT, boot_now().unwrap(), policy).unwrap();
+    let (entered, entered_sync) = oneshot::channel();
+    let (release, release_sync) = mpsc::channel();
+    let mut entered = Some(entered);
+    let mut service = Service::with_writer(budget, move || {
+        if let Some(entered) = entered.take() {
+            entered.send(()).unwrap();
+            release_sync.recv_timeout(secs(8)).unwrap();
+        }
+    })
+    .unwrap();
+
+    let mut connect = |gateway| {
+        let (socket, client) = UnixStream::pair().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        client.set_nonblocking(true).unwrap();
+        service.peers.push(Peer {
+            gateway,
+            socket,
+            first: true,
+            standby: false,
+            state: State::AwaitingRequest,
+        });
+        let client = tokio::net::UnixStream::from_std(client).unwrap();
+        let local = InMemoryQueue::new(0, 0, secs(1), 0);
+        GrantQueue::new(local, client, 0)
+    };
+    let first = gateway(0, 1);
+    let a = connect(first.clone());
+    let mut second = gateway(0, 2);
+    second.key.bot_id = "43".into();
+    let b = connect(second);
+    let mut a_permit = a.enqueue(0);
+    let mut entered_sync = entered_sync;
+    timeout(secs(3), async {
+        loop {
+            service.poll(|_| (false, false));
+            match entered_sync.try_recv() {
+                Ok(()) => break,
+                Err(oneshot::error::TryRecvError::Empty) => sleep(Duration::from_millis(5)).await,
+                Err(error) => panic!("{error}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+
+    let mut b_permit = b.enqueue(0);
+    let until = Instant::now() + Duration::from_millis(2200);
+    let mut ticks = 0;
+    while Instant::now() < until {
+        service.poll(|_| (false, false));
+        ticks += 1;
+        assert!(matches!(
+            a_permit.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            b_permit.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        sleep(Duration::from_millis(10)).await;
+    }
+    assert!(ticks > 10, "the owner continued polling during the sync");
+    assert_eq!(service.status(&first.key)["active"], "waiting");
+    release.send(()).unwrap();
+
+    // The first durable record expired in the sync. The other client must
+    // receive its own permit, and the first must retry on the same socket.
+    timeout(secs(4), async {
+        let (mut a_ready, mut b_ready) = (false, false);
+        while !a_ready || !b_ready {
+            service.poll(|_| (false, false));
+            if !a_ready && a_permit.try_recv().is_ok() {
+                assert!(a.take_permit());
+                a_ready = true;
+            }
+            if !b_ready && b_permit.try_recv().is_ok() {
+                assert!(b.take_permit());
+                b_ready = true;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let journal = std::fs::read_to_string(root.path()).unwrap();
+    let grants: Vec<Record> = journal
+        .lines()
+        .map(|line| serde_json::from_str::<Record>(line).unwrap())
+        .filter(|record| matches!(record.action, Action::Grant { .. }))
+        .collect();
+    assert_eq!(grants.len(), 3, "expired charge plus two usable permits");
+}
+
+#[test]
+fn other_records_cannot_consume_restart_launch_and_first_grant_space() {
+    let root = Root::new();
+    let mut budget = root.budget(BOOT, 0, 4).unwrap();
+    let replacement = gateway(0, 1);
+    let mut unrelated = gateway(0, 2);
+    unrelated.key.bot_id = "43".into();
+    budget.limit = budget.len + 2 * RECORD_SPACE;
+    assert!(budget.reserve_restart_space(std::slice::from_ref(&replacement.key)));
+    assert_eq!(
+        budget.launch(unrelated.clone(), secs(0), 1),
+        LocalAdmission::Pending {
+            retry_after: RETRY_JOURNAL_SPACE
+        }
+    );
+    assert_eq!(
+        budget.launch_with_reservation(replacement.clone(), secs(0), 1, true),
+        LocalAdmission::Granted
+    );
+    assert_eq!(
+        budget.first_grant_space.get(&replacement.key),
+        Some(&replacement.generation)
+    );
+
+    // Use the rest of the unreserved space. The first grant must still fit.
+    budget.limit = budget.len + RECORD_SPACE;
+    assert_eq!(
+        budget.identify(&unrelated, secs(0), false, false, false).0,
+        State::Waiting
+    );
+    assert_eq!(
+        budget.identify(&replacement, secs(0), true, false, false).0,
+        State::Granted
+    );
+    assert!(budget.first_grant_space.is_empty());
+    assert_eq!(
+        budget.identify(&unrelated, secs(0), false, false, false).0,
+        State::Granted
+    );
+}
+
 #[test]
 fn first_send_replaces_its_launch_even_if_hello_arrives_after_another_shard() {
     let root = Root::new();
@@ -160,6 +385,55 @@ fn torn_tail_is_discarded_but_a_corrupt_complete_record_fails_closed() {
     }
     append(b"{\"version\":1\n");
     assert!(root.budget(BOOT, 3601, 1).is_err());
+}
+
+#[test]
+fn valid_json_with_a_changed_bot_id_is_rejected_without_repair() {
+    let root = Root::new();
+    {
+        let mut budget = root.budget(BOOT, 0, 4).unwrap();
+        let active = gateway(0, 1);
+        assert_eq!(
+            budget.launch(active.clone(), secs(0), 1),
+            LocalAdmission::Granted
+        );
+        assert_eq!(
+            budget.identify(&active, secs(0), true, false, false).0,
+            State::Granted
+        );
+        assert_eq!(
+            budget.identify(&active, secs(32), false, false, false).0,
+            State::Granted
+        );
+    }
+
+    let journal = std::fs::read_to_string(root.path()).unwrap();
+    let mut lines: Vec<_> = journal.lines().map(str::to_owned).collect();
+    let mut last: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+    assert_eq!(last["action"]["converts_launch"], false);
+    assert_eq!(last["action"]["gateway"]["key"]["bot_id"], "42");
+    last["action"]["gateway"]["key"]["bot_id"] = "43".into();
+    *lines.last_mut().unwrap() = last.to_string();
+    let corrupt = lines.join("\n") + "\n";
+    std::fs::write(root.path(), &corrupt).unwrap();
+    assert!(root.budget(BOOT, 33, 4).is_err());
+    assert_eq!(std::fs::read_to_string(root.path()).unwrap(), corrupt);
+}
+
+#[test]
+fn old_format_complete_records_are_rejected_on_either_boot() {
+    let root = Root::new();
+    let old = serde_json::json!({
+        "version": 1,
+        "at_ns": 0,
+        "action": {"kind": "boot", "boot_id": BOOT, "hold_until_ns": 0},
+    })
+    .to_string()
+        + "\n";
+    std::fs::write(root.path(), &old).unwrap();
+    assert!(root.budget(BOOT, 0, 4).is_err());
+    assert!(root.budget(ANOTHER_BOOT, 0, 4).is_err());
+    assert_eq!(std::fs::read_to_string(root.path()).unwrap(), old);
 }
 
 #[test]
