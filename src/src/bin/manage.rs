@@ -517,9 +517,72 @@ async fn write_endpoint(endpoint: &Endpoint, name: &str) -> Result<(), ErrorBox>
     std::fs::rename(temp, dir.join(name))?;
     Ok(())
 }
+fn read_endpoint_file(path: &Path) -> Result<Endpoint, ErrorBox> {
+    use std::io::Read;
+
+    const MAX_ENDPOINT_BYTES: usize = 1024;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            Box::new(error) as ErrorBox
+        } else {
+            failure(Diagnostic::ControlAuthenticationFailed)
+        }
+    })?;
+    let metadata = file.metadata()?;
+    let denied = || failure(Diagnostic::ControlAuthenticationFailed);
+    if !metadata.is_file() || metadata.len() > MAX_ENDPOINT_BYTES as u64 {
+        return Err(denied());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions.
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & (0o7777 & !0o600) != 0
+        {
+            return Err(denied());
+        }
+    }
+    let mut bytes = Vec::new();
+    let result = file
+        .take((MAX_ENDPOINT_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| denied())
+        .and_then(|_| {
+            if bytes.len() > MAX_ENDPOINT_BYTES {
+                return Err(denied());
+            }
+            serde_json::from_slice(&bytes).map_err(|error| Box::new(error) as ErrorBox)
+        });
+    src::secret_file::wipe(&mut bytes);
+    result
+}
+
+async fn read_endpoint(
+    read: impl FnOnce() -> Result<Endpoint, ErrorBox> + Send + 'static,
+) -> Result<Endpoint, ErrorBox> {
+    let (send, receive) = oneshot::channel();
+    // A regular-file open or read can stall on the filesystem. A detached
+    // thread lets this short-lived CLI exit even if the kernel call stays blocked.
+    std::thread::Builder::new()
+        .name("manage-endpoint-read".into())
+        .spawn(move || {
+            let _ = send.send(read());
+        })?;
+    tokio::time::timeout(Duration::from_secs(2), receive)
+        .await
+        .map_err(|_| failure(Diagnostic::Timeout))??
+}
+
 async fn request(command: &str) -> Result<String, ErrorBox> {
-    let endpoint: Endpoint =
-        serde_json::from_slice(&tokio::fs::read(runtime_dir().join("core.json")).await?)?;
+    let path = runtime_dir().join("core.json");
+    let endpoint = read_endpoint(move || read_endpoint_file(&path)).await?;
     if endpoint.port != port()? {
         return Err(failure(Diagnostic::PortMismatch));
     }
@@ -929,11 +992,15 @@ async fn run() -> Result<(), ErrorBox> {
                     if error
                         .downcast_ref::<ProtectedFailure>()
                         .is_some_and(|failure| {
-                            matches!(failure.0, Diagnostic::ControlAuthenticationFailed)
+                            matches!(
+                                failure.0,
+                                Diagnostic::ControlAuthenticationFailed | Diagnostic::Timeout
+                            )
                         }) =>
                 {
                     return Err(error);
                 }
+                Err(error) if error.is::<serde_json::Error>() => return Err(error),
                 Err(_) => {}
             }
             if env::var_os("DISCORD_TOKEN").is_none_or(|v| v.is_empty()) {
@@ -973,6 +1040,67 @@ async fn run() -> Result<(), ErrorBox> {
 #[cfg(test)]
 mod request_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn endpoint_file_checks_the_opened_file_before_parsing() {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
+
+        let dir =
+            std::env::temp_dir().join(format!("manage-endpoint-{:x}", getrandom::u64().unwrap()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("core.json");
+        let bytes = serde_json::to_vec(&serde_json::json!({"port":39483,"secret":"01".repeat(32)}))
+            .unwrap();
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
+        assert_eq!(read_endpoint_file(&path).unwrap().port, 39483);
+        let link = dir.join("link.json");
+        symlink(&path, &link).unwrap();
+        assert!(matches!(read_endpoint_file(&link), Err(error)
+            if matches!(diagnostic(error.as_ref()), Diagnostic::ControlAuthenticationFailed)));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(read_endpoint_file(&path), Err(error)
+            if matches!(diagnostic(error.as_ref()), Diagnostic::ControlAuthenticationFailed)));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&path, [b' '; 1025]).unwrap();
+        assert!(read_endpoint_file(&path).is_err());
+
+        use std::os::unix::ffi::OsStrExt;
+        let fifo = dir.join("fifo");
+        let fifo_name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: fifo_name is NUL-terminated and lives through the call.
+        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+        assert!(read_endpoint_file(&fifo).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn endpoint_read_timeout_does_not_join_a_stalled_reader() {
+        let (entered, entered_rx) = oneshot::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let read = read_endpoint(move || {
+            entered.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Err(failure(Diagnostic::External))
+        });
+        let mut read = std::pin::pin!(read);
+        assert!(futures_util::poll!(&mut read).is_pending());
+        entered_rx.await.unwrap();
+        tokio::time::advance(Duration::from_secs(2) + Duration::from_millis(1)).await;
+        assert!(
+            matches!(futures_util::poll!(&mut read), std::task::Poll::Ready(Err(error))
+            if matches!(diagnostic(error.as_ref()), Diagnostic::Timeout))
+        );
+        release.send(()).unwrap();
+    }
 
     const FIXTURE: &str = "short-token-input short-secret-input short-key-input Authorization: Bearer short-header-input";
 
@@ -1197,6 +1325,15 @@ mod request_tests {
             serde_json::to_vec(&serde_json::json!({"port":port,"secret":admin})).unwrap(),
         )
         .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                directory.join("core.json"),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+        }
         let server = std::thread::spawn(move || {
             for ok in [true, false] {
                 let (socket, _) = listener.accept().unwrap();
