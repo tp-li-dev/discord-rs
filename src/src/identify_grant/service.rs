@@ -5,7 +5,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::File,
     io::{self, Read, Write},
     os::{fd::AsRawFd, unix::net::UnixStream},
@@ -630,6 +630,7 @@ pub(crate) struct Service {
     launch: Option<PendingLaunch>,
     launch_waiting: bool,
     write: Option<PendingWrite>,
+    restart_writer: HashSet<ShardKey>,
 }
 
 impl Service {
@@ -658,11 +659,26 @@ impl Service {
         self.settle_write(false);
         if self.budget.failed {
             Err(DaemonError::IdentifyUnavailable)
-        } else if self.write.is_some() || self.launch.is_some() || self.launch_waiting {
+        } else if self.write.is_some()
+            || self.launch.is_some()
+            || self.launch_waiting
+            || !self.restart_writer.is_empty()
+        {
             Err(DaemonError::IdentifyJournalBusy)
         } else {
             Ok(())
         }
+    }
+
+    /// The same owner tick reserves the writer and begins the first drain.
+    /// Peers and unrelated launches cannot submit until this restart finishes.
+    pub(crate) fn reserve_restart_writer(
+        &mut self,
+        targets: &[ShardKey],
+    ) -> Result<(), DaemonError> {
+        self.check_restart_writer()?;
+        self.restart_writer.extend(targets.iter().cloned());
+        Ok(())
     }
 
     fn with_writer(
@@ -676,6 +692,7 @@ impl Service {
             launch: None,
             launch_waiting: false,
             write: None,
+            restart_writer: HashSet::new(),
         })
     }
 
@@ -698,6 +715,11 @@ impl Service {
     ) -> Result<LocalAdmission, crate::local_identify::JournalPending> {
         use crate::local_identify::JournalPending;
         self.settle_write(false);
+        if !self.restart_writer.is_empty()
+            && !(reserved_restart && self.restart_writer.contains(key))
+        {
+            return Err(JournalPending);
+        }
         let Some(now) = self.observe_clock() else {
             return Ok(UNAVAILABLE);
         };
@@ -836,6 +858,7 @@ impl Service {
     pub(crate) fn release_restart_space(&mut self, targets: &[ShardKey]) {
         for key in targets {
             self.budget.restart_space.remove(key);
+            self.restart_writer.remove(key);
         }
     }
 
@@ -918,7 +941,7 @@ impl Service {
 
     pub(crate) fn poll(&mut self, reservations: impl Fn(&str) -> (bool, bool)) {
         self.settle_write(false);
-        if self.write.is_some() {
+        if self.write.is_some() || !self.restart_writer.is_empty() {
             return;
         }
         // Give a management launch waiting for this writer a tick to submit

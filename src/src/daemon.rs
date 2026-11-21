@@ -3846,12 +3846,12 @@ pub mod control {
                 self.finish(op);
                 return;
             }
-            // poll() can submit a new grant between admission and this first
-            // stop. Refuse while every target is still running.
+            // Reserve the writer before stopping any target. An unrelated
+            // grant can otherwise strand a drained Gateway behind its sync.
             if op.phase == Phase::Stopping
                 && op.next == 0
                 && op.is_restart()
-                && let Err(error) = self.daemon.check_restart_writer()
+                && let Err(error) = self.daemon.reserve_restart_writer(&op.targets)
             {
                 op.errors.insert(op.targets[0].clone(), error);
                 self.finish(op);
@@ -7635,6 +7635,104 @@ pub mod control {
 
             #[cfg(target_os = "linux")]
             #[tokio::test]
+            async fn restart_keeps_the_writer_after_first_stop_until_replacement() {
+                use std::io::{Read, Write};
+
+                let (mut plane, _) = fixture(2, 1, 10);
+                let root = std::env::temp_dir()
+                    .join(format!("igr-reserved-{:016x}", getrandom::u64().unwrap()));
+                let policy = LocalIdentifyPolicy {
+                    min_interval: Duration::ZERO,
+                    ..Default::default()
+                };
+                plane.daemon.set_local_identify_policy(policy);
+                let journal = root.join("identify-send-grants.jsonl");
+                let (entered, mut entered_sync) = tokio::sync::oneshot::channel();
+                let (release, release_sync) = std::sync::mpsc::channel();
+                let mut entered = Some(entered);
+                plane.daemon.local_identify.send_grants = Some(
+                    crate::identify_grant::service::Service::open_with_sync_hook(
+                        &root,
+                        policy,
+                        move || {
+                            let records = std::fs::read_to_string(&journal).unwrap();
+                            let last: Value =
+                                serde_json::from_str(records.lines().last().unwrap()).unwrap();
+                            if last["action"]["kind"] == "grant" {
+                                entered.take().unwrap().send(()).unwrap();
+                                let _ = release_sync.recv_timeout(Duration::from_secs(10));
+                            }
+                        },
+                    )
+                    .unwrap(),
+                );
+                let a = key(0, 0);
+                let b = key(1, 0);
+                plane.daemon.start(&a, &credentials).unwrap();
+                plane.daemon.start(&b, &credentials).unwrap();
+                let pid = running_pid(&plane, &b);
+                let generation = plane.daemon.entries[&a]
+                    .snapshot
+                    .identity
+                    .as_ref()
+                    .unwrap()
+                    .generation
+                    .clone();
+                let mut socket = plane
+                    .daemon
+                    .local_identify
+                    .send_grants
+                    .as_mut()
+                    .unwrap()
+                    .attach(
+                        &mut tokio::process::Command::new("/bin/true"),
+                        &a,
+                        generation,
+                        false,
+                    )
+                    .unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+
+                assert_eq!(plane.request(&request("restart", 1, 1))["ok"], true);
+                plane.tick(&credentials).await;
+                assert_eq!(plane.daemon.entries[&b].graceful_stop, Some(Ok(())));
+                assert!(!plane.daemon.entries[&b].snapshot.desired_running);
+                // Only now let A request a grant. On the old code it blocks B
+                // at the next tick, before the replacement can submit.
+                socket.write_all(&[1]).unwrap();
+                assert_eq!(
+                    complete(&mut plane, 1).await["operation"]["state"],
+                    "succeeded"
+                );
+                let replacement = running_pid(&plane, &b);
+                assert_ne!(replacement, pid);
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        plane.tick(&credentials).await;
+                        match entered_sync.try_recv() {
+                            Ok(()) => break,
+                            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+                            Err(error) => panic!("grant writer disappeared: {error}"),
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert_eq!(running_pid(&plane, &b), replacement);
+                release.send(()).unwrap();
+                let service = plane.daemon.local_identify.send_grants.as_mut().unwrap();
+                assert!(service.wait_for_write());
+                socket.read_exact(&mut [0; 10]).unwrap();
+                cleanup(&mut plane).await;
+                drop(plane);
+                std::fs::remove_dir_all(root).unwrap();
+            }
+
+            #[cfg(target_os = "linux")]
+            #[tokio::test]
             async fn restart_all_refuses_when_only_one_replacement_fits_in_the_journal() {
                 let (mut plane, _) = fixture(2, 1, 10);
                 plane.daemon.set_local_identify_policy(LocalIdentifyPolicy {
@@ -9278,6 +9376,14 @@ impl<C: Clock> Daemon<C> {
         #[cfg(target_os = "linux")]
         if let Some(service) = &mut self.local_identify.send_grants {
             return service.check_restart_writer();
+        }
+        Ok(())
+    }
+
+    fn reserve_restart_writer(&mut self, _targets: &[ShardKey]) -> Result<(), DaemonError> {
+        #[cfg(target_os = "linux")]
+        if let Some(service) = &mut self.local_identify.send_grants {
+            return service.reserve_restart_writer(_targets);
         }
         Ok(())
     }
