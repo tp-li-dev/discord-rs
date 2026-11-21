@@ -91,6 +91,10 @@ async fn cancelling_an_in_flight_launch_keeps_its_charge_and_releases_the_writer
             .is_err()
     );
     timeout(secs(3), entered_sync).await.unwrap().unwrap();
+    assert_eq!(
+        service.check_restart_writer(),
+        Err(DaemonError::IdentifyJournalBusy)
+    );
     assert!(
         service
             .launch(&first.key, first.generation.clone(), false, false)
@@ -104,6 +108,11 @@ async fn cancelling_an_in_flight_launch_keeps_its_charge_and_releases_the_writer
             .is_err()
     );
     release.send(()).unwrap();
+    assert!(service.wait_for_write());
+    assert_eq!(
+        service.check_restart_writer(),
+        Err(DaemonError::IdentifyJournalBusy)
+    );
 
     timeout(secs(3), async {
         loop {

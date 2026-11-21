@@ -1,6 +1,6 @@
 use super::{PERMIT_TTL, Reply, VERSION, boot_now, nanos};
 use crate::{
-    daemon::{LaunchGeneration, ShardKey},
+    daemon::{DaemonError, LaunchGeneration, ShardKey},
     local_identify::{LocalAdmission, LocalIdentifyAdmission, LocalIdentifyPolicy},
 };
 use serde::{Deserialize, Serialize};
@@ -537,6 +537,30 @@ impl Service {
     pub(crate) fn open(root: &Path, policy: LocalIdentifyPolicy) -> io::Result<Self> {
         let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
         Self::with_writer(Budget::open(root, boot.trim(), boot_now()?, policy)?, || {})
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_with_sync_hook(
+        root: &Path,
+        policy: LocalIdentifyPolicy,
+        before_sync: impl FnMut() + Send + 'static,
+    ) -> io::Result<Self> {
+        let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+        Self::with_writer(
+            Budget::open(root, boot.trim(), boot_now()?, policy)?,
+            before_sync,
+        )
+    }
+
+    pub(crate) fn check_restart_writer(&mut self) -> Result<(), DaemonError> {
+        self.settle_write(false);
+        if self.budget.failed {
+            Err(DaemonError::IdentifyUnavailable)
+        } else if self.write.is_some() || self.launch.is_some() || self.launch_waiting {
+            Err(DaemonError::IdentifyJournalBusy)
+        } else {
+            Ok(())
+        }
     }
 
     fn with_writer(

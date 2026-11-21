@@ -3570,6 +3570,11 @@ pub mod control {
                 // A new operation must not hold the shard with reserved recovery.
                 return Self::error("gateway fallback recovery pending; retry after recovery");
             }
+            if matches!(request.command.as_str(), "restart" | "restart-all")
+                && let Err(error) = self.daemon.check_restart_writer()
+            {
+                return Self::error(&format!("{error:?}"));
+            }
             // Explicit force stop supersedes an earlier drain/restart. The old
             // operation can never resume and launch a new generation afterwards.
             for id in active {
@@ -3826,6 +3831,17 @@ pub mod control {
                 for key in op.generations.keys() {
                     let _ = self.daemon.stop(key, StopMode::WaitForExit);
                 }
+                self.finish(op);
+                return;
+            }
+            // poll() can submit a new grant between admission and this first
+            // stop. Refuse while every target is still running.
+            if op.phase == Phase::Stopping
+                && op.next == 0
+                && op.is_restart()
+                && let Err(error) = self.daemon.check_restart_writer()
+            {
+                op.errors.insert(op.targets[0].clone(), error);
                 self.finish(op);
                 return;
             }
@@ -7442,6 +7458,110 @@ pub mod control {
 
             #[cfg(target_os = "linux")]
             #[tokio::test]
+            async fn restart_leaves_other_gateway_running_during_a_grant_sync() {
+                use std::io::{Read, Write};
+                use tokio::sync::oneshot;
+
+                let (mut plane, _) = fixture(2, 1, 10);
+                let root = std::env::temp_dir()
+                    .join(format!("igr-busy-{:016x}", getrandom::u64().unwrap()));
+                let policy = LocalIdentifyPolicy {
+                    min_interval: Duration::ZERO,
+                    ..Default::default()
+                };
+                let (entered, entered_sync) = oneshot::channel();
+                let (release, release_sync) = std::sync::mpsc::channel();
+                let mut entered = Some(entered);
+                let mut writes = 0;
+                plane.daemon.local_identify.send_grants = Some(
+                    crate::identify_grant::service::Service::open_with_sync_hook(
+                        &root,
+                        policy,
+                        move || {
+                            writes += 1;
+                            // The first two writes are A and B's startup launches.
+                            if writes == 3 {
+                                entered.take().unwrap().send(()).unwrap();
+                                release_sync.recv_timeout(Duration::from_secs(10)).unwrap();
+                            }
+                        },
+                    )
+                    .unwrap(),
+                );
+                let a = key(0, 0);
+                let b = key(1, 0);
+                plane.daemon.start(&a, &credentials).unwrap();
+                plane.daemon.start(&b, &credentials).unwrap();
+                let pid = running_pid(&plane, &b);
+                let generation = plane.daemon.entries[&a]
+                    .snapshot
+                    .identity
+                    .as_ref()
+                    .unwrap()
+                    .generation
+                    .clone();
+                let mut socket = plane
+                    .daemon
+                    .local_identify
+                    .send_grants
+                    .as_mut()
+                    .unwrap()
+                    .attach(
+                        &mut tokio::process::Command::new("/bin/true"),
+                        &a,
+                        generation,
+                        false,
+                    )
+                    .unwrap();
+
+                // A's grant starts in poll() after B's admission, before the first stop.
+                assert_eq!(plane.request(&request("restart", 1, 1))["ok"], true);
+                socket.write_all(&[1]).unwrap(); // Identify grant wire v1 request.
+                plane.tick(&credentials).await;
+                tokio::time::timeout(Duration::from_secs(2), entered_sync)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let refused = plane.request(&query(1));
+                assert_eq!(refused["operation"]["state"], "failed");
+                assert!(refused.to_string().contains("IdentifyJournalBusy"));
+
+                // The same busy state also refuses new requests at admission.
+                for id in 2..5 {
+                    assert_eq!(
+                        plane.request(&request("restart", 1, id))["error"],
+                        "IdentifyJournalBusy"
+                    );
+                    plane.tick(&credentials).await;
+                    assert_eq!(running_pid(&plane, &b), pid);
+                    assert!(!plane.daemon.entries[&b].restart_held);
+                }
+                assert_eq!(plane.operations.len(), 1);
+
+                release.send(()).unwrap();
+                assert!(
+                    plane
+                        .daemon
+                        .local_identify
+                        .send_grants
+                        .as_mut()
+                        .unwrap()
+                        .wait_for_write()
+                );
+                socket.read_exact(&mut [0; 10]).unwrap();
+                assert_eq!(plane.request(&request("restart", 1, 5))["ok"], true);
+                assert_eq!(
+                    complete(&mut plane, 5).await["operation"]["state"],
+                    "succeeded"
+                );
+                assert_ne!(running_pid(&plane, &b), pid);
+                cleanup(&mut plane).await;
+                drop(plane);
+                std::fs::remove_dir_all(root).unwrap();
+            }
+
+            #[cfg(target_os = "linux")]
+            #[tokio::test]
             async fn restart_all_refuses_when_only_one_replacement_fits_in_the_journal() {
                 let (mut plane, _) = fixture(2, 1, 10);
                 plane.daemon.set_local_identify_policy(LocalIdentifyPolicy {
@@ -8196,6 +8316,7 @@ pub enum DaemonError {
     IdentifyDeferred,
     IdentifyUnavailable,
     IdentifyJournalPending,
+    IdentifyJournalBusy,
     RestartBudget,
     RestartDeferred,
     NoRuntime,
@@ -9018,6 +9139,14 @@ impl<C: Clock> Daemon<C> {
         self.entries
             .values()
             .any(|entry| entry.snapshot.key.bot_id == bot_id && entry.update_fallback_reserved)
+    }
+
+    fn check_restart_writer(&mut self) -> Result<(), DaemonError> {
+        #[cfg(target_os = "linux")]
+        if let Some(service) = &mut self.local_identify.send_grants {
+            return service.check_restart_writer();
+        }
+        Ok(())
     }
 
     fn reserve_restart_identify(&mut self, targets: &[ShardKey]) -> Result<(), DaemonError> {
