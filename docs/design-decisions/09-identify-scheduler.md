@@ -44,10 +44,24 @@ B の追加には、起動時に継承する双方向のローカル IPC、ま�
 | 要求 | 間隔待ち・復旧枠の保護中 | 回数上限 |
 | --- | --- | --- |
 | 初回自動起動・自動復旧・更新失敗からの復旧 | `Deferred: IdentifyBudget` を監査に出し、監視 tick で再試行する。待機中は子を起動せず、再起動回数を消費しない。 | `Degraded: IdentifyUnavailable`。初回の同期的な拒否は起動結果にも反映する。 |
-| 手動 start / restart | 今回の既定案は明示的に `IdentifyDeferred` を返す。再試行は新たな操作とする。restart の起動段階で拒否された Shard は停止したままになる。 | `IdentifyUnavailable` で拒否する。 |
+| 手動 start / restart | `IdentifyDeferred` を返す。restart は停止前に拒否する。間隔が間もなく満了する場合も待機せず、再試行は新たな操作とする。 | `IdentifyUnavailable` で拒否する。restart は停止前に拒否する。 |
 | gateway-update の待機起動 | 既存の更新期限まで `waiting_reason: IdentifyBudget` を表示して待つ。期限切れは `IdentifyDeferred`。 | `IdentifyUnavailable` で失敗し、旧 Gateway を維持する。 |
 
 同じ Bot の更新後の復旧機会が保護されている間、管理操作による追加の再起動禁止が対象 Shard の復旧を妨げないよう、start / restart / gateway-update は受付時点で明示的に拒否する。
+
+## 手動 restart の停止前予約
+
+- 認証・対象確認・排他チェックの後、botd は新 Gateway の枠を Bot 単位で予約する。予約が全件成功するまで停止要求も自動復旧の保留も行わない。受付から起動まで、同じ Bot の通常起動・自動復旧・待機起動は予約を横取りできない。別 Bot の予算は独立している。
+- 予約した枠は停止中も保持し、`ChildRecovery` が代替 Gateway の起動を許可する時点で履歴に記録する。その時刻から次の許可間隔を数える。停止失敗・タイムアウト・操作の取り消しで終了した場合は、未使用の枠を解放する。起動を試みた枠は、spawn が失敗しても消費済みとする。
+- Bot 全体の restart、`--shard` リスト、`--guild` から解決した Shard リストも、対象全件の予約を一括で行う。既定の 30 秒間隔では同じ Bot の実 Gateway を複数同時に予約できない。回数枠が足りていても `IdentifyDeferred` を返すので、運用者は間隔を空けて 1 Shard ずつ操作する。枠の不足が判定された場合は `IdentifyUnavailable` を返す。明示的な模擬 Discord の起動は従来どおり実 Gateway の予算を使わない。
+- `botctl restart --all --yes` は認証済みの一件の操作として送信し、botd が全ローカル Shard を対象にする。Bot をまたいで検査し、後続の Bot が拒否された場合は先行 Bot の仮予約も返す。既存の操作上限である 64 Shard を適用する。実行結果には `operation.command` の `restart-all`、1 件の操作 ID と対象 Shard の結果が入る。`--dry-run` で対象 Bot と非ローカルの Bot を確認できる。実行には対応する botctl と botd が必要。
+- 予約を拒否したときは受付応答の `error` に固定値 `IdentifyDeferred` または `IdentifyUnavailable` を返し、その操作を登録しない。開始済みの操作は従来の操作 ID で照会でき、停止や起動の失敗は対象 Shard に固定のエラー名を返す。診断には秘密やファイルパスを含めない。一括性は Identify の受付に適用される。受付後に実際の停止や起動が失敗した場合は、すでに発行した停止を取り消せる保証はない。
+
+## 停止・削除と Identify の順序の確認
+
+- 通常の明示的な start は稼働中の Gateway を拒否し、停止済みの Shard を対象とする。残存する起動用ファイルの再取得や削除は、許可後の launch で生存確認を経て行う。自動復旧による許可待ちは既にプロセスが失われた Shard に対するもので、別 Shard の健全な Gateway を停止しない。
+- 通常の gateway-update は待機 Gateway の許可を得てから待機用マーカーを消去して spawn し、準備完了・昇格確認の後に旧 Gateway を停止する。昇格を送信すると epoch の下限が上がり、候補へ Core の所有権が移っている可能性がある。この段階で失敗した場合、旧 Gateway が安全にサービスを再開できる保証はない。ここでは既存どおり失敗した候補と旧 Gateway を終了し、事前に保護した復旧枠を間隔が満了した時点で使う。`standby_and_failed_activation_recovery_share_the_launch_budget` が待機・拒否での PID 維持、許可前のマーカー維持、昇格失敗時の停止・間隔待ち・境界での新 PID を確認する。
+- 明示的な模擬 rolling ランタイムでは候補を先に許可する。制御接続を失って受付を閉じた Gateway の終了処理も障害復旧に当たり、終了を観測した後の再起動には模擬の共有予算が適用される。`gateway_os_death_recovers_then_waits_when_the_shared_bot_identify_budget_is_spent` が OS 終了観測後に残量不足で起動せず、他の Shard と Bot が応答を続けることを確認する。
 
 ## 障害と隔離
 
@@ -60,11 +74,12 @@ B の追加には、起動時に継承する双方向のローカル IPC、ま�
 
 - 注入時計で間隔の直前と境界、時間枠の失効、2 枠の判定、逆行、拒否・延期で履歴が増えないことを確認する。
 - ローカルの子プロセスを使い、初回の同時起動、管理 start / restart、待機 Gateway、更新失敗後の復旧、自動復旧が同じ制限を受けることを確認する。同じ Bot の複数 Shard の同時要求で 1 件のみ起動できることと、別 Bot の起動が進むことを確認する。
+- 注入時計と実際の子プロセスで、回数枠・間隔による restart の拒否で PID が変わらないこと、停止要求失敗で未使用枠を返すこと、Shard リストと `--all` の予約を一括で拒否すること、保留中に同じ Bot の別途起動が枠を使えず別 Bot の restart は進むことを確認する。CLI と botd の結合試験では `--all` が一件の照会可能な操作になることを確認する。
 - B の受入試験では初回と無効セッション後の実送信、Resume による非消費、IPC 切断・重複・期限切れ、旧版との混在を模擬 Discord で再現する。許可または READY の観測だけでは送信を証明できないため、模擬サーバーで opcode 2 の受信を確認する。実 Discord の検証は別途行う。
 
 ## ユーザー判断が必要な点
 
 1. B に進む場合、IPC 形式と旧版 Gateway の移行方法。botd 不在時に既存 Gateway の再 Identify を保留する案の可否と、待ちの期限。
 2. Discord の残量取得・更新頻度、ローカルの保守的な上限を残すか、必要な復旧予算を何枠にするか。botd 再起動で履歴を失った際の再照会・待機・永続化の方針。
-3. 再 Identify、初回起動、手動操作、待機更新の正式な優先順位と公平性。手動 restart の停止前に予算を予約するか、管理操作を待機可能にするか。
+3. 再 Identify、初回起動、手動操作、待機更新の正式な優先順位と公平性。
 4. 複数 botd・複数ホストでの予算の調整範囲と、既存の quorum・lease への組み込み時期。
