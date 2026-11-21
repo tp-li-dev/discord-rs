@@ -45,7 +45,9 @@ B の追加には、起動時に継承する双方向のローカル IPC、ま�
 | --- | --- | --- |
 | 初回自動起動・自動復旧・更新失敗からの復旧 | `Deferred: IdentifyBudget` を監査に出し、監視 tick で再試行する。待機中は子を起動せず、再起動回数を消費しない。 | `Degraded: IdentifyUnavailable`。初回の同期的な拒否は起動結果にも反映する。 |
 | 手動 start / restart | 今回の既定案は明示的に `IdentifyDeferred` を返す。再試行は新たな操作とする。restart の起動段階で拒否された Shard は停止したままになる。 | `IdentifyUnavailable` で拒否する。 |
-| gateway-update の待機起動 | 既存の更新期限まで `Begin` で待つ。 | `IdentifyUnavailable` で失敗し、旧 Gateway を維持する。 |
+| gateway-update の待機起動 | 既存の更新期限まで `waiting_reason: IdentifyBudget` を表示して待つ。期限切れは `IdentifyDeferred`。 | `IdentifyUnavailable` で失敗し、旧 Gateway を維持する。 |
+
+同じ Bot の更新後の復旧機会が保護されている間、管理操作による追加の再起動禁止が対象 Shard の復旧を妨げないよう、start / restart / gateway-update は受付時点で明示的に拒否する。
 
 ## 障害と隔離
 

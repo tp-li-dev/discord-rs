@@ -146,7 +146,7 @@ botd は Shard ごとに順番に次を行います。
 失敗時の扱いは次のとおりです。
 
 - 待機 Gateway の起動失敗、90 秒以内に ready にならない、activate の送信失敗では、その Shard の待機 Gateway を終了します。稼働中の Gateway は変更しません。
-- activate の後に `standby-active` が 20 秒以内に出ない、または待機 Gateway が終了した場合は操作が失敗します。このとき旧 Gateway はすでに Core から切り離されているため、botd は旧 Gateway を強制終了し、上げた epoch で起動し直します（Identify が 1 回余分に発生します）。待機 Gateway も終了します。
+- activate の後に `standby-active` が 20 秒以内に出ない、または待機 Gateway が終了した場合は操作が失敗します。このとき旧 Gateway はすでに Core から切り離されているため、botd は旧 Gateway を強制終了し、次の Identify 許可を得てから上げた epoch で起動し直します。待機 Gateway も終了します。
 - 先に完了した Shard の更新は残ります。全体の自動ロールバックはありません。
 - 操作全体のサーバー側期限は 120 秒 + 45 秒 × Shard 数です。確認待ちに入った段階は最大 20 秒でその段階を終えます。
 - activate の送信後に失敗した場合の実 Discord 上の Core と Gateway の挙動は未検証です。
@@ -450,6 +450,12 @@ Core（Worker）だけを `kill -9` した場合は、Gatewayがメモリに持�
 
 `child_recovery` はdaemonのGateway監視とWorker側の復旧経路に接続されています。再試行・予算・degraded状態の観測は、孤児の再採用やホスト障害からの安全な分散復旧を意味しません。
 
-実 Discord の Gateway 自動復旧は、単一ホスト・単一 botd 専用のローカル Identify 許可（Bot 単位。同じ Bot は直近の許可から 30 秒以上空け、直近 1 時間で最大 10 回。超えると `IdentifyUnavailable` で `Degraded`）の下で有効です。初回起動と手動 start は常に許可して記録します。複数プロセス・複数ホスト間の調整は未実装、botd 再起動で履歴は消えます。セッションの Resume は未実装で、再起動のたびに Identify を 1 回消費します。ローカル未ビルドで GitHub Actions の検証待ちで、実 Discord・実機では未検証です。`botctl status` では上限超過が `restart_exhausted: true`・`recovery.state` の `Degraded: IdentifyUnavailable`（`desired_running` は false）として見え、復旧イベント（監査）にも同じ理由が出ます。間隔未満の間は `Deferred`（IdentifyBudget）で待ち、再起動回数を消費せず間隔が空くと再起動します。`metrics_feed` はライブラリとテストがありますがdaemonに接続されていません。
+botd は初回自動起動、手動 start / restart、gateway-update の待機起動、自動復旧（更新失敗後を含む）に共通の起動予算を使います。同じ Bot は直近の許可から 30 秒以上空け、直近 1 時間で最大 10 回です。許可を得た起動試行は失敗しても枠を消費します。起動後の Gateway 内の再 Identify は各プロセスのキューで扱い、複数 botd・複数ホストの実送信に対する予算共有は未実装です。botd の再起動で起動許可の履歴は消えます。
+
+- 初回自動起動と自動復旧は間隔待ちを `recovery.deferred: IdentifyBudget` として status に表示し、復旧監査にも記録します。監視 tick で再試行し、待機中は再起動回数を消費しません。`startup_ok` は同期的に分かった起動エラーを示します。各 Shard の起動状況は status で確認してください。上限まで使った Shard は `Degraded: IdentifyUnavailable`（`restart_exhausted: true`、`desired_running: false`）になります。
+- 手動 start / restart の起動段階では、間隔が空いていなければ `IdentifyDeferred`、上限に達していれば `IdentifyUnavailable` を返します。再試行は新しい操作として実行します。複数 Shard を指定すると一部だけ起動することがあります。restart の起動段階で拒否された Shard は停止したままです。
+- gateway-update は復旧用を含む 2 枠を確認し、待機起動の 1 枠を消費します。間隔待ちは操作表示の `waiting_reason: IdentifyBudget`、期限切れは `IdentifyDeferred`、枠不足は `IdentifyUnavailable` です。復旧枠を保護している間は同じ Bot の新しい start / restart / gateway-update を拒否します。
+
+`metrics_feed` はライブラリとテストがありますがdaemonに接続されていません。
 
 `discord_smoke` は明示実行の読み取り専用REST確認補助CLI（`src/src/bin/discord_smoke.rs`、`src/tests/discord_smoke/cli.rs`）で、GatewayやCoreを起動しません。実Discordでの検証はユーザーが実施する範囲です。性能測定の条件とLinux共有runner（Actions `ubuntu-latest`、AMD EPYC 7763 4vCPU、IPC往復 p99 = 115.5/258.1/973.6 µs、failover検知 Suspected p50 1503.6 ms / FailoverPending p50 3003.1 ms、共有ランナーで本番保証ではない、往復値で片道p99の直接測定ではない）の記録は [benchmarks.md](benchmarks.md) を参照してください。手動ワークフローとして `.github/workflows/stress.yml` と `bench.yml` が用意されていますが、更新負荷中の無停止条件は未達で `src/tests/update_load.rs` は `#[ignore]` です。
