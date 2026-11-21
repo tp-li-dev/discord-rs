@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Check separate-mode shards on Ubuntu; run as root.
-# Use botctl and the running botd from the same release.
+# Use botctl and the running botd from the same release (mutual authentication).
+# Set CONTROL_SOCKET to the configured absolute Unix socket path when not using TCP.
 
 update_reply() {
   python3 -c '
@@ -78,7 +79,11 @@ USER_NAME=discord-rs
 ROOT=${ROOT:-/var/lib/discord-rs/runtime}
 SECRET=/etc/discord-rs/botd.secret
 BOTCTL=/opt/discord-rs/bin/botctl
-PORT=47321
+PORT=${PORT:-47321}
+control_endpoint=(--port "$PORT")
+if [ -n "${CONTROL_SOCKET:-}" ]; then
+  control_endpoint=(--socket "$CONTROL_SOCKET")
+fi
 bot=test
 repeat=1
 selected_shard=
@@ -113,9 +118,9 @@ record() {
 }
 ctl() {
   if [ "$1" = gateway-update ]; then
-    timeout 310 sudo -u "$USER_NAME" "$BOTCTL" "$@" --secret-file "$SECRET" --port "$PORT" --json 2>/dev/null
+    timeout 310 sudo -u "$USER_NAME" "$BOTCTL" "$@" --secret-file "$SECRET" "${control_endpoint[@]}" --json 2>/dev/null
   else
-    timeout 8 sudo -u "$USER_NAME" "$BOTCTL" "$@" --timeout 5s --secret-file "$SECRET" --port "$PORT" --json 2>/dev/null
+    timeout 8 sudo -u "$USER_NAME" "$BOTCTL" "$@" --timeout 5s --secret-file "$SECRET" "${control_endpoint[@]}" --json 2>/dev/null
   fi
 }
 json_string() {

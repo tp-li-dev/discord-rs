@@ -116,7 +116,7 @@ jobs:
             exit 1
           fi
           sudo systemctl is-active botd
-      - name: botctl status through --secret-file
+      - name: botctl and botd mutual authentication through --secret-file
         run: |
           set -euo pipefail
           # Run as the service user: only it can read the 0600 secret.
@@ -128,6 +128,7 @@ jobs:
           if sudo -u discord-rs /opt/discord-rs/bin/botctl status --secret-file /tmp/wrong.secret --port 47321 --json >/tmp/wrong.out 2>&1; then
             echo "wrong secret was accepted"; cat /tmp/wrong.out; exit 1
           fi
+          python3 -c 'import json,sys; d=json.load(sys.stdin); assert d.get("ok") is False; assert "local control authentication failed" in d.get("error", "")' </tmp/wrong.out
           echo "wrong secret refused"
       - name: Stay alive across several watchdog periods
         run: |

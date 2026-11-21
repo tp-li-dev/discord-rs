@@ -14,7 +14,7 @@
 1. **botctl で操作できます（secret ファイル経由）。** unit は `botd --secret-file /etc/discord-rs/botd.secret
    --control-port 47321` で起動し、`botctl` は同じファイルと `--port 47321` で loopback へ接続します
    （「[管理 secret](#管理-secret)」）。secret ファイルの権限検査・systemd 実機での常駐接続は実機では未検証です。
-   自動検出用 endpoint ファイルはなく、ポートは固定値を `--port` で指定します。
+   管理 CLI と daemon は相互認証する同じリリースを使います。自動検出用 endpoint ファイルはなく、TCP のポートは固定値を `--port` で指定します。
 2. **systemd Watchdog / `Type=notify` は実装済みだが、実 systemd では未検証のため unit では無効です。**
    botd は既定の経路で `sd_notify`（`READY=1`、`WATCHDOG=1`、`STOPPING=1`。`src/src/sd_notify.rs`）に対応しています
    （CI の統合試験で、一時ソケットへ READY と WATCHDOG が届くことを確認済み。Raft/クラスタ/Gateway 切替の
@@ -184,6 +184,16 @@ unit の要点（`deploy/systemd/botd.service` 内のコメントも参照）:
 - 同じ runtime root に対して複数の botd を同時に動かす構成は非対応です（一方が予約を作ってから Gateway を起動するまでの
   短い間、他方が予約を古いと誤判定する可能性があります）。
 - ローカルでは未ビルドで、動作は CI の結果待ちです。
+
+### Unix ソケットを使う場合
+
+unit の `ExecStart` を上書きする場合は、既存の全引数を含め、`--control-port 47321` を `--control-socket /run/discord-rs/control.sock` に置き換えます。unit の `RuntimeDirectory=discord-rs` と `RuntimeDirectoryMode=0700` が、サービス UID 所有の親ディレクトリを作ります。クライアントも同じ UID で実行します。
+
+```bash
+sudo -u discord-rs /opt/discord-rs/bin/botctl status --secret-file /etc/discord-rs/botd.secret --socket /run/discord-rs/control.sock --json
+```
+
+`update-check.sh` と `soak-report.sh` は `CONTROL_SOCKET=/run/discord-rs/control.sock` を設定するとこちらのソケットを使います。移行時のリリースの組み合わせと異常終了後のソケットの扱いは設計書を参照してください。[ローカル管理チャネルの設計](design-decisions/12-control-channel-hardening.md)
 
 ### 導入後の確認
 
