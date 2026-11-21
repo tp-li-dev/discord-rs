@@ -33,30 +33,40 @@ impl Clock for ManualClock {
     }
 }
 
-struct Root(PathBuf);
+struct Root(PathBuf, PathBuf);
 impl Root {
     fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        let base = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("target")
-            .join("daemon-tests")
-            .join(format!(
-                "{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
+            .join("daemon-tests");
+        let path = base.join(format!(
+            "{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
         std::fs::create_dir_all(&path).unwrap();
-        Self(path)
+        Self(path, base)
+    }
+
+    #[cfg(unix)]
+    fn for_separate_cores() -> Self {
+        use std::os::unix::fs::DirBuilderExt;
+
+        // Use a short Linux path with Unix permissions even from a WSL DrvFs checkout.
+        let base = PathBuf::from("/tmp");
+        let path = base.join(format!("id-{:016x}", getrandom::u64().unwrap()));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .unwrap();
+        Self(path, base)
     }
 }
 impl Drop for Root {
     fn drop(&mut self) {
-        let base = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("daemon-tests");
-        if let (Ok(target), Ok(base)) = (self.0.canonicalize(), base.canonicalize())
-            && target != base
-            && target.starts_with(&base)
+        if let (Ok(target), Ok(base)) = (self.0.canonicalize(), self.1.canonicalize())
+            && target.parent() == Some(base.as_path())
         {
             let _ = std::fs::remove_dir_all(target);
         }
@@ -342,11 +352,22 @@ async fn concurrent_manual_starts_can_only_consume_one_same_bot_grant() {
 async fn standby_and_failed_activation_recovery_share_the_launch_budget() {
     use std::os::unix::fs::PermissionsExt;
 
-    let root = Root::new();
+    let root = Root::for_separate_cores();
     let program = root.0.join("process-only-gateway");
-    // Gateway and Core hold their launch-scoped stdin open. No Discord
-    // connection or Core protocol is involved in this scheduler fixture.
-    std::fs::write(&program, "#!/bin/sh\nwhile IFS= read -r line; do :; done\n").unwrap();
+    // Cores drain the capability pipe. The standby exits after receiving activation.
+    std::fs::write(
+        &program,
+        r#"#!/bin/sh
+for arg in "$@"; do
+    if [ "$arg" = "--standby" ]; then
+        IFS= read -r line || exit 1
+        exit 17
+    fi
+done
+while IFS= read -r line; do :; done
+"#,
+    )
+    .unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
     let plan = shard_runtime::plan(
         &[LocalShardIntent {
@@ -387,6 +408,13 @@ async fn standby_and_failed_activation_recovery_share_the_launch_budget() {
     );
     assert!(!marker.exists());
     daemon.0.send_gateway_activation(&wanted).await.unwrap();
+    eventually(|| {
+        matches!(
+            daemon.0.gateway_activation_progress(&wanted),
+            UpdateProgress::Failed(DaemonError::ChildExited)
+        )
+    })
+    .await;
     daemon.0.fail_gateway_activation(&wanted);
     eventually(|| {
         daemon.0.poll(&credentials).unwrap();
@@ -408,6 +436,10 @@ async fn standby_and_failed_activation_recovery_share_the_launch_budget() {
     daemon.0.poll(&credentials).unwrap();
     assert!(daemon.0.has_child(&wanted));
     assert_ne!(daemon.0.snapshots()[0].identity, original);
+    assert_eq!(daemon.0.snapshots()[0].restarts, 1);
+
+    // Grants at 0, 30 and 60 leave one slot. A standby needs two, but
+    // an ordinary start can spend the fourth and final slot at 90.
     clock.set(90);
     let replacement = daemon.0.snapshots()[0].identity.clone();
     assert_eq!(
@@ -419,6 +451,16 @@ async fn standby_and_failed_activation_recovery_share_the_launch_budget() {
 
     daemon.0.stop(&wanted, StopMode::Force).unwrap();
     terminal(&mut daemon.0).await;
+    daemon.0.start(&wanted, &credentials).unwrap();
+    assert!(daemon.0.has_child(&wanted));
+    daemon.0.stop(&wanted, StopMode::Force).unwrap();
+    terminal(&mut daemon.0).await;
+    clock.set(120);
+    assert_eq!(
+        daemon.0.start(&wanted, &credentials),
+        Err(DaemonError::IdentifyUnavailable)
+    );
+    assert!(!daemon.0.has_child(&wanted));
     daemon.0.stop_cores(Duration::from_secs(2)).await;
 }
 
