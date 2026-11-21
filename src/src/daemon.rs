@@ -6380,6 +6380,32 @@ pub mod control {
         }
 
         #[test]
+        fn configuring_nonce_retry_replaces_the_previous_allowlist() {
+            use crate::discord_message::NONCE_RETRY_FLAG;
+
+            let mut plane = plane(2, 2);
+            for enabled in ["id-0", "id-1", "id-1"] {
+                plane
+                    .daemon
+                    .configure_create_message_nonce_retry(
+                        &plane.config,
+                        &HashSet::from([enabled.to_owned()]),
+                    )
+                    .unwrap();
+                for entry in plane.daemon.entries.values() {
+                    let count = entry
+                        .spec
+                        .gateway
+                        .args
+                        .iter()
+                        .filter(|arg| *arg == NONCE_RETRY_FLAG)
+                        .count();
+                    assert_eq!(count, (entry.spec.bot_id == enabled) as usize);
+                }
+            }
+        }
+
+        #[test]
         fn configured_environment_cannot_override_windows_system_root() {
             let plane = plane(1, 1);
             for role in [Role::Gateway, Role::Core] {
@@ -8581,7 +8607,7 @@ impl<C: Clock> Daemon<C> {
         Ok(())
     }
 
-    /// Resolve an exact Bot ID allowlist before any launch attempt. Normal and
+    /// Replace the exact Bot ID allowlist before any launch attempt. Normal and
     /// recovery launches and standby launches all use these same Gateway args.
     pub fn configure_create_message_nonce_retry(
         &mut self,
@@ -8600,11 +8626,9 @@ impl<C: Clock> Daemon<C> {
             return Err(DaemonError::UnknownBot);
         }
         for entry in self.entries.values_mut() {
+            let args = &mut entry.spec.gateway.args;
+            args.retain(|arg| arg != NONCE_RETRY_FLAG);
             if bot_ids.contains(&entry.spec.bot_id) {
-                let args = &mut entry.spec.gateway.args;
-                if args.iter().any(|arg| arg == NONCE_RETRY_FLAG) {
-                    continue;
-                }
                 args.push(NONCE_RETRY_FLAG.into());
             }
         }
