@@ -145,6 +145,7 @@ impl std::error::Error for PlacementError {}
 
 /// Private credential slot in processes started by botd.
 pub const GATEWAY_TOKEN_ENV: &str = "DISCORD_RS_GATEWAY_TOKEN";
+pub const GATEWAY_TOKEN_FD_ENV: &str = "DISCORD_RS_GATEWAY_TOKEN_FD";
 
 /// Provisioning names have a dedicated TOKEN component and may not use
 /// namespaces interpreted by the loader, runtimes, or process setup.
@@ -157,6 +158,7 @@ pub fn valid_token_env(name: &str) -> bool {
         && name.split('_').any(|part| part == "TOKEN")
         && ![
             GATEWAY_TOKEN_ENV,
+            GATEWAY_TOKEN_FD_ENV,
             "GCONV_PATH",
             "LOCPATH",
             "NLSPATH",

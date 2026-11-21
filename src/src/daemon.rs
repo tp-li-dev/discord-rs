@@ -9109,6 +9109,7 @@ fn validate_specs(specs: &[ShardRuntimeSpec]) -> Result<(), DaemonError> {
                     || name.eq_ignore_ascii_case("SYSTEMROOT")
                     || name.eq_ignore_ascii_case(crate::placement::GATEWAY_TOKEN_ENV)
                     || name.eq_ignore_ascii_case(shard_runtime::GATEWAY_NONCE_RETRY_POLICY_ENV)
+                    || name.eq_ignore_ascii_case(crate::placement::GATEWAY_TOKEN_FD_ENV)
                     || credential_names.contains(&name.to_ascii_uppercase())
                     || !names.insert(name.to_ascii_uppercase())
                 {
@@ -9605,9 +9606,23 @@ impl<C: Clock> Daemon<C> {
                 .arg(address.to_string())
                 .env_remove("DISCORD_TOKEN")
                 .env_remove(crate::placement::GATEWAY_TOKEN_ENV);
-        } else if let Some(credential) = credential {
+        }
+        #[cfg(not(target_os = "linux"))]
+        if let Some(credential) = credential {
             command.env(crate::placement::GATEWAY_TOKEN_ENV, credential);
         }
+        #[cfg(target_os = "linux")]
+        let _token_fd = credential
+            .as_deref()
+            .map(|token| {
+                crate::gateway_token::attach(
+                    command.as_std_mut(),
+                    crate::placement::GATEWAY_TOKEN_ENV,
+                    token,
+                )
+            })
+            .transpose()
+            .map_err(|_| DaemonError::SpawnFailed)?;
         #[cfg(target_os = "linux")]
         let grant_fd = self
             .local_identify
@@ -10253,9 +10268,29 @@ impl<C: Clock> Daemon<C> {
                 .arg(address.to_string())
                 .env_remove("DISCORD_TOKEN")
                 .env_remove(crate::placement::GATEWAY_TOKEN_ENV);
-        } else if let Some(credential) = credential {
+        }
+        #[cfg(not(target_os = "linux"))]
+        if let Some(credential) = credential {
             command.env(crate::placement::GATEWAY_TOKEN_ENV, credential);
         }
+        #[cfg(target_os = "linux")]
+        let _token_fd = match credential
+            .as_deref()
+            .map(|token| {
+                crate::gateway_token::attach(
+                    command.as_std_mut(),
+                    crate::placement::GATEWAY_TOKEN_ENV,
+                    token,
+                )
+            })
+            .transpose()
+        {
+            Ok(fd) => fd,
+            Err(_) => {
+                Self::release_reservation(entry)?;
+                return Err(DaemonError::SpawnFailed);
+            }
+        };
         // Terminal Ctrl-C must target the daemon's foreground group, not its
         // independently supervised Gateway units. This is not a service manager
         // or a guarantee against an OS/session/job object's teardown policy.

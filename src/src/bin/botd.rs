@@ -1533,11 +1533,14 @@ fn exec_with_token(args: &[OsString]) -> Result<(), &'static str> {
         .get(name)
         .filter(|token| !token.expose_secret().is_empty())
         .ok_or("selected token missing or empty")?;
-    let _ = std::process::Command::new(program)
-        .args(rest)
-        .env_clear()
-        .env(name, token.expose_secret())
-        .exec();
+    let mut command = std::process::Command::new(program);
+    command.args(rest).env_clear();
+    #[cfg(target_os = "linux")]
+    let _token_fd = src::gateway_token::attach(&mut command, name, token.expose_secret())
+        .map_err(|_| "cannot prepare token descriptor")?;
+    #[cfg(not(target_os = "linux"))]
+    command.env(name, token.expose_secret());
+    let _ = command.exec();
     Err("cannot execute token command")
 }
 

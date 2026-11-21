@@ -34,8 +34,32 @@ fn token_command_inherits_only_the_selected_assignment() {
     let output = Command::new(env!("CARGO_BIN_EXE_botd"))
         .args(["--with-token"])
         .arg(&file)
-        .args(["DISCORD_TEST_BOT_TOKEN", "/usr/bin/env"])
+        .arg("DISCORD_TEST_BOT_TOKEN")
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "inherited_credential_fixture",
+            "--nocapture",
+            "--test-threads=1",
+        ])
         .env("TOKEN_INHERITED", "parent.fixture")
+        .output()
+        .unwrap();
+    let smoke = Command::new(env!("CARGO_BIN_EXE_botd"))
+        .args(["--with-token"])
+        .arg(&file)
+        .args([
+            "TOKEN_OTHER",
+            env!("CARGO_BIN_EXE_discord_smoke"),
+            "--token-env",
+            "TOKEN_OTHER",
+        ])
+        .output()
+        .unwrap();
+    let wrong_source = Command::new(env!("CARGO_BIN_EXE_botd"))
+        .args(["--with-token"])
+        .arg(&file)
+        .args(["TOKEN_OTHER", env!("CARGO_BIN_EXE_discord_smoke")])
         .output()
         .unwrap();
     let fd = Command::new(env!("CARGO_BIN_EXE_botd"))
@@ -53,8 +77,64 @@ fn token_command_inherits_only_the_selected_assignment() {
     assert!(fd.status.success());
     assert_eq!(fd.stdout, b"/dev/null\n");
     assert!(output.status.success());
-    assert_eq!(output.stdout, b"DISCORD_TEST_BOT_TOKEN=selected.fixture\n");
+    // The exec environment now contains descriptor metadata only. The child
+    // checks the same selected assignment after enabling dump protection.
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("inherited-token-verified"));
+    assert!(!stdout.contains("selected.fixture"));
     assert!(output.stderr.is_empty());
+    assert!(smoke.status.success());
+    assert!(String::from_utf8_lossy(&smoke.stdout).contains("token=present requests=none"));
+    assert!(!wrong_source.status.success());
+    assert!(String::from_utf8_lossy(&wrong_source.stderr).contains("token_descriptor_invalid"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn inherited_credential_fixture() {
+    use src::gateway_token;
+    let Ok(metadata) = std::env::var(gateway_token::FD_ENV) else {
+        return;
+    };
+    assert_eq!(std::env::vars_os().count(), 1);
+    let (fd, source) = metadata.split_once(':').unwrap();
+    assert_eq!(source, "DISCORD_TEST_BOT_TOKEN");
+    let fd: std::os::fd::RawFd = fd.parse().unwrap();
+    // SAFETY: this fixture owns the dedicated socket in FD_ENV.
+    if unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+        assert!(unsafe { gateway_token::take_inherited() }.is_err());
+    }
+    src::redact::disable_process_dumps().unwrap();
+    let token = unsafe { gateway_token::take_inherited() }
+        .unwrap()
+        .unwrap()
+        .for_name(std::ffi::OsStr::new(source))
+        .unwrap();
+    assert!(token.expose_secret() == std::ffi::OsStr::new("selected.fixture"));
+    // SAFETY: fcntl on the now-closed descriptor simply reports EBADF.
+    assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::EBADF)
+    );
+    println!("inherited-token-verified");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn shipped_gateway_reads_inherited_token_before_discord_metadata() {
+    use std::os::unix::ffi::OsStrExt;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_src"));
+    command.env_clear();
+    let _fd = src::gateway_token::attach(
+        &mut command,
+        "DISCORD_TOKEN",
+        std::ffi::OsStr::from_bytes(&[0xff]),
+    )
+    .unwrap();
+    let output = command.output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("[token_encoding]"));
 }
 
 struct CoreGuard {
@@ -130,8 +210,11 @@ fn management_reply_errors_and_log_display_are_masked() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dir.join("core.json"), std::fs::Permissions::from_mode(0o600))
-            .unwrap();
+        std::fs::set_permissions(
+            dir.join("core.json"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
     }
     let server = std::thread::spawn(move || {
         for ok in [true, false] {

@@ -15,6 +15,8 @@
 
 `manage start` の初回ビルド、常駐管理プロセスの `manage update`、`reload general` の Cargo 子プロセスは、`env_clear` の後に[運用ガイドの許可リスト](operator-guide.md#ビルド子プロセスの環境)にある親の環境変数だけを設定する。名前に `TOKEN` を含む変数は ASCII の大文字小文字を問わず除外するため、`LC_*` に該当する名前や将来の許可リスト追加でも、配置の Bot 資格情報参照名と内部名 `DISCORD_RS_GATEWAY_TOKEN` は渡らない。`reload` の `DISCORD_BUILD_ID` は更新時に生成する。
 
+Linux の botd は、通常起動・スタンバイ起動・障害復旧の Gateway に、設定で選んだ 1 件の Bot token を匿名 Unix ソケットの継承 fd で渡す。初期環境に渡すのは fd 番号と資格情報の参照名だけ。受信側は `PR_SET_DUMPABLE=0` の設定後に読み取り、fd を close-on-exec に戻してから読み、直ちに閉じる。Core は fd と token を受け取らない。botd の `--with-token` から起動する `discord_smoke` も同じ順序で読み取る。token を環境変数にエクスポートして直接起動する旧来の経路では、exec 直後の環境に token が入る。root などプロセスの検査権限を持つ主体は信頼境界に含まれる。
+
 この境界は管理 CLI が起動する Cargo に適用する。シェルから直接起動する Cargo は、Bot の資格情報を設定する前に実行する。同じ OS ユーザーのファイルやプロセスへアクセスできるビルドコードから資格情報を隔離するには、資格情報を持たない別ユーザーでビルドする。
 
 `botd` の配置から起動する Gateway は、通常起動と standby の両方で親環境を消去し、対象 Bot の資格情報だけを内部名で設定する。配置プランの追加環境は空で、模擬 Discord 起動では資格情報を渡さない。

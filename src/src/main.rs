@@ -161,6 +161,8 @@ where
 enum StartupFailure {
     MissingToken,
     NonUnicodeToken,
+    #[cfg(target_os = "linux")]
+    InvalidTokenDescriptor,
     InvalidBootstrap,
     MetadataTimeout,
     MetadataUnavailable,
@@ -179,6 +181,10 @@ impl fmt::Display for StartupFailure {
         f.write_str(match self {
             Self::MissingToken => "DISCORD_TOKEN is not configured [token_missing]",
             Self::NonUnicodeToken => "DISCORD_TOKEN is not Unicode [token_encoding]",
+            #[cfg(target_os = "linux")]
+            Self::InvalidTokenDescriptor => {
+                "invalid inherited Gateway credential [token_descriptor_invalid]"
+            }
             Self::InvalidBootstrap => "invalid management bootstrap [bootstrap_invalid]",
             Self::MetadataTimeout => "gateway metadata timed out [metadata_timeout]",
             Self::MetadataUnavailable => "gateway metadata unavailable [metadata_unavailable]",
@@ -974,19 +980,39 @@ fn main() -> ExitCode {
     src::redact::install_panic_hook();
     let args: Vec<_> = env::args_os().skip(1).collect();
     #[cfg(target_os = "linux")]
-    if !args
-        .first()
-        .is_some_and(|arg| arg == "--worker" || arg == "--core-listen")
-        && src::redact::disable_process_dumps().is_err()
-    {
-        eprintln!("Gateway: cannot disable process dumps");
-        return ExitCode::FAILURE;
-    }
+    let inherited_token = {
+        let core = args
+            .first()
+            .is_some_and(|arg| arg == "--worker" || arg == "--core-listen");
+        if core && env::var_os(src::gateway_token::FD_ENV).is_some() {
+            eprintln!("Core: unexpected credential descriptor");
+            return ExitCode::FAILURE;
+        }
+        if !core && src::redact::disable_process_dumps().is_err() {
+            eprintln!("Gateway: cannot disable process dumps");
+            return ExitCode::FAILURE;
+        }
+        // SAFETY: the managed launcher supplies a dedicated inherited fd,
+        // which we consume before the runtime can allocate any descriptors.
+        match unsafe { src::gateway_token::take_inherited() } {
+            Ok(token) => token,
+            Err(_) => {
+                eprintln!("Gateway: {}", StartupFailure::InvalidTokenDescriptor);
+                return ExitCode::FAILURE;
+            }
+        }
+    };
     let result = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|error| Box::new(error) as AppError)
-        .and_then(|runtime| runtime.block_on(run(args)));
+        .and_then(|runtime| {
+            runtime.block_on(run(
+                args,
+                #[cfg(target_os = "linux")]
+                inherited_token,
+            ))
+        });
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -996,7 +1022,10 @@ fn main() -> ExitCode {
     }
 }
 
-async fn run(args: Vec<OsString>) -> Result<(), AppError> {
+async fn run(
+    args: Vec<OsString>,
+    #[cfg(target_os = "linux")] inherited_token: Option<src::gateway_token::InheritedToken>,
+) -> Result<(), AppError> {
     if args == [OsString::from("--worker")] {
         return worker::run().await;
     }
@@ -1095,6 +1124,10 @@ async fn run(args: Vec<OsString>) -> Result<(), AppError> {
         .await;
     }
     let mut options = GatewayOptions::parse(args)?;
+    #[cfg(target_os = "linux")]
+    if inherited_token.is_some() && options.mock_discord.is_some() {
+        return Err(StartupFailure::InvalidTokenDescriptor.into());
+    }
     let bootstrap = if options.local_control {
         Some(
             src::local_control::read_bootstrap()
@@ -1130,7 +1163,23 @@ async fn run(args: Vec<OsString>) -> Result<(), AppError> {
     // No production client, token lookup, metadata request or WebSocket exists
     // on the explicit mock branch. Environment variables never enable it.
     let live = if mock.is_none() {
-        Some(live_gateway(&options, &deployment).await?)
+        #[cfg(target_os = "linux")]
+        let inherited = inherited_token
+            .map(|token| token.for_name(options.token_env()))
+            .transpose()
+            .map_err(|_| StartupFailure::InvalidTokenDescriptor)?;
+        #[cfg(not(target_os = "linux"))]
+        let inherited: Option<Secret<OsString>> = None;
+        let token = match inherited {
+            Some(token) => Secret::new(
+                token
+                    .into_inner()
+                    .into_string()
+                    .map_err(|_| StartupFailure::NonUnicodeToken)?,
+            ),
+            None => token_from_env(env::var(options.token_env()))?,
+        };
+        Some(live_gateway(&options, &deployment, token).await?)
     } else {
         None
     };
@@ -1262,11 +1311,12 @@ impl GatewayQueue {
 type LiveShard = Shard<GatewayQueue>;
 
 async fn live_gateway(
-    options: &GatewayOptions,
+    _options: &GatewayOptions,
     deployment: &worker::DeploymentIdentity,
+    token: Secret<String>,
 ) -> Result<(LiveShard, Arc<Client>), AppError> {
     #[cfg(target_os = "linux")]
-    let grant_socket = options
+    let grant_socket = _options
         .identify_grant_fd
         .map(|fd| {
             // Managed mode accepts a dedicated FD inherited at exec from botd.
@@ -1277,7 +1327,6 @@ async fn live_gateway(
         .map_err(|_| StartupFailure::IdentifyGrantUnavailable)?;
     let _ = rustls::crypto::ring::default_provider().install_default();
     let shard_id = configured_shard(deployment);
-    let token = token_from_env(env::var(options.token_env()))?;
     let http = Arc::new(Client::new(token.expose_secret().clone()));
     let queue = single_shard_queue(deployment.shard.total(), async {
         let response = http.gateway().authed().await.map_err(|_| ())?;

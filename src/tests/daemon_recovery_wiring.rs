@@ -1,5 +1,6 @@
 //! Legacy Daemon adapter boundaries, using owned process-only Gateway fixtures.
 //! No Discord, Core, remote management, or distributed ownership is simulated.
+include!("fixtures/gateway_credential.rs");
 use src::{
     child_recovery::{ChildRole, DegradedReason, RecoveryEventKind},
     daemon::{Daemon, DaemonError, ProcessSnapshot, ProcessState, ShardKey, StopMode},
@@ -214,10 +215,8 @@ fn process_only_gateway_fixture() {
         "B" => "wiring-fixture-b-only",
         _ => std::process::exit(91),
     };
-    if std::env::var(src::placement::GATEWAY_TOKEN_ENV)
-        .ok()
-        .as_deref()
-        != Some(expected)
+    if fixture_credential(src::placement::GATEWAY_TOKEN_ENV).as_deref()
+        != Some(std::ffi::OsStr::new(expected))
         || std::env::var_os("TOKEN_A").is_some()
         || std::env::var_os("TOKEN_B").is_some()
         || std::env::var_os("DISCORD_TOKEN").is_some()
