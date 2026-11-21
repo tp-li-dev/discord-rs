@@ -12,6 +12,9 @@ use std::path::{Component, Path, PathBuf};
 /// exits successfully; writing this frame is not an acknowledgement.
 pub const GATEWAY_CONTROL_FRAME_LIMIT: usize = 512;
 pub const GATEWAY_SHUTDOWN_FRAME: &[u8] = b"{\"command\":\"shutdown\"}\n";
+/// Daemon-owned nonce policy for the shipped Gateway. Custom executables
+/// retain their own argument grammar, including the legacy opt-in switch.
+pub const GATEWAY_NONCE_RETRY_POLICY_ENV: &str = "DISCORD_RS_GATEWAY_NONCE_RETRY";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]

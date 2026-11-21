@@ -250,6 +250,20 @@ struct GatewayOptions {
 
 impl GatewayOptions {
     fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Self, StartupFailure> {
+        let managed_nonce_retry =
+            match env::var_os(src::shard_runtime::GATEWAY_NONCE_RETRY_POLICY_ENV) {
+                None => None,
+                Some(value) if value == "0" => Some(false),
+                Some(value) if value == "1" && cfg!(target_os = "linux") => Some(true),
+                Some(_) => return Err(StartupFailure::InvalidArguments),
+            };
+        Self::parse_with_nonce_policy(args, managed_nonce_retry)
+    }
+
+    fn parse_with_nonce_policy(
+        args: impl IntoIterator<Item = OsString>,
+        managed_nonce_retry: Option<bool>,
+    ) -> Result<Self, StartupFailure> {
         let mut options = Self::default();
         let mut args = args.into_iter();
         while let Some(flag) = args.next() {
@@ -265,6 +279,9 @@ impl GatewayOptions {
                     );
                 }
                 "--local-control" if !options.local_control => options.local_control = true,
+                // Strip standalone copies during managed ingestion. Values
+                // consumed by options below are operands and stay literal.
+                NONCE_RETRY_FLAG if managed_nonce_retry.is_some() => {}
                 NONCE_RETRY_FLAG if cfg!(target_os = "linux") && !options.nonce_retry => {
                     options.nonce_retry = true;
                 }
@@ -301,6 +318,9 @@ impl GatewayOptions {
                 }
                 _ => return Err(StartupFailure::InvalidArguments),
             }
+        }
+        if let Some(enabled) = managed_nonce_retry {
+            options.nonce_retry = enabled;
         }
         #[cfg(target_os = "linux")]
         if options.identify_grant_fd.is_some()
@@ -1748,6 +1768,39 @@ mod tests {
             args.extend([OsString::from(flag), root.join(name).into_os_string()]);
         }
         args
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn managed_nonce_policy_owns_the_switch_in_prepopulated_process_specs() {
+        let intents = [src::placement::LocalShardIntent {
+            bot_id: "101".into(),
+            shard_id: 0,
+            total_shards: 1,
+            token_env: "TOKEN_ALPHA".into(),
+        }];
+        let mut specs = src::shard_runtime::plan(&intents, &env::current_dir().unwrap()).unwrap();
+        let spec = &mut specs[0].gateway;
+        spec.args.push(NONCE_RETRY_FLAG.into());
+        assert!(
+            GatewayOptions::parse_with_nonce_policy(spec.args.clone(), None)
+                .unwrap()
+                .nonce_retry
+        );
+        assert!(
+            !GatewayOptions::parse_with_nonce_policy(spec.args.clone(), Some(false))
+                .unwrap()
+                .nonce_retry
+        );
+
+        // The enabled allowlist also adds the compat switch for custom executables.
+        spec.args.push(NONCE_RETRY_FLAG.into());
+        assert!(
+            GatewayOptions::parse_with_nonce_policy(spec.args.clone(), Some(true))
+                .unwrap()
+                .nonce_retry
+        );
+        assert!(GatewayOptions::parse_with_nonce_policy(spec.args.clone(), None).is_err());
     }
 
     #[test]

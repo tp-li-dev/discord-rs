@@ -6500,12 +6500,24 @@ pub mod control {
                 for entry in plane.daemon.entries.values() {
                     let mut command = Command::new(&entry.spec.gateway.program);
                     entry.add_gateway_args(&mut command);
+                    entry.set_gateway_nonce_policy(&mut command);
                     let count = command
                         .as_std()
                         .get_args()
                         .filter(|arg| *arg == NONCE_RETRY_FLAG)
                         .count();
                     assert_eq!(count, (entry.spec.bot_id == enabled) as usize);
+                    let policy = command
+                        .as_std()
+                        .get_envs()
+                        .find(|(key, _)| *key == shard_runtime::GATEWAY_NONCE_RETRY_POLICY_ENV)
+                        .and_then(|(_, value)| value);
+                    let expected = if entry.spec.bot_id == enabled {
+                        "1"
+                    } else {
+                        "0"
+                    };
+                    assert_eq!(policy, Some(std::ffi::OsStr::new(expected)));
                 }
             }
         }
@@ -8789,6 +8801,13 @@ impl Entry {
         }
     }
 
+    fn set_gateway_nonce_policy(&self, command: &mut Command) {
+        command.env(
+            shard_runtime::GATEWAY_NONCE_RETRY_POLICY_ENV,
+            if self.nonce_retry { "1" } else { "0" },
+        );
+    }
+
     fn acquire_identify(
         &self,
         registry: &mut crate::local_identify::LocalIdentifyRegistry,
@@ -9089,6 +9108,7 @@ fn validate_specs(specs: &[ShardRuntimeSpec]) -> Result<(), DaemonError> {
                     || value.contains('\0')
                     || name.eq_ignore_ascii_case("SYSTEMROOT")
                     || name.eq_ignore_ascii_case(crate::placement::GATEWAY_TOKEN_ENV)
+                    || name.eq_ignore_ascii_case(shard_runtime::GATEWAY_NONCE_RETRY_POLICY_ENV)
                     || credential_names.contains(&name.to_ascii_uppercase())
                     || !names.insert(name.to_ascii_uppercase())
                 {
@@ -9578,6 +9598,7 @@ impl<C: Clock> Daemon<C> {
             .stderr(err)
             .kill_on_drop(false)
             .process_group(0);
+        entry.set_gateway_nonce_policy(&mut command);
         if let Some(address) = entry.mock_discord {
             command
                 .arg("--mock-discord")
@@ -10211,6 +10232,7 @@ impl<C: Clock> Daemon<C> {
             .env("GENERATION_ID", sequence.to_string())
             .stdin(Stdio::piped())
             .kill_on_drop(false);
+        entry.set_gateway_nonce_policy(&mut command);
         // Failure reasons (close codes etc.) go to gateway.log beside the
         // shard's state; if it cannot be opened safely, fall back to null.
         let (out, err) = match spec
