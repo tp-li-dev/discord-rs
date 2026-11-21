@@ -1,4 +1,4 @@
-use super::{REPLY_LEN, RPC_TIMEOUT, Reply, UNAVAILABLE_LOG, VERSION, boot_now, nanos};
+use super::{REPLY_LEN, Reply, UNAVAILABLE_LOG, VERSION, boot_now, nanos};
 use std::{
     io,
     os::{
@@ -15,7 +15,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::UnixStream,
     sync::{Mutex, oneshot},
-    time::{sleep, timeout},
+    time::sleep,
 };
 use twilight_gateway_queue::{InMemoryQueue, Queue};
 
@@ -107,10 +107,12 @@ async fn request(
             permit.closed().await;
             return;
         };
-        // Even if the WebSocket disconnects, finish the bounded exchange
-        // before another request uses this stream.
-        match timeout(RPC_TIMEOUT, exchange(socket)).await {
-            Ok(Ok(Reply::Permit(expires))) => {
+        // Complete the outstanding framed exchange on this stream, including
+        // across a WebSocket reconnect. Timeout/cancellation in the middle of
+        // a reply would misattribute its remaining bytes to another request.
+        // Twilight keeps driving Heartbeat and Resume while this task waits.
+        match exchange(socket).await {
+            Ok(Reply::Permit(expires)) => {
                 if !permit.is_closed() {
                     deadline.store(expires, Ordering::Release);
                     if permit.send(()).is_err() {
@@ -119,7 +121,7 @@ async fn request(
                 }
                 return;
             }
-            Ok(Ok(Reply::Wait(delay))) => {
+            Ok(Reply::Wait(delay)) => {
                 drop(channel);
                 let delay = Duration::from_nanos(delay)
                     .clamp(Duration::from_millis(25), Duration::from_secs(30));

@@ -3255,6 +3255,9 @@ pub mod control {
             }
             if op.command != "core-restart" {
                 for key in &op.targets {
+                    if self.daemon.entries[key].journal_start_pending {
+                        let _ = self.daemon.stop(key, StopMode::WaitForExit);
+                    }
                     self.daemon.hold_restart(key, false);
                 }
             }
@@ -3834,7 +3837,7 @@ pub mod control {
                         self.daemon
                             .start_inner(key, credentials, StartKind::Restart)
                     } else {
-                        self.daemon.start(key, credentials)
+                        self.daemon.start_inner(key, credentials, StartKind::Manual)
                     }
                 } else {
                     if self.daemon.has_child(key) {
@@ -3847,6 +3850,10 @@ pub mod control {
                     }
                 };
                 match result {
+                    Err(DaemonError::IdentifyJournalPending) if op.phase == Phase::Starting => {
+                        op.next -= 1;
+                        return;
+                    }
                     Err(error) => {
                         op.errors.insert(key.clone(), error);
                         if op.phase == Phase::Stopping && op.is_restart() {
@@ -8083,6 +8090,7 @@ pub enum DaemonError {
     InvalidState,
     IdentifyDeferred,
     IdentifyUnavailable,
+    IdentifyJournalPending,
     RestartBudget,
     RestartDeferred,
     NoRuntime,
@@ -8172,6 +8180,7 @@ struct Entry {
     started: bool,
     graceful_stop: Option<Result<(), DaemonError>>,
     restart_held: bool,
+    journal_start_pending: bool,
     /// Protect the next real Identify for this update's fallback recovery.
     update_fallback_reserved: bool,
     /// Only explicit local test configuration may select this. Never infer the
@@ -8326,10 +8335,10 @@ impl Entry {
         launch: GatewayLaunch,
         generation: LaunchGeneration,
         reserved_restart: bool,
-    ) -> crate::local_identify::LocalAdmission {
+    ) -> Result<crate::local_identify::LocalAdmission, crate::local_identify::JournalPending> {
         use crate::local_identify::LocalAdmission;
         if self.mock_discord.is_some() {
-            return LocalAdmission::Granted;
+            return Ok(LocalAdmission::Granted);
         }
         let standby = match launch {
             GatewayLaunch::Active => false,
@@ -8437,9 +8446,9 @@ impl<S: CredentialSource> RecoveryHost for ProcessRecoveryHost<'_, S> {
             .get_or_insert_with(std::time::Instant::now);
         let reserved_restart = self.reserved_restart == Some(&entry.snapshot.key);
         let decision = if blocked && !reserved_restart {
-            LocalAdmission::Pending {
+            Ok(LocalAdmission::Pending {
                 retry_after: Duration::ZERO,
-            }
+            })
         } else {
             let now = self.clock.now();
             if *self.clock_failed || now < *self.last_now {
@@ -8459,7 +8468,7 @@ impl<S: CredentialSource> RecoveryHost for ProcessRecoveryHost<'_, S> {
             )
         };
         match decision {
-            LocalAdmission::Granted => {
+            Ok(LocalAdmission::Granted) => {
                 entry.update_fallback_reserved = false;
                 entry.admission_since = None;
                 if let Some(feed) = &entry.feed {
@@ -8471,7 +8480,8 @@ impl<S: CredentialSource> RecoveryHost for ProcessRecoveryHost<'_, S> {
             }
             denial if self.manual == Some(&entry.snapshot.key) => {
                 let error = match denial {
-                    LocalAdmission::Exhausted { .. } => DaemonError::IdentifyUnavailable,
+                    Err(_) => DaemonError::IdentifyJournalPending,
+                    Ok(LocalAdmission::Exhausted { .. }) => DaemonError::IdentifyUnavailable,
                     _ => DaemonError::IdentifyDeferred,
                 };
                 self.errors.insert(entry.snapshot.key.clone(), error);
@@ -8479,8 +8489,8 @@ impl<S: CredentialSource> RecoveryHost for ProcessRecoveryHost<'_, S> {
                 // stopped slot reusable for a later management operation.
                 IdentifyAdmission::Pending
             }
-            LocalAdmission::Pending { .. } => IdentifyAdmission::Pending,
-            LocalAdmission::Exhausted { .. } => IdentifyAdmission::Unavailable,
+            Ok(LocalAdmission::Exhausted { .. }) => IdentifyAdmission::Unavailable,
+            Ok(LocalAdmission::Pending { .. }) | Err(_) => IdentifyAdmission::Pending,
         }
     }
     fn cancel_identify(&mut self, _: ChildKey) {}
@@ -8702,6 +8712,7 @@ impl<C: Clock> Daemon<C> {
                         started: false,
                         graceful_stop: None,
                         restart_held: false,
+                        journal_start_pending: false,
                         update_fallback_reserved: false,
                         mock_discord: None,
                         feed,
@@ -9023,9 +9034,9 @@ impl<C: Clock> Daemon<C> {
             generation.clone(),
             false,
         ) {
-            LocalAdmission::Granted => {}
-            LocalAdmission::Pending { .. } => return Ok(false),
-            LocalAdmission::Exhausted { .. } => return Err(DaemonError::IdentifyUnavailable),
+            Ok(LocalAdmission::Granted) => {}
+            Ok(LocalAdmission::Pending { .. }) | Err(_) => return Ok(false),
+            Ok(LocalAdmission::Exhausted { .. }) => return Err(DaemonError::IdentifyUnavailable),
         }
         #[cfg(target_os = "linux")]
         if self.local_identify.send_grants.is_some() {
@@ -9173,6 +9184,8 @@ impl<C: Clock> Daemon<C> {
     /// Abandons a standby Gateway that has not been activated.
     #[cfg(unix)]
     pub fn cancel_gateway_update(&mut self, key: &ShardKey) {
+        #[cfg(target_os = "linux")]
+        self.cancel_journal_launch(key, true);
         if let Some(entry) = self.entries.get_mut(key)
             && let Some(mut candidate) = entry.candidate.take()
         {
@@ -9340,6 +9353,14 @@ impl<C: Clock> Daemon<C> {
     /// behind. The Gateway that is active is stopped by the normal graceful path.
     #[cfg(unix)]
     pub fn abandon_gateway_updates(&mut self) {
+        #[cfg(target_os = "linux")]
+        if let Some(service) = &mut self.local_identify.send_grants {
+            for key in self.entries.keys() {
+                if let Some(sequence) = service.cancel_launch(key, true) {
+                    self.sequence = sequence;
+                }
+            }
+        }
         for entry in self.entries.values_mut() {
             entry.update_fallback_reserved = false;
             if let Some(mut candidate) = entry.candidate.take() {
@@ -9523,7 +9544,31 @@ impl<C: Clock> Daemon<C> {
         key: &ShardKey,
         credentials: &impl CredentialSource,
     ) -> Result<(), DaemonError> {
-        self.start_inner(key, credentials, StartKind::Manual)
+        loop {
+            let result = self.start_inner(key, credentials, StartKind::Manual);
+            #[cfg(target_os = "linux")]
+            if result == Err(DaemonError::IdentifyJournalPending)
+                && let Some(service) = &mut self.local_identify.send_grants
+            {
+                if !service.wait_for_write() {
+                    // A different operation owns an already durable launch.
+                    self.stop(key, StopMode::WaitForExit)?;
+                    return Err(DaemonError::IdentifyDeferred);
+                }
+                continue;
+            }
+            return result;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn cancel_journal_launch(&mut self, key: &ShardKey, standby: bool) {
+        if let Some(service) = &mut self.local_identify.send_grants
+            && let Some(sequence) = service.cancel_launch(key, standby)
+        {
+            // A submitted generation remains charged if the operation is cancelled.
+            self.sequence = sequence;
+        }
     }
 
     fn start_inner(
@@ -9537,29 +9582,32 @@ impl<C: Clock> Daemon<C> {
             return Err(DaemonError::InvalidState);
         }
         let entry = self.entries.get_mut(key).ok_or(DaemonError::UnknownShard)?;
-        if entry.snapshot.desired_running {
-            return Err(DaemonError::InvalidState);
+        if !entry.journal_start_pending {
+            if entry.snapshot.desired_running {
+                return Err(DaemonError::InvalidState);
+            }
+            if entry.started {
+                self.recovery
+                    .start_stopped(entry.recovery_key)
+                    .map_err(|_| DaemonError::InvalidState)?;
+            } else {
+                self.recovery
+                    .register(entry.recovery_key, 0)
+                    .map_err(|_| DaemonError::InvalidState)?;
+            }
+            entry.started = true;
+            entry.snapshot.desired_running = true;
         }
-        if entry.started {
-            self.recovery
-                .start_stopped(entry.recovery_key)
-                .map_err(|_| DaemonError::InvalidState)?;
-        } else {
-            self.recovery
-                .register(entry.recovery_key, 0)
-                .map_err(|_| DaemonError::InvalidState)?;
-        }
-        entry.started = true;
-        entry.snapshot.desired_running = true;
         // The accepted management operation owns this one launch. Its hold is
         // restored before the next automatic poll; no budget is reset.
         self.recovery
             .hold(entry.recovery_key, false)
             .map_err(|_| DaemonError::InvalidState)?;
         let result = self.poll_recovery(credentials, Some(key), kind);
-        let entry = &self.entries[key];
+        let entry = self.entries.get_mut(key).unwrap();
+        entry.journal_start_pending = result == Err(DaemonError::IdentifyJournalPending);
         let _ = self.recovery.hold(entry.recovery_key, entry.restart_held);
-        if kind == StartKind::Manual
+        if kind != StartKind::Automatic
             && matches!(
                 result,
                 Err(DaemonError::IdentifyDeferred | DaemonError::IdentifyUnavailable)
@@ -9840,6 +9888,9 @@ impl<C: Clock> Daemon<C> {
             if requested.is_none_or(|requested| requested == &key) {
                 first_error.get_or_insert(error);
             }
+            if error == DaemonError::IdentifyJournalPending {
+                continue;
+            }
             let entry = self.entries.get_mut(&key).unwrap();
             entry.snapshot.state = ProcessState::Failed { error, code: None };
             if matches!(
@@ -9969,7 +10020,10 @@ impl<C: Clock> Daemon<C> {
     /// Force requires the caller's explicit operator authorization. No kill or
     /// stop is issued on daemon Drop or when only a status client disconnects.
     pub fn stop(&mut self, key: &ShardKey, mode: StopMode) -> Result<(), DaemonError> {
+        #[cfg(target_os = "linux")]
+        self.cancel_journal_launch(key, false);
         let entry = self.entries.get_mut(key).ok_or(DaemonError::UnknownShard)?;
+        entry.journal_start_pending = false;
         entry.snapshot.desired_running = false;
         entry.snapshot.retry_at_ms = None;
         entry.admission_since = None;
