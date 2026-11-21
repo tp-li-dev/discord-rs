@@ -7056,6 +7056,8 @@ pub mod control {
             for _ in 0..9 {
                 daemon.local_identify.record("id-0", at);
             }
+            let (_, clock) = tokio::sync::watch::channel(Duration::from_secs(60));
+            let clock = MonotonicClock::with_manual_time(clock);
             let mut host = ProcessRecoveryHost {
                 entries: &mut daemon.entries,
                 credentials: &no_credentials,
@@ -7063,7 +7065,9 @@ pub mod control {
                 sequence: &mut daemon.sequence,
                 manual: Some(&other),
                 reserved_restart: None,
-                now: Duration::from_secs(60),
+                clock: &clock,
+                last_now: &mut daemon.last_now,
+                clock_failed: &mut daemon.clock_failed,
                 local_identify: &mut daemon.local_identify,
                 errors: BTreeMap::new(),
             };
@@ -7210,6 +7214,72 @@ pub mod control {
                     yes: true,
                     ..request("restart-all", 0, id)
                 }
+            }
+
+            #[tokio::test]
+            async fn recovery_pass_stall_does_not_backdate_the_next_identify_launch() {
+                use std::sync::Arc;
+                use std::sync::atomic::{AtomicUsize, Ordering};
+
+                // The first recovery-pass observation happens before the stall.
+                // All later observations are after it until the clock is advanced.
+                struct StallClock(Arc<AtomicUsize>);
+                impl Clock for StallClock {
+                    fn now(&self) -> Duration {
+                        let sample = self.0.fetch_add(1, Ordering::Relaxed);
+                        Duration::from_secs(match sample {
+                            0..=2 => 0,
+                            3..100 => 30,
+                            _ => 60,
+                        })
+                    }
+                    fn sleep_until(&self, _: Duration) -> crate::supervisor::Sleep<'_> {
+                        Box::pin(std::future::pending())
+                    }
+                }
+
+                let (plane, _) = fixture(1, 2, 10);
+                let specs = plane
+                    .daemon
+                    .entries
+                    .values()
+                    .map(|entry| entry.spec.clone())
+                    .collect();
+                let samples = Arc::new(AtomicUsize::new(0));
+                let mut daemon = Daemon::with_clock(
+                    specs,
+                    RestartPolicy::default(),
+                    StallClock(Arc::clone(&samples)),
+                )
+                .unwrap();
+                for entry in daemon.entries.values_mut() {
+                    daemon.recovery.register(entry.recovery_key, 0).unwrap();
+                    entry.started = true;
+                    entry.snapshot.desired_running = true;
+                }
+                let keys = [key(0, 0), key(0, 1)];
+                let running = |daemon: &Daemon<StallClock>| {
+                    keys.iter().filter(|key| daemon.has_child(key)).count()
+                };
+                daemon.poll(&credentials).unwrap();
+                assert_eq!(running(&daemon), 1);
+                daemon.poll(&credentials).unwrap();
+                assert_eq!(
+                    running(&daemon),
+                    1,
+                    "the clock has not moved since the first launch"
+                );
+
+                samples.store(100, Ordering::Relaxed);
+                daemon.poll(&credentials).unwrap();
+                assert_eq!(running(&daemon), 2);
+                for key in keys {
+                    daemon.stop(&key, StopMode::WaitForExit).unwrap();
+                    let recovery_key = daemon.entries[&key].recovery_key;
+                    let child = daemon.recovery.child_mut(recovery_key).unwrap().unwrap();
+                    child.kill().await.unwrap();
+                }
+                daemon.poll(&credentials).unwrap();
             }
 
             #[tokio::test]
@@ -8304,7 +8374,9 @@ struct ProcessRecoveryHost<'a, S> {
     sequence: &'a mut u64,
     manual: Option<&'a ShardKey>,
     reserved_restart: Option<&'a ShardKey>,
-    now: Duration,
+    clock: &'a dyn Clock,
+    last_now: &'a mut Duration,
+    clock_failed: &'a mut bool,
     local_identify: &'a mut crate::local_identify::LocalIdentifyRegistry,
     errors: BTreeMap<ShardKey, DaemonError>,
 }
@@ -8370,9 +8442,15 @@ impl<S: CredentialSource> RecoveryHost for ProcessRecoveryHost<'_, S> {
                 retry_after: Duration::ZERO,
             }
         } else {
+            let now = self.clock.now();
+            if *self.clock_failed || now < *self.last_now {
+                *self.clock_failed = true;
+                return IdentifyAdmission::Pending;
+            }
+            *self.last_now = now;
             entry.acquire_identify(
                 self.local_identify,
-                self.now,
+                now,
                 GatewayLaunch::Active,
                 LaunchGeneration {
                     daemon_instance: self.instance,
@@ -9755,12 +9833,17 @@ impl<C: Clock> Daemon<C> {
             sequence: &mut self.sequence,
             manual: requested.filter(|_| kind != StartKind::Automatic),
             reserved_restart: requested.filter(|_| kind == StartKind::Restart),
-            now: self.last_now,
+            clock: &*self.clock,
+            last_now: &mut self.last_now,
+            clock_failed: &mut self.clock_failed,
             local_identify: &mut self.local_identify,
             errors: BTreeMap::new(),
         };
         let mut events = self.recovery.poll(&mut host);
         let errors = host.errors;
+        if self.clock_failed && first_error.is_none() {
+            first_error = self.now().err();
+        }
         for (key, error) in errors {
             if requested.is_none_or(|requested| requested == &key) {
                 first_error.get_or_insert(error);
