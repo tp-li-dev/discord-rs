@@ -48,9 +48,11 @@ cron で自動化する場合（1 時間おき。`/etc/cron.d/soak-hourly` に�
 | fd | 各プロセスの `fds` | 増え続ける（リーク） |
 | ログ | `files` の大きさ | `gateway.log`／`core-*.log` が急に大きくなる |
 | 残骸 | sockets/secret・reservations の数 | 稼働中は socket 2 + secret 1、予約 1。それ以外が増える |
-| 接続 | `closes`、`worker_unavailable` | 切断が頻発（WSL と違い、通常は少ないはず） |
+| 接続 | `closes`、`resumed`、`worker_unavailable` | `closes` が増えたときはログで原因と復帰結果を確認する |
 | Core | `cores` の `running`／`failures` | `failures` が増える |
 | 応答 | 時々 `!count` を送る | 返信がない／数が飛ぶ |
+
+`soak-report.sh` は、Shard ごとの `gateway.log` と残っている旧 `gateway-candidate.log` から、`Gateway 切断` を含む行を `closes`、`Resume 成功` を含む行を `resumed` として別々に数えます。前者は Twilight の `GatewayClose` イベント、後者は Discord の `RESUMED` イベントの記録です。Twilight 0.18.0 には、WebSocket の読み取りが EOF で終わると Close イベントを返さずに再接続へ進む経路があります。その経路でも保持したセッションで Resume できるため、集計値から個々の切断と復帰は対応づけられません。集計は時刻の書式に依存せず、回転済みの `.log.1` は件数に含めません。
 
 ## 4. 終わり方
 

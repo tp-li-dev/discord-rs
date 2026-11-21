@@ -15,34 +15,27 @@ Bot が「メッセージを送る」という通信（HTTP）を Discord に出
 - 理由：複数のプロセス（旧 Gateway と新 Gateway、Core の再起動など）が関わる構成では、勝手に再送すると二重になりやすい。
 - exactly-once（ちょうど 1 回）は保証しない。重複を減らし、欠落を明示する設計。
 
-## discord.py の場合（**私の記憶。実装で未確認**）
+## discord.py v2.6.4 の場合（ソースで確認）
 
-- 一部の失敗は、自動でやり直す：混み合ったとき（HTTP 429）は、指示された時間を待って再試行。サーバーの一時的な障害（500、502、504 など）や一部の接続切れは、数回（5 回程度）再試行、と記憶している。
-- そのため、まれに二重投稿になり得るが、それを許容している。
-- やり直しても失敗したら、例外として利用者のコードに渡す。
-- **確認の方法：** discord.py の `http.py`（`HTTPClient.request`）を読む。
+- `Messageable.send` は nonce の指定がなければ 64 ビットの乱数を 1 回生成する。HTTP 本文には nonce を文字列で入れ、`enforce_nonce=true` を付ける。同じ呼び出しの HTTP 再試行では、この本文の nonce を再利用する。[Messageable.send](https://github.com/Rapptz/discord.py/blob/v2.6.4/discord/abc.py#L1554-L1575)、[handle_message_parameters](https://github.com/Rapptz/discord.py/blob/v2.6.4/discord/http.py#L194-L196)、[HTTPClient.request](https://github.com/Rapptz/discord.py/blob/v2.6.4/discord/http.py#L589-L723)。
+- `HTTPClient.request` は初回を含め最大 5 試行。再試行の条件を満たす 429 は `retry_after` を待ち、500・502・504・524 と一部の接続リセット（`errno` 54 または 10054）はバックオフする。他の 5xx や試行を使い切ったときは例外になる。[HTTPClient.request](https://github.com/Rapptz/discord.py/blob/v2.6.4/discord/http.py#L589-L723)。
 
-## 改善の候補：重複防止の印（nonce）（**私の記憶。公式で未確認**）
+## 改善の候補：nonce による期間限定の重複抑止
 
-Discord のメッセージ作成には、`nonce` と `enforce_nonce` があり、**同じ印のメッセージは、短い時間内に 1 通だけ作られる**（重複したら、既存のメッセージが返る）と記憶している。もし使えるなら、**印を付けて安全に再試行できる**。
-
-確認すること：
-1. Discord の公式ドキュメント（Create Message）の `nonce`、`enforce_nonce` の仕様と、有効な時間。
-2. 使用している通信ライブラリ（twilight）が、これを指定できるか。
-3. メッセージ作成以外の操作（編集、リアクション、スラッシュの応答など）に、同様の仕組みがあるか。ないものは、冪等（何度やっても同じ結果）かどうかで分ける。
+Create Message では、`nonce` は整数または文字列で最大 25 文字。`enforce_nonce=true` と nonce を指定すると、過去数分の同じ投稿者・同じ nonce のメッセージがあればそのメッセージを返す。保持期間の正確な長さ、チャンネルをまたぐ範囲、削除・編集後の挙動は未確認。[Discord Create Message](https://docs.discord.com/developers/resources/message#create-message)。
 
 ## 調査の結果（2026-11-16 夜、twilight-http 0.18 のソースで確認）
 
-- `CreateMessage::nonce(u64)` はある（`twilight-http-0.18.0/src/request/channel/message/create_message.rs`、280 行付近）。**`enforce_nonce` を指定するメソッドはない**（`nonce` の記述のみ）。`nonce` だけでは Discord が重複を除くとは限らない（私の記憶。未確認）。
+- `CreateMessage::nonce(u64)` はある（`twilight-http-0.18.0/src/request/channel/message/create_message.rs`、280 行付近）。**`enforce_nonce` を指定するメソッドはない**（`nonce` の記述のみ）。
 - **`payload_json(&[u8])` で、リクエスト本文を JSON で直接渡せる**（「呼ぶと、`attachments` 以外の他のフィールドは無視される」）。本文に `"enforce_nonce": true` と `"nonce"` を含めれば、ライブラリが未対応でも送れる見込み。
 - 現在、通常の返信と `!workers` は `http.create_message(...)` で送っている（`src/src/main.rs` の 1298・1335 行付近）。
-- **未確認（肝心）**：Discord が `enforce_nonce` で実際に重複を除くか、重複を除く時間、nonce の形式の制約。公式ドキュメントの確認、または実機で同じ nonce の同じ本文を 2 回送って見る（実際にチャンネルへ投稿される。投稿先と許可が要る）。
+- **未確認（実機）**：同じ nonce で再送したときの重複抑止。実際に投稿する試験には投稿先と許可が要る。
 - 確認の手順（案）：試験用の小さなプログラムで、(1) 同じ nonce・同じ本文を 2 回送り、返ったメッセージ ID が同じか、チャンネルに 1 通だけ残るかを見る。(2) 1 分・5 分と時間を空けて再度送り、重複を除く時間の目安を見る。
 
 ## 提案する方針
 
 - 原則：**自動で再試行しない**（現状維持）。
-- 例外：**重複を防げると確認できた操作だけ**（nonce が使えるメッセージ作成、冪等な操作）、安全に再試行する。
+- 例外：**重複を防げると確認できた操作だけ**（検証した重複抑止期間内のメッセージ作成、冪等な操作）を再試行する。
 - どの操作を再試行してよいかは、**操作の種類ごとの一覧**として、文書とコードで持つ。
 
 ## 未確認（実機）

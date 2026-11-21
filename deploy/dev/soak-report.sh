@@ -34,10 +34,24 @@ echo "--- gateway.log signals (counts) ---"
 # Since 2026-11-16 a standby Gateway logs into the same gateway.log. Versions before that wrote
 # the active Gateway's output to gateway-candidate.log after an update; a leftover file of that
 # name is still counted together with gateway.log.
-for f in $(find "$ROOT" -name gateway.log 2>/dev/null); do
-  d=$(dirname "$f"); logs="$f"; [ -f "$d/gateway-candidate.log" ] && logs="$f $d/gateway-candidate.log"
-  echo "$(basename "$d"): generations=$(cat $logs | grep -c 'gateway generation')"        "login=$(cat $logs | grep -c 'ログイン成功') closes=$(cat $logs | grep -c 'Gateway 切断')"        "worker_unavailable=$(cat $logs | grep -c 'unavailable') rest_unknown=$(cat $logs | grep -c '結果不明') resumed=$(cat $logs | grep -c 'Resume 成功')"
-done
+# Count each signal from the same pass through the log. The timestamp is not part of a match.
+while IFS= read -r -d '' f; do
+  d=$(dirname "$f")
+  logs=("$f")
+  if [ -f "$d/gateway-candidate.log" ]; then logs+=("$d/gateway-candidate.log"); fi
+  printf '%s: ' "$(basename "$d")"
+  awk '
+    /gateway generation/ { generations++ }
+    /ログイン成功/       { login++ }
+    /Gateway 切断/       { closes++ }
+    /unavailable/        { unavailable++ }
+    /結果不明/           { unknown++ }
+    /Resume 成功/        { resumed++ }
+    END {
+      printf "generations=%d login=%d closes=%d worker_unavailable=%d rest_unknown=%d resumed=%d\n",
+             generations, login, closes, unavailable, unknown, resumed
+    }' "${logs[@]}"
+done < <(find "$ROOT" -name gateway.log -print0 2>/dev/null)
 echo "core duplicates dropped (last): $(grep -h '重複したメッセージ' "$ROOT"/*/*/ipc/core-*.log 2>/dev/null | tail -n 1)"
 
 echo "--- journal since boot: warnings/errors count ---"

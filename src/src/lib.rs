@@ -25,6 +25,7 @@ pub mod identify;
 pub mod interaction_flow;
 pub mod local_control;
 pub mod local_identify;
+pub mod log_time;
 pub mod metrics;
 pub mod metrics_feed;
 pub mod ownership;

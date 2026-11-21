@@ -89,7 +89,12 @@ fn open_gateway_log(dir: &Path, max_bytes: u64, generation: u64) -> Option<std::
         file.set_permissions(std::fs::Permissions::from_mode(0o600))
             .ok()?;
     }
-    writeln!(file, "--- gateway generation {generation} ---").ok()?;
+    writeln!(
+        file,
+        "--- gateway generation {generation} --- ({})",
+        crate::log_time::utc_stamp()
+    )
+    .ok()?;
     Some(file)
 }
 /// Authenticated update admission and off-loop audit/artifact work.
@@ -4130,7 +4135,14 @@ pub mod control {
             let dir = log_dir("create");
             drop(open_gateway_log(&dir, 1024, 7).expect("opened"));
             let text = std::fs::read_to_string(dir.join("gateway.log")).unwrap();
-            assert_eq!(text, "--- gateway generation 7 ---\n");
+            let stamp = text
+                .strip_prefix("--- gateway generation 7 --- (")
+                .and_then(|line| line.strip_suffix("Z)\n"))
+                .expect("timestamped generation marker");
+            let (seconds, millis) = stamp.split_once('.').unwrap();
+            assert_eq!(seconds.len(), 19);
+            assert_eq!(millis.len(), 3);
+            assert!(millis.bytes().all(|byte| byte.is_ascii_digit()));
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -4153,10 +4165,9 @@ pub mod control {
                 std::fs::read(dir.join("gateway.log.1")).unwrap(),
                 vec![b'x'; 100]
             );
-            assert_eq!(
-                std::fs::read_to_string(dir.join("gateway.log")).unwrap(),
-                "--- gateway generation 2 ---\n"
-            );
+            let text = std::fs::read_to_string(dir.join("gateway.log")).unwrap();
+            assert_eq!(text.lines().count(), 1);
+            assert!(text.starts_with("--- gateway generation 2 --- ("));
             // Under the limit: appended, not rotated.
             drop(open_gateway_log(&dir, 1024, 3).expect("opened"));
             let text = std::fs::read_to_string(dir.join("gateway.log")).unwrap();

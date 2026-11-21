@@ -111,15 +111,16 @@ rx=$(gw "$T/first" resumed); ry=$(gw "$T/last" resumed)
 for K in generations closes worker_unavailable; do
   x=$(gw "$T/first" "$K"); y=$(gw "$T/last" "$K"); echo "$K (sum over gateway.log): $x -> $y"
   if isnum "$x" && isnum "$y"; then
-    if [ "$K" = closes ] && isnum "$rx" && isnum "$ry"; then
-      # 切断が増えても、増えた分がすべて Resume で復帰していれば異常ではない（Discord の Reconnect 要求など）。
-      dc=$((y - x)); dr=$((ry - rx))
-      if [ "$dc" -gt "$dr" ]; then add "$K" WATCH "closes +$dc but resumed +$dr (a disconnect without a resume)"
-      else add "$K" OK "closes +$dc, resumed +$dr (every disconnect resumed)"; fi
+    if [ "$K" = closes ] && [ "$y" -lt "$x" ]; then
+      add "$K" WATCH "$x->$y (close log count decreased; check rotation)"
+    elif [ "$K" = closes ] && [ "$y" -gt "$x" ]; then
+      # Close events and successful Resumes are independent log signals.
+      add "$K" WATCH "$x->$y (close log lines increased; inspect Gateway logs for outcomes)"
     elif [ "$y" -gt "$x" ]; then add "$K" WATCH "$x->$y"; else add "$K" OK "$x->$y"; fi
   else add "$K" NA "n/a"; fi
 done
 echo "resumed (sum over gateway.log): ${rx:-n/a} -> ${ry:-n/a}"
+echo "Close and Resume counts are independent log signals."
 ja=$(jw "$T/first"); jb=$(jw "$T/last"); echo "journal warnings since boot: $ja -> $jb"
 if isnum "$a" && isnum "$b"; then
   if [ "$b" -gt "$a" ]; then add restarts WATCH "NRestarts $a->$b"; else add restarts OK "NRestarts $a->$b"; fi

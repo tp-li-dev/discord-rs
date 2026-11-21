@@ -9,9 +9,13 @@
 
 use serde_json::{Value, json};
 use std::{
+    ffi::OsStr,
     future::Future,
     io::Write,
-    os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    os::{
+        fd::{AsRawFd, FromRawFd, OwnedFd},
+        unix::ffi::OsStrExt,
+    },
     path::{Path, PathBuf},
     process::{Output, Stdio},
     sync::atomic::{AtomicU64, Ordering},
@@ -51,10 +55,14 @@ fn secret_hex() -> String {
     SECRET.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-async fn bounded<T>(future: impl Future<Output = T>) -> T {
-    tokio::time::timeout(WAIT, future)
-        .await
-        .expect("separate cores deadline")
+#[track_caller]
+fn bounded<T>(future: impl Future<Output = T>) -> impl Future<Output = T> {
+    let caller = std::panic::Location::caller();
+    async move {
+        tokio::time::timeout(WAIT, future)
+            .await
+            .unwrap_or_else(|_| panic!("separate cores deadline ({WAIT:?}) at {caller}"))
+    }
 }
 
 struct Gateway {
@@ -316,7 +324,7 @@ async fn control(port: u16, value: Value) -> Value {
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    panic!("audit replay did not finish");
+    panic!("audit replay still pending after 200 attempts on test daemon port {port}");
 }
 
 async fn control_once(port: u16, mut value: Value) -> Value {
@@ -331,6 +339,10 @@ async fn control_once(port: u16, mut value: Value) -> Value {
     bounded(BufReader::new(stream).read_until(b'\n', &mut reply))
         .await
         .unwrap();
+    assert!(
+        !reply.is_empty(),
+        "test daemon on port {port} closed the control connection without a response"
+    );
     serde_json::from_slice(&reply).expect("daemon response")
 }
 
@@ -536,6 +548,24 @@ async fn gateway_update_replaces_the_gateway_and_keeps_the_cores() {
     let _ = std::fs::remove_dir_all(&fixture.root);
 }
 
+fn belongs_to_fixture(arg: &[u8], root: &Path) -> bool {
+    Path::new(OsStr::from_bytes(arg)).starts_with(root)
+}
+
+#[test]
+fn process_scan_excludes_fixtures_with_the_same_path_prefix() {
+    let root = Path::new("/tmp/bsc123-1");
+    assert!(belongs_to_fixture(
+        b"/tmp/bsc123-1/bot/shard/ipc/core.sock",
+        root
+    ));
+    assert!(!belongs_to_fixture(
+        b"/tmp/bsc123-10/bot/shard/ipc/core.sock",
+        root
+    ));
+    assert!(!belongs_to_fixture(b"/tmp/bsc123-11/bot/shard", root));
+}
+
 #[tokio::test]
 async fn a_core_crash_during_a_gateway_update_leaves_a_working_system() {
     let fixture = Fixture::start().await;
@@ -549,34 +579,43 @@ async fn a_core_crash_during_a_gateway_update_leaves_a_working_system() {
         json!({"command":"gateway-update","bot":"101","operation_id":id}),
     )
     .await;
-    signal(original_cores[0], "KILL");
     assert_eq!(admitted["ok"], true, "{admitted}");
+    signal(original_cores[0], "KILL");
 
-    bounded(async {
+    let mut last_operation_state = Value::Null;
+    tokio::time::timeout(WAIT, async {
         loop {
             let view = control(
                 fixture.port,
                 json!({"command":"operation","operation_id":id}),
             )
             .await;
-            if matches!(
-                view["operation"]["state"].as_str(),
-                Some("succeeded" | "failed")
-            ) {
+            last_operation_state = view["operation"]["state"].clone();
+            if matches!(last_operation_state.as_str(), Some("succeeded" | "failed")) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     })
-    .await;
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "gateway-update {id} did not finish within {WAIT:?}: \
+             state={last_operation_state}, botd={botd_pid}, botd_alive={}",
+            alive(botd_pid)
+        )
+    });
 
     // Identify all fixture processes, including any that have lost their parent. Both
     // Gateway and Core command lines contain the fixture's private runtime path.
-    let (gateway_pid, cores) = bounded(async {
+    let mut gateways = Vec::new();
+    let mut cores = Vec::new();
+    let mut wrong_parents = Vec::new();
+    let gateway_pid = tokio::time::timeout(WAIT, async {
         loop {
-            let mut gateways = Vec::new();
-            let mut cores = Vec::new();
-            let mut all_children = true;
+            gateways.clear();
+            cores.clear();
+            wrong_parents.clear();
             for entry in std::fs::read_dir("/proc").unwrap().flatten() {
                 let Some(pid) = entry
                     .file_name()
@@ -592,8 +631,11 @@ async fn a_core_crash_during_a_gateway_update_leaves_a_working_system() {
                     continue;
                 };
                 let args: Vec<_> = cmdline.split(|b| *b == 0).collect();
-                let root = fixture.root.to_string_lossy();
-                if !args.iter().any(|arg| arg.starts_with(root.as_bytes())) || !alive(pid) {
+                if !args
+                    .iter()
+                    .any(|arg| belongs_to_fixture(arg, &fixture.root))
+                    || !alive(pid)
+                {
                     continue;
                 }
                 let status =
@@ -601,44 +643,64 @@ async fn a_core_crash_during_a_gateway_update_leaves_a_working_system() {
                 let parent = status
                     .lines()
                     .find_map(|line| line.strip_prefix("PPid:")?.trim().parse::<u32>().ok());
-                all_children &= parent == Some(botd_pid);
+                if parent != Some(botd_pid) {
+                    wrong_parents.push((pid, parent));
+                }
                 if args.contains(&b"--core-listen".as_slice()) {
                     cores.push(pid);
                 } else {
                     gateways.push(pid);
                 }
             }
-            if all_children
+            if wrong_parents.is_empty()
                 && gateways.len() == 1
                 && cores.len() == 2
                 && !cores.contains(&original_cores[0])
                 && cores.iter().all(|pid| alive(*pid))
             {
-                break (gateways[0], cores);
+                break gateways[0];
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     })
-    .await;
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "fixture process recovery exceeded {WAIT:?}: update={last_operation_state}, \
+             botd={botd_pid}, gateways={gateways:?}, cores={cores:?}, \
+             wrong_parents={wrong_parents:?}, original_cores={original_cores:?}"
+        )
+    });
 
     let mut gateway = if gateway_pid == original_gateway {
         first.take().unwrap()
     } else {
-        bounded(async {
+        let mut last_candidate = None;
+        tokio::time::timeout(WAIT, async {
             loop {
                 let candidate = fixture.accept().await;
-                if candidate.pid() == gateway_pid {
+                last_candidate = Some(candidate.pid());
+                if last_candidate == Some(gateway_pid) {
                     break candidate;
                 }
             }
         })
         .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "collector did not announce recovered Gateway {gateway_pid} within {WAIT:?}: \
+                 last_candidate={last_candidate:?}, cores={cores:?}"
+            )
+        })
     };
-    bounded(async {
+    let mut last_reported_pid = Value::Null;
+    let mut workers = Vec::new();
+    tokio::time::timeout(WAIT, async {
         loop {
             let status = gateway.status().await;
-            let workers = worker_pids(&status);
-            if status["pid"] == gateway_pid
+            last_reported_pid = status["pid"].clone();
+            workers = worker_pids(&status);
+            if last_reported_pid == gateway_pid
                 && workers.len() == 2
                 && workers.iter().all(|pid| cores.contains(pid) && alive(*pid))
                 && workers[0] != workers[1]
@@ -648,17 +710,36 @@ async fn a_core_crash_during_a_gateway_update_leaves_a_working_system() {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     })
-    .await;
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "Gateway did not attach to both Cores within {WAIT:?}: expected_gateway={gateway_pid}, \
+             reported_gateway={last_reported_pid}, expected_cores={cores:?}, reported_cores={workers:?}"
+        )
+    });
 
     signal(botd_pid, "TERM");
     let mut daemon = fixture.daemon;
-    bounded(daemon.wait()).await.unwrap();
-    bounded(async {
-        while [gateway_pid, cores[0], cores[1]].into_iter().any(alive) {
+    let expected_children = [gateway_pid, cores[0], cores[1]];
+    tokio::time::timeout(WAIT, daemon.wait())
+        .await
+        .unwrap_or_else(|_| {
+            panic!("botd {botd_pid} did not exit within {WAIT:?}: children={expected_children:?}")
+        })
+        .unwrap();
+    tokio::time::timeout(WAIT, async {
+        while expected_children.into_iter().any(alive) {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
-    .await;
+    .await
+    .unwrap_or_else(|_| {
+        let remaining: Vec<_> = expected_children
+            .into_iter()
+            .filter(|pid| alive(*pid))
+            .collect();
+        panic!("test children still alive after botd {botd_pid} exited: {remaining:?}")
+    });
     let ipc: Vec<_> = walk(&fixture.root)
         .into_iter()
         .filter(|p| p.extension().is_some_and(|e| e == "sock" || e == "secret"))
