@@ -869,7 +869,12 @@ async fn run() -> Result<(), &'static str> {
     if options.identify_send_grants {
         daemon
             .enable_identify_send_grants(&options.runtime_root)
-            .map_err(|_| "Identify send grant journal unavailable")?;
+            .map_err(|error| match error {
+                DaemonError::IdentifyBootIdUnavailable => {
+                    "Identify send grants require the kernel boot ID (/proc/sys/kernel/random/boot_id or systemd identify-boot-id credential)"
+                }
+                _ => "Identify send grant journal unavailable",
+            })?;
     }
     daemon
         .configure_create_message_nonce_retry(&config, &options.nonce_retry_bots)

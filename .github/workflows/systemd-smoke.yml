@@ -18,6 +18,7 @@ on:
       - 'src/src/core_attach.rs'
       - 'src/src/core_server.rs'
       - 'src/src/daemon.rs'
+      - 'src/src/identify_grant/**'
 
 permissions:
   contents: read
@@ -32,7 +33,7 @@ env:
 
 jobs:
   smoke:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -146,6 +147,31 @@ jobs:
           status=$(systemctl show botd -p ExecMainStatus --value)
           echo "Result=$result ExecMainStatus=$status"
           test "$result" = "success"
+      - name: Identify send grants reach READY=1 under the shipped sandbox
+        run: |
+          set -euo pipefail
+          sed -e 's/--no-autostart$/--no-autostart --identify-send-grants/' \
+              -e 's|/var/lib/discord-rs/runtime|/var/lib/discord-rs/grant-smoke|' \
+              /tmp/smoke.conf > /tmp/smoke-grants.conf
+          sudo install -m 0644 /tmp/smoke-grants.conf /etc/systemd/system/botd.service.d/smoke.conf
+          sudo systemctl daemon-reload
+          if ! sudo systemctl start botd; then
+            sudo journalctl -u botd --no-pager -n 30
+            exit 1
+          fi
+          systemctl is-active --quiet botd
+          sudo -u discord-rs /opt/discord-rs/bin/botctl status --secret-file /etc/discord-rs/botd.secret --port 47321 --json \
+            | python3 -c 'import json,sys; assert json.load(sys.stdin)["ok"] is True'
+          sudo python3 - <<'PY'
+          import json
+          from pathlib import Path
+          expected = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+          journal = Path("/var/lib/discord-rs/grant-smoke/identify-send-grants.jsonl")
+          assert json.loads(journal.read_text().splitlines()[0])["action"]["boot_id"] == expected
+          PY
+          sudo systemctl stop botd
+          sudo install -m 0644 /tmp/smoke.conf /etc/systemd/system/botd.service.d/smoke.conf
+          sudo systemctl daemon-reload
       - name: Gateway and Core start under systemd (mock Discord), baseline vs hardened
         run: |
           set +e

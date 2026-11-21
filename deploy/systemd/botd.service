@@ -108,6 +108,9 @@ ProtectKernelLogs=yes
 ProtectHostname=yes
 ProtectProc=invisible
 ProcSubset=pid
+# ProcSubset=pid hides /proc/sys. The manager reads just the boot ID for
+# --identify-send-grants and provides a read-only service credential.
+LoadCredential=identify-boot-id:/proc/sys/kernel/random/boot_id
 RestrictRealtime=yes
 SystemCallArchitectures=native
 # システムコールは @system-service のみ許可（通常のサーバ処理に必要な範囲）。@privileged と

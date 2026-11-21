@@ -11,6 +11,8 @@
 #   6. --core-mode separate（drop-in で有効化）: Core は botd の子（Gateway の子ではない）、
 #      Gateway を kill しても Core の PID は不変、stop 後に Gateway/Core が残らず ipc に *.sock と core.secret が残らない
 #
+#   7. --identify-send-grants --no-autostart で READY=1 と boot ID の記録を確認する
+#
 # 使い方（root で実行。専用ユーザー・/opt・/etc・unit を作り、終了時にすべて削除する）:
 #   sudo ./wsl-systemd-smoke.sh /path/to/discord-rs        # リポジトリのルート。target/release に botd botctl src が必要
 set -u
@@ -183,6 +185,24 @@ echo "Result=$result leftover processes=$left sock files=$socks core.secret=$sec
 if [ "$result" = success ] && [ "$left" = 0 ] && [ "$socks" = 0 ] && [ "$secret" = 0 ]; then echo "OK: separate mode stopped cleanly"; else echo "FAIL: unclean separate stop"; ps -u "$USER_NAME" -o pid,ppid,cmd | head; ls -la "$ipc_dir" 2>/dev/null; fail=1; fi
 rm -f /etc/systemd/system/botd.service.d/zz-separate.conf
 systemctl daemon-reload
+
+echo "--- 7. --identify-send-grants --no-autostart (READY=1) ---"
+cat > /etc/systemd/system/botd.service.d/zz-grants.conf <<CONF
+[Service]
+ExecStart=
+ExecStart=/opt/discord-rs/bin/botd --file /etc/discord-rs/bots.toml --runtime-root /var/lib/discord-rs/grant-smoke --gateway-program /opt/discord-rs/bin/src --secret-file /etc/discord-rs/botd.secret --token-file %d/botd.env --control-port $PORT --stop-children-on-exit --identify-send-grants --no-autostart
+CONF
+systemctl daemon-reload
+if systemctl start botd && systemctl is-active --quiet botd && \
+  status_json | python3 -c 'import json,sys; assert json.load(sys.stdin)["ok"] is True' && \
+  python3 -c 'from pathlib import Path; import json; boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip(); assert json.loads(Path("/var/lib/discord-rs/grant-smoke/identify-send-grants.jsonl").read_text().splitlines()[0])["action"]["boot_id"] == boot'; then
+  echo "OK: grant service ready with the kernel boot ID"
+else
+  echo "FAIL: grant service did not reach ready with the kernel boot ID"
+  journalctl -u botd --no-pager | tail -20
+  fail=1
+fi
+systemctl stop botd
 
 echo "=== result: $([ "$fail" = 0 ] && echo PASS || echo FAIL) ==="
 exit "$fail"

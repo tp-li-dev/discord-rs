@@ -41,6 +41,24 @@ impl Drop for Root {
     }
 }
 
+#[test]
+fn boot_id_uses_the_systemd_copy_when_proc_is_hidden() {
+    let root = Root::new();
+    let proc = root.0.join("proc-boot-id");
+    let credential = root.0.join(BOOT_ID_CREDENTIAL);
+    std::fs::write(&credential, format!("{BOOT}\n")).unwrap();
+    assert_eq!(read_boot_id(&proc, Some(&root.0)).unwrap(), BOOT);
+    assert!(read_boot_id(&proc, None).is_err());
+    std::fs::write(&proc, ANOTHER_BOOT).unwrap();
+    assert_eq!(read_boot_id(&proc, Some(&root.0)).unwrap(), ANOTHER_BOOT);
+    std::fs::remove_file(&proc).unwrap();
+    std::fs::write(&credential, "invalid").unwrap();
+    assert_eq!(
+        read_boot_id(&proc, Some(&root.0)).unwrap_err().kind(),
+        io::ErrorKind::InvalidData
+    );
+}
+
 fn secs(n: u64) -> Duration {
     Duration::from_secs(n)
 }

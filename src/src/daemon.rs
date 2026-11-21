@@ -8325,6 +8325,7 @@ pub enum DaemonError {
     IdentifyUnavailable,
     IdentifyJournalPending,
     IdentifyJournalBusy,
+    IdentifyBootIdUnavailable,
     IdentifyJournalCapacity,
     RestartBudget,
     RestartDeferred,
@@ -9058,10 +9059,10 @@ impl<C: Clock> Daemon<C> {
         {
             return Err(DaemonError::InvalidState);
         }
-        self.local_identify.send_grants = Some(
-            crate::identify_grant::service::Service::open(root, self.local_identify.policy())
-                .map_err(|_| DaemonError::IdentifyUnavailable)?,
-        );
+        self.local_identify.send_grants = Some(crate::identify_grant::service::Service::open(
+            root,
+            self.local_identify.policy(),
+        )?);
         Ok(())
     }
 

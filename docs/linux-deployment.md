@@ -185,6 +185,11 @@ unit の要点（`deploy/systemd/botd.service` 内のコメントも参照）:
 - `User=discord-rs`、`NoNewPrivileges=yes`、`ProtectSystem=strict`、`ProtectHome=yes`、`PrivateTmp=yes`、
   `ReadWritePaths=/var/lib/discord-rs`、`LoadCredential=botd.env:/etc/discord-rs/botd.env`、
   `Restart=on-failure`、`RestartSec=5s`、`LimitNOFILE=65536`、ログは journald。
+- `--identify-send-grants` はカーネルの boot ID が必要です。`ProcSubset=pid` は維持し、
+  systemd が `LoadCredential=identify-boot-id:/proc/sys/kernel/random/boot_id` でその値だけを
+  読み取り専用で渡します。unit 以外の通常起動では procfs から読みます。
+  [Ubuntu 24.04 systemd.exec(5)](https://manpages.ubuntu.com/manpages/noble/man5/systemd.exec.5.html)
+  · [Linux procfs](https://docs.kernel.org/filesystems/proc.html#mount-options)
 - **`--stop-children-on-exit`（ExecStart）と `KillSignal=SIGTERM`**: このフラグ有効時、botd は SIGINT と SIGTERM の
   どちらでも、起動した全 Shard の Gateway 子へ graceful な停止を要求し、最大 30 秒待ってから終了します。止まった子の
   起動予約は解放されます。期限内に止まらない子は botd が強制終了せず、標準エラー（journald）に出して終了します。
