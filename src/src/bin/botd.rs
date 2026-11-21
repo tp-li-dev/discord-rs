@@ -1,13 +1,13 @@
 //! Local authenticated daemon control. Bootstrap capability arrives on anonymous stdin
 //! (`--bootstrap-stdin`) or from a permission-checked file (`--secret-file`, for systemd).
-//! The TCP listener is always loopback; it is not a remote management endpoint. Its port
-//! is random unless `--control-port` is given (only with `--secret-file`).
+//! The listener is loopback TCP (random port by default) or a private Linux Unix socket.
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use src::daemon::control::{AUDIT_ACK_TIMEOUT, CommandRequest, ControlPlane, NOTE};
 use src::daemon::update_control::{ControlAccess, UpdateHub};
+use src::management::{self, Key, Listener, Protocol, Session};
+use src::update_rollback::UpdateControlRequest;
 use src::{cluster::NodeId, cluster_runtime::RaftRuntimeOptions, raft_quorum::StorageMode};
-use src::{local_control::DaemonControlEnvelope, update_rollback::UpdateControlRequest};
 use std::{
     collections::{BTreeMap, HashSet},
     ffi::OsString,
@@ -16,19 +16,16 @@ use std::{
     path::PathBuf,
     time::Duration,
 };
-use subtle::ConstantTimeEq;
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
-    net::TcpListener,
     sync::{mpsc, oneshot},
-    task::JoinSet,
 };
 
 const REQUEST_LIMIT: u64 = 4096;
-const RESPONSE_LIMIT: usize = 64 * 1024;
+const RESPONSE_LIMIT: usize = management::RESPONSE_LIMIT;
 const DEADLINE: Duration = Duration::from_secs(3);
 const NONCE_RETRY_FOR: &str = "--enable-create-message-nonce-retry-for";
-const USAGE: &str = "usage: botd --file F --runtime-root ABS --gateway-program ABS (--bootstrap-stdin | --secret-file ABS [--control-port PORT]) [--no-autostart] [--stop-children-on-exit] [--core-mode embedded|separate] [--identify-send-grants] [--enable-create-message-nonce-retry-for BOT_ID ...] [--mock-discord LOOPBACK_IP:PORT] [--allow-test-quorum] [--allow-raft-quorum --raft-store ABS --raft-rpc-listen LOOPBACK_IP:PORT --raft-rpc-peer ID=LOOPBACK_IP:PORT ... [--raft-create] [--raft-bootstrap]] [--allow-test-gateway-switch --mock-identify-budget F]";
+const USAGE: &str = "usage: botd --file F --runtime-root ABS --gateway-program ABS (--bootstrap-stdin | --secret-file ABS [--control-port PORT | --control-socket ABS]) [--no-autostart] [--stop-children-on-exit] [--core-mode embedded|separate] [--identify-send-grants] [--enable-create-message-nonce-retry-for BOT_ID ...] [--mock-discord LOOPBACK_IP:PORT] [--allow-test-quorum] [--allow-raft-quorum --raft-store ABS --raft-rpc-listen LOOPBACK_IP:PORT --raft-rpc-peer ID=LOOPBACK_IP:PORT ... [--raft-create] [--raft-bootstrap]] [--allow-test-gateway-switch --mock-identify-budget F]";
 
 struct Options {
     file: PathBuf,
@@ -51,6 +48,7 @@ struct Options {
     mock_recovery_max_restarts: Option<u32>,
     secret_file: Option<PathBuf>,
     control_port: u16,
+    control_socket: Option<PathBuf>,
 }
 
 fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'static str> {
@@ -80,6 +78,7 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
     let mut mock_recovery_max_restarts = None;
     let mut secret_file = None;
     let mut control_port = None;
+    let mut control_socket = None;
     while let Some(arg) = args.next() {
         let target = match arg.to_str() {
             Some("--identify-send-grants")
@@ -127,6 +126,9 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
             Some("--gateway-program") if gateway_program.is_none() => &mut gateway_program,
             Some("--raft-store") if raft_store.is_none() => &mut raft_store,
             Some("--secret-file") if secret_file.is_none() => &mut secret_file,
+            Some("--control-socket") if cfg!(target_os = "linux") && control_socket.is_none() => {
+                &mut control_socket
+            }
             Some("--control-port") if control_port.is_none() => {
                 let port = args
                     .next()
@@ -306,6 +308,7 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
         mock_recovery_max_restarts,
         secret_file,
         control_port: control_port.unwrap_or(0),
+        control_socket,
     };
     if options
         .core_status_dir
@@ -329,6 +332,16 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
     }
     if control_port.is_some() && options.secret_file.is_none() {
         return Err("--control-port requires --secret-file");
+    }
+    if let Some(path) = &options.control_socket {
+        if control_port.is_some() || options.secret_file.is_none() {
+            return Err(
+                "--control-socket requires --secret-file and conflicts with --control-port",
+            );
+        }
+        if !path.is_absolute() {
+            return Err("--control-socket requires an absolute path");
+        }
     }
     if !options.runtime_root.is_absolute() || !options.gateway_program.is_absolute() {
         return Err("runtime root and gateway program must be absolute paths");
@@ -389,7 +402,6 @@ struct Bootstrap {
 #[derive(Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct StatusRequest {
-    secret: [u8; 32],
     command: String,
     #[serde(default)]
     bot: Option<String>,
@@ -424,12 +436,12 @@ struct Envelope {
     response: oneshot::Sender<Value>,
 }
 
-// Each alternative is strict, including the flattened update payload. No role,
+// Each alternative is strict, including the typed update payload. No role,
 // subject or scope supplied by a connected client is accepted here.
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum WireRequest {
-    Update(Box<DaemonControlEnvelope<UpdateControlRequest>>),
+    Update(Box<UpdateControlRequest>),
     Command(Box<StatusRequest>),
 }
 
@@ -489,44 +501,39 @@ async fn load_bootstrap(secret_file: Option<&std::path::Path>) -> Result<Bootstr
 
 #[cfg(test)]
 async fn serve_status<S: AsyncRead + AsyncWrite + Unpin>(
-    stream: S,
+    mut stream: S,
     secret: &[u8; 32],
     commands: &mpsc::Sender<Envelope>,
 ) -> io::Result<()> {
-    serve_control(stream, secret, &ControlAccess::default(), commands).await
+    let (session, _) =
+        management::authenticate_server(&mut stream, Protocol::Botd, &[Key::new(secret)]).await?;
+    serve_control(stream, session, &ControlAccess::default(), commands).await
 }
 
 async fn serve_control<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
-    secret: &[u8; 32],
+    session: Session,
     access: &ControlAccess,
     commands: &mpsc::Sender<Envelope>,
 ) -> io::Result<()> {
-    let frame = tokio::time::timeout(DEADLINE, read_frame(&mut stream))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "control frame timed out"))??;
+    let frame = tokio::time::timeout(
+        DEADLINE,
+        session.read_request(&mut stream, management::BOTD_REQUEST_LIMIT),
+    )
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "control frame timed out"))??;
     let request: WireRequest = serde_json::from_slice(&frame)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid status request"))?;
-    let received_secret = match &request {
-        WireRequest::Update(wire) => &wire.secret,
-        WireRequest::Command(wire) => &wire.secret,
-    };
-    if !bool::from(received_secret.ct_eq(secret)) {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "status request denied",
-        ));
-    }
     let (command, update) = match request {
         WireRequest::Update(wire) => (
             CommandRequest {
-                command: wire.request.command_name().into(),
-                bot: Some(wire.request.bot.clone()),
-                operation_id: Some(wire.request.operation_id.clone()),
-                yes: wire.request.yes,
+                command: wire.command_name().into(),
+                bot: Some(wire.bot.clone()),
+                operation_id: Some(wire.operation_id.clone()),
+                yes: wire.yes,
                 ..Default::default()
             },
-            Some(wire.request),
+            Some(*wire),
         ),
         WireRequest::Command(request) => (
             CommandRequest {
@@ -578,15 +585,8 @@ async fn serve_control<S: AsyncRead + AsyncWrite + Unpin>(
         } else {
             json!({"ok": false, "offline": false, "error": "daemon control busy", "note": NOTE})
         };
-        let mut response = encode_response(value)?;
-        response.push(b'\n');
-        if response.len() > RESPONSE_LIMIT {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "status response exceeds limit",
-            ));
-        }
-        stream.write_all(&response).await?;
+        let response = encode_response(value)?;
+        session.write_response(&mut stream, &response).await?;
         stream.shutdown().await
     })
     .await
@@ -623,7 +623,7 @@ fn encode_response(mut value: Value) -> io::Result<Vec<u8>> {
     let mut omitted = 0;
     loop {
         let bytes = serde_json::to_vec(&value)?;
-        if bytes.len() < RESPONSE_LIMIT {
+        if bytes.len() <= RESPONSE_LIMIT {
             return Ok(bytes);
         }
         let removed = trim(&mut value);
@@ -638,25 +638,38 @@ fn encode_response(mut value: Value) -> io::Result<Vec<u8>> {
     }
 }
 
+async fn bind_control(options: &Options) -> Result<Listener, &'static str> {
+    #[cfg(target_os = "linux")]
+    if let Some(path) = &options.control_socket {
+        return Listener::bind_unix(path).map_err(
+            |_| "cannot bind local daemon control socket; check path, ownership and mode",
+        );
+    }
+    Listener::bind_tcp(options.control_port)
+        .await
+        .map_err(|_| "cannot bind local daemon control")
+}
+
 async fn status_server(
-    listener: TcpListener,
+    listener: Listener,
     secret: [u8; 32],
     access: ControlAccess,
     commands: mpsc::Sender<Envelope>,
 ) -> io::Result<()> {
-    let mut sessions = JoinSet::new();
-    loop {
-        tokio::select! {
-            accepted = listener.accept(), if sessions.len() < 32 => {
-                let (stream, peer) = accepted?;
-                if !peer.ip().is_loopback() { continue; }
-                let commands = commands.clone();
-                let access = access.clone();
-                sessions.spawn(async move { let _ = serve_control(stream, &secret, &access, &commands).await; });
+    management::serve(
+        listener,
+        Protocol::Botd,
+        vec![Key::new(&secret)],
+        |stream, session, _| {
+            let commands = commands.clone();
+            let access = access.clone();
+            async move {
+                let _ = serve_control(stream, session, &access, &commands).await;
             }
-            _ = sessions.join_next(), if !sessions.is_empty() => {}
-        }
-    }
+        },
+        || {},
+    )
+    .await
 }
 
 // Recovery telemetry never blocks process observation or a Gateway heartbeat.
@@ -846,13 +859,10 @@ async fn run() -> Result<(), &'static str> {
             .map_err(|_| "invalid mock Discord configuration")?;
     }
     let bootstrap = load_bootstrap(options.secret_file.as_deref()).await?;
-    let listener = TcpListener::bind(("127.0.0.1", options.control_port))
-        .await
-        .map_err(|_| "cannot bind local daemon control")?;
+    let listener = bind_control(&options).await?;
     let port = listener
-        .local_addr()
-        .map_err(|_| "cannot inspect local daemon control")?
-        .port();
+        .port()
+        .map_err(|_| "cannot inspect local daemon control")?;
     let audit = RecoveryAudit::open(options.runtime_root.join("recovery-audit.jsonl")).await?;
     let credentials = EnvironmentCredentials;
     // Partial startup failures remain visible through snapshots. Dropping this
@@ -899,6 +909,7 @@ async fn run() -> Result<(), &'static str> {
     let mut stdout = tokio::io::stdout();
     if stdout.write_all(&announcement).await.is_err() || stdout.flush().await.is_err() {
         server.abort();
+        let _ = server.await;
         return Err("cannot announce local daemon control");
     }
     // systemd Type=notify: the control listener is bound and announced.
@@ -979,6 +990,7 @@ async fn run() -> Result<(), &'static str> {
     };
     let _ = notifier.stopping();
     server.abort();
+    let _ = server.await;
     if options.stop_children_on_exit && signaled {
         // Graceful only, within STOP_CHILDREN_DEADLINE overall. A child that
         // does not stop in time is left running, never force-killed.
@@ -1055,13 +1067,10 @@ async fn run_raft_cluster(
     {
         return Err("Raft cluster requires a full local administrator capability");
     }
-    let listener = TcpListener::bind(("127.0.0.1", options.control_port))
-        .await
-        .map_err(|_| "cannot bind local daemon control")?;
+    let listener = bind_control(&options).await?;
     let port = listener
-        .local_addr()
-        .map_err(|_| "cannot inspect local daemon control")?
-        .port();
+        .port()
+        .map_err(|_| "cannot inspect local daemon control")?;
     let mut host = src::daemon::cluster_host::ClusterHost::bind(
         &config,
         options.raft.take().ok_or("Raft opt-in required")?,
@@ -1085,6 +1094,7 @@ async fn run_raft_cluster(
     let mut stdout = tokio::io::stdout();
     if stdout.write_all(&bytes).await.is_err() || stdout.flush().await.is_err() {
         server.abort();
+        let _ = server.await;
         host.shutdown().await;
         return Err("cannot announce local daemon control");
     }
@@ -1113,6 +1123,7 @@ async fn run_raft_cluster(
         }
     };
     server.abort();
+    let _ = server.await;
     host.shutdown().await;
     result
 }
@@ -1171,13 +1182,10 @@ async fn run_test_cluster(
     {
         return Err("test cluster requires a full local administrator capability");
     }
-    let listener = TcpListener::bind(("127.0.0.1", options.control_port))
-        .await
-        .map_err(|_| "cannot bind local daemon control")?;
+    let listener = bind_control(&options).await?;
     let port = listener
-        .local_addr()
-        .map_err(|_| "cannot inspect local daemon control")?
-        .port();
+        .port()
+        .map_err(|_| "cannot inspect local daemon control")?;
     let (sender, mut receiver) = mpsc::channel::<Envelope>(64);
     let mut server = tokio::spawn(status_server(
         listener,
@@ -1193,6 +1201,7 @@ async fn run_test_cluster(
     let mut stdout = tokio::io::stdout();
     if stdout.write_all(&bytes).await.is_err() || stdout.flush().await.is_err() {
         server.abort();
+        let _ = server.await;
         runtime.shutdown().await;
         return Err("cannot announce local daemon control");
     }
@@ -1246,6 +1255,7 @@ async fn run_test_cluster(
         }
     };
     server.abort();
+    let _ = server.await;
     runtime.shutdown().await;
     // Dropping parent pipes cannot extend a guardian's last lease. Shutdown and
     // botd crash therefore use the same independently supervised expiry path.
@@ -1274,13 +1284,10 @@ async fn run_test_gateway_switch(
     }
     let limits = serde_json::from_slice(&bytes).map_err(|_| "invalid mock Identify budget")?;
     let bootstrap = load_bootstrap(options.secret_file.as_deref()).await?;
-    let listener = TcpListener::bind(("127.0.0.1", options.control_port))
-        .await
-        .map_err(|_| "cannot bind local daemon control")?;
+    let listener = bind_control(&options).await?;
     let port = listener
-        .local_addr()
-        .map_err(|_| "cannot inspect local daemon control")?
-        .port();
+        .port()
+        .map_err(|_| "cannot inspect local daemon control")?;
     let core_program = std::env::current_exe().map_err(|_| "Core executable unavailable")?;
     let audit = RecoveryAudit::open(options.runtime_root.join("recovery-audit.jsonl")).await?;
     let mut recovery_config = src::child_recovery::RecoveryConfig::default();
@@ -1325,6 +1332,7 @@ async fn run_test_gateway_switch(
     let mut stdout = tokio::io::stdout();
     if stdout.write_all(&announcement).await.is_err() || stdout.flush().await.is_err() {
         server.abort();
+        let _ = server.await;
         return Err("cannot announce local daemon control");
     }
     let mut update_tick = tokio::time::interval(Duration::from_millis(25));
@@ -1389,6 +1397,7 @@ async fn run_test_gateway_switch(
         }
     };
     server.abort();
+    let _ = server.await;
     result
 }
 
@@ -1837,7 +1846,6 @@ mod tests {
     #[tokio::test]
     async fn rejects_unknown_request_fields_without_response() {
         let mut value = serde_json::to_value(StatusRequest {
-            secret: [7; 32],
             command: "status".into(),
             ..Default::default()
         })
@@ -1916,9 +1924,7 @@ mod tests {
         });
         let (mut client, server) = duplex(8192);
         let (sender, mut receiver) = mpsc::channel::<Envelope>(1);
-        let task = tokio::spawn(async move {
-            serve_control(server, &[7; 32], &ControlAccess::default(), &sender).await
-        });
+        let task = tokio::spawn(async move { serve_status(server, &[7; 32], &sender).await });
         client
             .write_all(format!("{wire}\n").as_bytes())
             .await

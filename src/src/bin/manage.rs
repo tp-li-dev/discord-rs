@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use src::local_control::GatewayControl;
+use src::management::{self, Key, Listener, Protocol, Session, Stream};
 use src::metrics::MetricsRegistry;
 use src::rbac_audit::{
     AuditConfig, AuditedExecutor, Confirmation, Principal, Request as AuditRequest,
@@ -10,22 +11,24 @@ use std::{
     error::Error,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use subtle::ConstantTimeEq;
 use tokio::{
-    io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    net::{TcpListener, TcpStream},
+    io::AsyncWriteExt,
     process::{Child, Command},
-    sync::{Semaphore, mpsc},
+    sync::{mpsc, oneshot},
 };
 
 type ErrorBox = Box<dyn Error + Send + Sync>;
 const DEFAULT_PORT: u16 = 39483;
-// Includes the newline. Reject oversized or incomplete requests without buffering them.
+// Former newline framing is exercised only by the regression test for its bounds.
+#[cfg(test)]
 const MAX_REQUEST_BYTES: usize = 4095;
 
+#[cfg(test)]
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, BufReader};
+
+#[cfg(test)]
 async fn read_frame<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     limit: usize,
@@ -41,7 +44,7 @@ async fn read_frame<R: AsyncBufRead + Unpin>(
     Ok(Some(line))
 }
 
-// Wire encoding is deliberate; Secret itself remains non-serializable.
+// The private endpoint file has explicit serde; Secret itself remains non-serializable.
 mod secret_wire {
     use super::*;
     pub fn serialize<S: serde::Serializer>(
@@ -66,8 +69,6 @@ struct Endpoint {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Request {
-    #[serde(with = "secret_wire")]
-    secret: Secret<String>,
     command: String,
 }
 #[derive(Serialize, Deserialize)]
@@ -112,6 +113,7 @@ enum Diagnostic {
     InvalidPort,
     PortMismatch,
     InvalidReply,
+    ControlAuthenticationFailed,
     MissingBootstrapPipe,
     TokenMissing,
     StartupUnconfirmed,
@@ -179,6 +181,7 @@ fn audit_diagnostic(error: src::rbac_audit::ExecuteError) -> Diagnostic {
 impl std::fmt::Display for Diagnostic {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::ControlAuthenticationFailed => f.write_str(management::AUTHENTICATION_FAILED),
             Self::GatewayUnavailable => write!(f, "Gateway unavailable [{self:?}]"),
             Self::ProcessExit { .. } => write!(f, "Botが終了しました [{self:?}]"),
             _ => write!(f, "management_failed cause={self:?}"),
@@ -538,23 +541,26 @@ async fn request(command: &str) -> Result<String, ErrorBox> {
     if endpoint.port != port()? {
         return Err(failure(Diagnostic::PortMismatch));
     }
+    let denied = |_| failure(Diagnostic::ControlAuthenticationFailed);
+    let key = Key::from_legacy_secret(endpoint.secret.expose_secret()).map_err(denied)?;
     let mut stream = tokio::time::timeout(
         Duration::from_secs(2),
-        TcpStream::connect(("127.0.0.1", endpoint.port)),
+        management::connect_tcp(endpoint.port),
     )
     .await??;
-    let mut data = serde_json::to_vec(&Request {
-        secret: endpoint.secret,
+    let session = management::authenticate_client(&mut stream, Protocol::Manage, key)
+        .await
+        .map_err(denied)?;
+    let data = serde_json::to_vec(&Request {
         command: command.to_owned(),
     })?;
-    data.push(b'\n');
-    stream.write_all(&data).await?;
-    let line = tokio::time::timeout(
-        Duration::from_secs(600),
-        read_frame(&mut BufReader::new(stream), 64 * 1024),
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        session.write_request(&mut stream, &data),
     )
-    .await??
-    .ok_or_else(|| failure(Diagnostic::InvalidReply))?;
+    .await??;
+    let line = tokio::time::timeout(Duration::from_secs(600), session.read_response(&mut stream))
+        .await??;
     let reply: Reply = serde_json::from_slice(&line)?;
     reply_message(command, &reply)
 }
@@ -646,17 +652,21 @@ async fn stop_bot(child: &mut Option<Bot>) -> Result<(), ErrorBox> {
     Ok(())
 }
 async fn core(binary: PathBuf) -> Result<(), ErrorBox> {
-    let listener = TcpListener::bind(("127.0.0.1", port()?)).await?;
-    let secret = Arc::new(Secret::new(token()?));
+    let listener = Listener::bind_tcp(port()?).await?;
     let endpoint = Endpoint {
-        port: listener.local_addr()?.port(),
-        secret: Secret::new(secret.expose_secret().clone()),
+        port: listener
+            .port()?
+            .ok_or_else(|| failure(Diagnostic::InvalidPort))?,
+        secret: Secret::new(token()?),
     };
-    let viewer_secret = Arc::new(Secret::new(token()?));
     let viewer_endpoint = Endpoint {
         port: endpoint.port,
-        secret: Secret::new(viewer_secret.expose_secret().clone()),
+        secret: Secret::new(token()?),
     };
+    let keys = vec![
+        Key::from_legacy_secret(endpoint.secret.expose_secret())?,
+        Key::from_legacy_secret(viewer_endpoint.secret.expose_secret())?,
+    ];
     tokio::fs::create_dir_all(runtime_dir()).await?;
     let mut audit =
         AuditedExecutor::open(runtime_dir().join("audit.jsonl"), AuditConfig::default())?;
@@ -667,41 +677,69 @@ async fn core(binary: PathBuf) -> Result<(), ErrorBox> {
     let mut last_failure: Option<Diagnostic> = None;
     let mut started = tokio::time::Instant::now();
     let mut supervision = tokio::time::interval(Duration::from_secs(2));
-    let readers = Arc::new(Semaphore::new(32));
     let (requests_tx, mut requests_rx) =
-        mpsc::channel::<(Option<Request>, Option<&'static str>, BufReader<TcpStream>)>(32);
+        mpsc::channel::<(Request, &'static str, Stream, Session, oneshot::Sender<()>)>(32);
+    let (rejected_tx, mut rejected_rx) = mpsc::channel::<()>(32);
     write_endpoint(&endpoint, "core.json").await?;
     write_endpoint(&viewer_endpoint, "viewer.json").await?;
-    println!("コアを起動しました。BotのDiscord接続状態はログで確認してください。");
-    loop {
-        let (input, role, mut reader) = tokio::select! {
-            accepted = listener.accept() => {
-                let (stream, _) = accepted?;
-                let Ok(permit) = readers.clone().try_acquire_owned() else { continue };
-                let sender = requests_tx.clone();
-                let expected_secret = secret.clone();
-                let expected_viewer = viewer_secret.clone();
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    let mut reader = BufReader::new(stream);
-                    let Ok(Ok(Some(line))) = tokio::time::timeout(
-                        Duration::from_secs(3), read_frame(&mut reader, MAX_REQUEST_BYTES)
-                    ).await else {
-                        let _ = sender.try_send((None, None, reader));
+    println!("??????????Bot?Discord?????????????????");
+    let mut server = tokio::spawn(management::serve(
+        listener,
+        Protocol::Manage,
+        keys,
+        {
+            let rejected_tx = rejected_tx.clone();
+            move |mut stream, session, index| {
+                let requests_tx = requests_tx.clone();
+                let rejected_tx = rejected_tx.clone();
+                async move {
+                    let frame = tokio::time::timeout(
+                        Duration::from_secs(3),
+                        session.read_request(&mut stream, management::MANAGE_REQUEST_LIMIT),
+                    )
+                    .await;
+                    let input = match frame {
+                        Ok(Ok(body)) => serde_json::from_slice::<Request>(&body).ok(),
+                        _ => None,
+                    };
+                    let Some(input) = input else {
+                        let _ = rejected_tx.try_send(());
                         return;
                     };
-                    let input = serde_json::from_slice::<Request>(&line).ok();
-                    let role = input.as_ref().and_then(|input| {
-                        let candidate = input.secret.expose_secret().as_bytes();
-                        if bool::from(candidate.ct_eq(expected_secret.expose_secret().as_bytes())) { Some("admin") }
-                        else if bool::from(candidate.ct_eq(expected_viewer.expose_secret().as_bytes())) { Some("viewer") }
-                        else { None }
-                    });
-                    let _ = sender.try_send((input, role, reader));
-                });
-                continue;
-            },
+                    let role = if index == 0 { "admin" } else { "viewer" };
+                    let (done, completed) = oneshot::channel();
+                    if requests_tx
+                        .try_send((input, role, stream, session, done))
+                        .is_ok()
+                    {
+                        let _ = completed.await;
+                    }
+                }
+            }
+        },
+        move || {
+            let _ = rejected_tx.try_send(());
+        },
+    ));
+    loop {
+        let (input, role, mut stream, session, _done) = tokio::select! {
+            result = &mut server => {
+                result??;
+                return Err(failure(Diagnostic::ManagementRejected));
+            }
             Some(request) = requests_rx.recv() => request,
+            Some(()) = rejected_rx.recv() => {
+                let denied = AuditRequest {
+                    principal: Principal::unauthenticated(),
+                    operation: "unknown".into(),
+                    bot_id: Some("local-bot".into()),
+                    shard_id: None,
+                    remote: false,
+                    confirmation: Confirmation::None,
+                };
+                let _ = audit.execute(&denied, || Ok(()));
+                continue;
+            }
             _ = supervision.tick() => {
                 if let Some(process) = bot.as_mut() {
                     if let Some(status) = process.try_wait()? {
@@ -719,8 +757,7 @@ async fn core(binary: PathBuf) -> Result<(), ErrorBox> {
                 continue;
             }
         };
-        let command = input.as_ref().map(|v| v.command.as_str()).unwrap_or("");
-        let operation = match command {
+        let operation = match input.command.as_str() {
             "status" | "metrics-json" | "metrics-prometheus" => "status",
             "logs" => "logs",
             "list-unknown" => "inspect",
@@ -730,20 +767,13 @@ async fn core(binary: PathBuf) -> Result<(), ErrorBox> {
             _ => "unknown",
         };
         let audit_request = AuditRequest {
-            principal: role.map_or_else(Principal::unauthenticated, |r| {
-                Principal::authenticated("local-capability", r)
-            }),
+            principal: Principal::authenticated("local-capability", role),
             operation: operation.into(),
             bot_id: Some("local-bot".into()),
             shard_id: None,
             remote: false,
             confirmation: Confirmation::None,
         };
-        if role.is_none() {
-            let _ = audit.execute(&audit_request, || Ok(()));
-            continue;
-        }
-        let input = input.expect("authenticated request");
         if let Some(process) = bot.as_mut()
             && let Some(status) = process.try_wait()?
         {
@@ -830,16 +860,20 @@ async fn core(binary: PathBuf) -> Result<(), ErrorBox> {
             }
         };
         let mut data = serde_json::to_vec(&reply)?;
-        data.push(b'\n');
-        if data.len() > 64 * 1024 {
-            data = b"{\"ok\":false,\"message\":\"response exceeds limit\"}\n".to_vec();
+        if data.len() > management::RESPONSE_LIMIT {
+            data = br#"{"ok":false,"message":"response exceeds limit"}"#.to_vec();
         }
-        let _ =
-            tokio::time::timeout(Duration::from_secs(3), reader.get_mut().write_all(&data)).await;
+        let _ = tokio::time::timeout(Duration::from_secs(3), async {
+            session.write_response(&mut stream, &data).await?;
+            stream.shutdown().await
+        })
+        .await;
         if exit {
             break;
         }
     }
+    server.abort();
+    let _ = server.await;
     let _ = tokio::fs::remove_file(runtime_dir().join("core.json")).await;
     let _ = tokio::fs::remove_file(runtime_dir().join("viewer.json")).await;
     Ok(())
@@ -903,9 +937,21 @@ async fn run() -> Result<(), ErrorBox> {
     }
     match command {
         "start" => {
-            if request("status").await.is_ok() {
-                println!("{}", request("start").await?);
-                return Ok(());
+            match request("status").await {
+                Ok(_) => {
+                    println!("{}", request("start").await?);
+                    return Ok(());
+                }
+                Err(error)
+                    if error
+                        .downcast_ref::<ProtectedFailure>()
+                        .is_some_and(|failure| {
+                            matches!(failure.0, Diagnostic::ControlAuthenticationFailed)
+                        }) =>
+                {
+                    return Err(error);
+                }
+                Err(_) => {}
             }
             if env::var_os("DISCORD_TOKEN").is_none_or(|v| v.is_empty()) {
                 return Err(failure(Diagnostic::TokenMissing));
