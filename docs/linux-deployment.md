@@ -25,7 +25,8 @@
    Shard の状態ディレクトリ直下の `gateway.log`（`<runtime root>/<bot>/shard-<n>/gateway.log`、管理 endpoint と
    同じ場所）へ追記します。権限 0600。シンボリックリンクや通常ファイル以外なら使わず従来どおり破棄（null）へ
    フォールバックし、起動は失敗させません。起動時に 1 MiB を超えていれば `gateway.log.1` へ 1 世代だけ
-   ローテーションし、起動ごとに `--- gateway generation N ---` の区切り行を書きます。接続失敗の理由
+   ローテーションし、起動ごとに `--- gateway generation N ---` の区切り行を書きます。世代区切りと Gateway の接続イベントの時刻は
+   UTC のミリ秒表記（例 `2026-11-21T04:00:01.123Z`）です。接続失敗の理由
    （close code 4004、4014 等）はここで確認します。journald に出るのは botd 自身の標準出力（起動時の 1 行 JSON）と
    標準エラーのみです。この機能はローカル未ビルドで、CI での検証待ちです。
 4. **本番の Raft 有効化は拒否のままです。** `--allow-raft-quorum` は `--mock-discord` を必須とし、本番 backend
