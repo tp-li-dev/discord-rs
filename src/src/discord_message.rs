@@ -24,6 +24,37 @@ const LEGACY_DEADLINE: Duration = Duration::from_secs(10);
 const RETRY_WINDOW: Duration = Duration::from_secs(15);
 const RETRY_BACKOFF: Duration = Duration::from_millis(250);
 
+#[derive(Clone)]
+struct RetryDeadline<C> {
+    active_deadline: Instant,
+    boot_deadline_ms: u64,
+    boot_ms: C,
+}
+
+impl<C: Fn() -> Option<u64>> RetryDeadline<C> {
+    fn new(active_deadline: Instant, boot_ms: C) -> Option<Self> {
+        let boot_deadline_ms = boot_ms()?.checked_add(RETRY_WINDOW.as_millis() as u64)?;
+        Some(Self {
+            active_deadline,
+            boot_deadline_ms,
+            boot_ms,
+        })
+    }
+
+    fn is_open(&self) -> bool {
+        Instant::now() < self.active_deadline
+            && (self.boot_ms)().is_some_and(|now| now < self.boot_deadline_ms)
+    }
+}
+
+#[cfg(target_os = "linux")]
+use crate::core_status::try_boot_ms as retry_boot_ms;
+
+#[cfg(not(target_os = "linux"))]
+fn retry_boot_ms() -> Option<u64> {
+    None
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TextMessageKind {
     TrackedPrefixReply,
@@ -73,14 +104,19 @@ pub enum AttemptError {
 /// Use Twilight's shared limiter but decline its internal 429 re-send. In 0.18
 /// the limiter alone cannot be relied on to honor the global Retry-After.
 pub async fn single_attempt<T: Unpin>(
-    mut request: ResponseFuture<T>,
+    request: ResponseFuture<T>,
     deadline: Instant,
+) -> Result<Response<T>, AttemptError> {
+    single_attempt_with_guard(request, move || Instant::now() < deadline).await
+}
+
+async fn single_attempt_with_guard<T: Unpin>(
+    mut request: ResponseFuture<T>,
+    can_send: impl Fn() -> bool + Send + 'static,
 ) -> Result<Response<T>, AttemptError> {
     let sent = Arc::new(AtomicBool::new(false));
     let gate = Arc::clone(&sent);
-    if !request
-        .set_pre_flight(move || Instant::now() < deadline && !gate.swap(true, Ordering::Relaxed))
-    {
+    if !request.set_pre_flight(move || can_send() && !gate.swap(true, Ordering::Relaxed)) {
         return Err(AttemptError::GuardUnavailable);
     }
 
@@ -137,7 +173,7 @@ pub async fn send_text_message(
                 .payload_json(body)
                 .into_future();
             async move {
-                single_attempt(request, deadline)
+                single_attempt_with_guard(request, move || deadline.is_open())
                     .await
                     .map(|response| response.status().get())
             }
@@ -151,7 +187,7 @@ async fn send_text_message_with<F: Future<Output = Result<u16, AttemptError>>>(
     content: &str,
     nonce_retry: bool,
     legacy_send: impl Future<Output = Option<u16>>,
-    nonce_send: impl FnMut(&[u8], Instant) -> F,
+    nonce_send: impl FnMut(&[u8], RetryDeadline<fn() -> Option<u64>>) -> F,
 ) -> Option<u16> {
     if !nonce_retry || kind != TextMessageKind::TrackedPrefixReply {
         return legacy_send.await;
@@ -159,23 +195,29 @@ async fn send_text_message_with<F: Future<Output = Result<u16, AttemptError>>>(
 
     let nonce = new_nonce().ok()?;
     let body = create_payload(content, &nonce).ok()?;
-    send_with_nonce(&body, Instant::now() + RETRY_WINDOW, nonce_send).await
+    let deadline = RetryDeadline::new(Instant::now() + RETRY_WINDOW, retry_boot_ms as fn() -> _)?;
+    send_with_nonce(&body, deadline, nonce_send).await
 }
 
-async fn send_with_nonce<F: Future<Output = Result<u16, AttemptError>>>(
+async fn send_with_nonce<
+    C: Fn() -> Option<u64> + Clone,
+    F: Future<Output = Result<u16, AttemptError>>,
+>(
     body: &[u8],
-    deadline: Instant,
-    mut send: impl FnMut(&[u8], Instant) -> F,
+    deadline: RetryDeadline<C>,
+    mut send: impl FnMut(&[u8], RetryDeadline<C>) -> F,
 ) -> Option<u16> {
-    timeout_at(deadline, async {
-        if Instant::now() >= deadline {
+    // Keep the active-time timeout for in-flight I/O. The boot clock also
+    // covers suspend before the retry decision and before any HTTP send.
+    timeout_at(deadline.active_deadline, async {
+        if !deadline.is_open() {
             return None;
         }
-        match send(body, deadline).await {
+        match send(body, deadline.clone()).await {
             Ok(status) => Some(status),
             Err(AttemptError::Transport | AttemptError::Timeout) => {
                 sleep(RETRY_BACKOFF).await;
-                if Instant::now() >= deadline {
+                if !deadline.is_open() {
                     return None;
                 }
                 send(body, deadline).await.ok()
@@ -192,7 +234,12 @@ async fn send_with_nonce<F: Future<Output = Result<u16, AttemptError>>>(
 mod tests {
     use super::*;
     use serde_json::{Value, json};
-    use std::future::ready;
+    use std::{
+        future::{poll_fn, ready},
+        pin::pin,
+        sync::atomic::AtomicU64,
+        task::Poll,
+    };
     use tokio::{
         io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader},
         net::{TcpListener, TcpStream},
@@ -227,6 +274,10 @@ mod tests {
         let mut body = vec![0; content_length.unwrap()];
         stream.read_exact(&mut body).await.unwrap();
         (stream.into_inner(), body)
+    }
+
+    fn active_time_deadline(deadline: Instant) -> RetryDeadline<impl Fn() -> Option<u64> + Clone> {
+        RetryDeadline::new(deadline, || Some(0)).unwrap()
     }
 
     #[tokio::test]
@@ -299,7 +350,8 @@ mod tests {
     async fn nonce_retry_keeps_outcome_unknown_after_one_unsuccessful_retry() {
         for second in [AttemptError::Transport, AttemptError::Http(403)] {
             let mut attempts = 0;
-            let result = send_with_nonce(b"payload", Instant::now() + RETRY_WINDOW, |_, _| {
+            let deadline = active_time_deadline(Instant::now() + RETRY_WINDOW);
+            let result = send_with_nonce(b"payload", deadline, |_, _| {
                 attempts += 1;
                 ready(Err(if attempts == 1 {
                     AttemptError::Timeout
@@ -318,7 +370,8 @@ mod tests {
     async fn nonce_retry_does_not_resend_after_a_http_error_or_429() {
         for first in [AttemptError::Http(503), AttemptError::RateLimited] {
             let mut attempts = 0;
-            let result = send_with_nonce(b"payload", Instant::now() + RETRY_WINDOW, |_, _| {
+            let deadline = active_time_deadline(Instant::now() + RETRY_WINDOW);
+            let result = send_with_nonce(b"payload", deadline, |_, _| {
                 attempts += 1;
                 ready(Err(first))
             })
@@ -333,7 +386,7 @@ mod tests {
         let mut attempts = 0;
         let result = send_with_nonce(
             b"payload",
-            Instant::now() + Duration::from_millis(10),
+            active_time_deadline(Instant::now() + Duration::from_millis(10)),
             |_, _| {
                 attempts += 1;
                 ready(Err(AttemptError::Transport))
@@ -342,6 +395,31 @@ mod tests {
         .await;
         assert_eq!(result, None);
         assert_eq!(attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn nonce_retry_rechecks_boot_clock_after_backoff() {
+        for boot_time_after_suspend in [Some(60_000), None] {
+            let now = std::cell::Cell::new(Some(1000));
+            let attempts = std::cell::Cell::new(0);
+            let active_deadline = Instant::now() + RETRY_WINDOW;
+            let deadline = RetryDeadline::new(active_deadline, || now.get()).unwrap();
+            let mut send = pin!(send_with_nonce(b"payload", deadline, |_, _| {
+                attempts.set(attempts.get() + 1);
+                ready(Err(AttemptError::Transport))
+            }));
+            poll_fn(|cx| {
+                assert!(send.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            assert_eq!(attempts.get(), 1);
+            now.set(boot_time_after_suspend);
+
+            assert_eq!(send.await, None);
+            assert_eq!(attempts.get(), 1);
+            assert!(Instant::now() < active_deadline);
+        }
     }
 
     #[tokio::test]
@@ -402,6 +480,15 @@ mod tests {
 
     #[tokio::test]
     async fn nonce_retry_limiter_wait_cannot_send_a_late_second_post() {
+        assert_limiter_blocks_late_retry(false).await;
+    }
+
+    #[tokio::test]
+    async fn nonce_retry_pre_flight_rechecks_boot_clock_after_limiter_wait() {
+        assert_limiter_blocks_late_retry(true).await;
+    }
+
+    async fn assert_limiter_blocks_late_retry(suspend: bool) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let http = proxy_client(&listener);
         let channel = Id::new(1);
@@ -425,7 +512,17 @@ mod tests {
 
         let mut attempts = 0;
         let mut blocker = None;
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let active_deadline = Instant::now()
+            + if suspend {
+                RETRY_WINDOW
+            } else {
+                Duration::from_secs(2)
+            };
+        let now = Arc::new(AtomicU64::new(1000));
+        let clock = Arc::clone(&now);
+        let deadline =
+            RetryDeadline::new(active_deadline, move || Some(clock.load(Ordering::Relaxed)))
+                .unwrap();
         let send = send_with_nonce(&body, deadline, |body, deadline| {
             attempts += 1;
             let attempt = attempts;
@@ -442,10 +539,29 @@ mod tests {
                         .into_future(),
                 );
             }
+            let release = if attempt == 2 && suspend {
+                blocker.take()
+            } else {
+                None
+            };
+            let now = Arc::clone(&now);
             async move {
-                let result = single_attempt(request, deadline).await;
+                let mut request =
+                    pin!(single_attempt_with_guard(request, move || deadline.is_open()));
+                if let Some(blocker) = release {
+                    poll_fn(|cx| {
+                        assert!(request.as_mut().poll(cx).is_pending());
+                        Poll::Ready(())
+                    })
+                    .await;
+                    now.store(60_000, Ordering::Relaxed);
+                    drop(blocker);
+                }
+                let result = request.await;
                 if attempt == 1 {
                     assert!(matches!(&result, Err(AttemptError::Transport)));
+                } else if suspend {
+                    assert!(matches!(&result, Err(AttemptError::Deadline)));
                 }
                 result.map(|response| response.status().get())
             }
@@ -455,7 +571,7 @@ mod tests {
             .expect("nonce retry did not stop at the total deadline");
         assert_eq!(attempts, 2, "the retry must have entered the limiter queue");
         assert_eq!(result, None);
-        assert!(Instant::now() >= deadline);
+        assert_eq!(Instant::now() < active_deadline, suspend);
         drop(blocker);
 
         // Release the limiter and send a distinct request through the same route.
