@@ -6425,11 +6425,11 @@ pub mod control {
                     )
                     .unwrap();
                 for entry in plane.daemon.entries.values() {
-                    let count = entry
-                        .spec
-                        .gateway
-                        .args
-                        .iter()
+                    let mut command = Command::new(&entry.spec.gateway.program);
+                    entry.add_gateway_args(&mut command);
+                    let count = command
+                        .as_std()
+                        .get_args()
                         .filter(|arg| *arg == NONCE_RETRY_FLAG)
                         .count();
                     assert_eq!(count, (entry.spec.bot_id == enabled) as usize);
@@ -8463,6 +8463,7 @@ struct Entry {
     graceful_stop: Option<Result<(), DaemonError>>,
     restart_held: bool,
     journal_start_pending: bool,
+    nonce_retry: bool,
     /// Protect the next real Identify for this update's fallback recovery.
     update_fallback_reserved: bool,
     /// Only explicit local test configuration may select this. Never infer the
@@ -8610,6 +8611,13 @@ enum StartKind {
 }
 
 impl Entry {
+    fn add_gateway_args(&self, command: &mut Command) {
+        command.args(&self.spec.gateway.args);
+        if self.nonce_retry {
+            command.arg(crate::discord_message::NONCE_RETRY_FLAG);
+        }
+    }
+
     fn acquire_identify(
         &self,
         registry: &mut crate::local_identify::LocalIdentifyRegistry,
@@ -8999,6 +9007,7 @@ impl<C: Clock> Daemon<C> {
                         graceful_stop: None,
                         restart_held: false,
                         journal_start_pending: false,
+                        nonce_retry: false,
                         update_fallback_reserved: false,
                         mock_discord: None,
                         feed,
@@ -9065,14 +9074,13 @@ impl<C: Clock> Daemon<C> {
         Ok(())
     }
 
-    /// Replace the exact Bot ID allowlist before any launch attempt. Normal and
-    /// recovery launches and standby launches all use these same Gateway args.
+    /// Replace the exact Bot ID allowlist before any launch attempt. All
+    /// Gateway launches add the daemon-owned flag separately from custom args.
     pub fn configure_create_message_nonce_retry(
         &mut self,
         config: &Config,
         bot_ids: &HashSet<String>,
     ) -> Result<(), DaemonError> {
-        use crate::discord_message::NONCE_RETRY_FLAG;
         if self.entries.values().any(|entry| entry.started) {
             return Err(DaemonError::InvalidState);
         }
@@ -9084,11 +9092,7 @@ impl<C: Clock> Daemon<C> {
             return Err(DaemonError::UnknownBot);
         }
         for entry in self.entries.values_mut() {
-            let args = &mut entry.spec.gateway.args;
-            args.retain(|arg| arg != NONCE_RETRY_FLAG);
-            if bot_ids.contains(&entry.spec.bot_id) {
-                args.push(NONCE_RETRY_FLAG.into());
-            }
+            entry.nonce_retry = bot_ids.contains(&entry.spec.bot_id);
         }
         Ok(())
     }
@@ -9379,8 +9383,8 @@ impl<C: Clock> Daemon<C> {
             None => (Stdio::null(), Stdio::null()),
         };
         let mut command = Command::new(&spec.program);
+        entry.add_gateway_args(&mut command);
         command
-            .args(&spec.args)
             .arg("--core-dir")
             .arg(cores.dir())
             .arg("--standby")
@@ -10018,8 +10022,8 @@ impl<C: Clock> Daemon<C> {
                 command.arg("--core-epoch").arg(entry.epoch.to_string());
             }
         }
+        entry.add_gateway_args(&mut command);
         command
-            .args(&spec.args)
             .env_clear()
             .envs(&spec.environment.variables)
             .env("BOT_ID", &entry.spec.bot_id)
