@@ -244,6 +244,10 @@ async fn unrelated_retry_failure_does_not_turn_a_successful_manual_start_into_an
     let root = Root::new();
     let clock = ManualClock::default();
     let mut daemon = Managed::new(&root, &["A", "B"], &clock);
+    daemon.0.set_local_identify_policy(LocalIdentifyPolicy {
+        min_interval: Duration::ZERO,
+        ..Default::default()
+    });
     let missing_reads = AtomicU64::new(0);
     let source = |name: &str| {
         if name == "TOKEN_A" {
@@ -358,7 +362,6 @@ async fn guarded_legacy_gateway_requires_shared_admission_after_its_first_proces
     let root = Root::new();
     let clock = ManualClock::default();
     let mut daemon = Managed::new(&root, &["A"], &clock);
-    daemon.0.require_shared_recovery_admission();
     // The first start is recorded; a one-per-window cap makes the very next
     // automatic Identify exhausted (production defaults: 30 s apart, 10/hour).
     daemon.0.set_local_identify_policy(LocalIdentifyPolicy {
@@ -435,7 +438,6 @@ async fn guarded_legacy_gateway_waits_for_the_local_identify_interval_before_rec
     let root = Root::new();
     let clock = ManualClock::default();
     let mut daemon = Managed::new(&root, &["A"], &clock);
-    daemon.0.require_shared_recovery_admission();
     daemon.0.start(&key("A"), &credentials).unwrap();
     let identity = snapshot(&daemon.0, "A").identity.unwrap();
     ready(&root, "A", identity.pid).await;
@@ -446,14 +448,14 @@ async fn guarded_legacy_gateway_waits_for_the_local_identify_interval_before_rec
     })
     .await;
 
-    // The initial start was recorded moments ago (real time), so the default
+    // The initial start was recorded at the injected time zero, so the default
     // 30 s interval keeps the automatic Identify Pending: not degraded, no
     // new child, recovery still wanted.
     clock.set(1);
     daemon.0.poll(&credentials).unwrap();
     let waiting = snapshot(&daemon.0, "A");
     assert_ne!(
-        waiting.recovery.unwrap()["state"],
+        waiting.recovery.as_ref().unwrap()["state"],
         serde_json::json!({"Degraded":"IdentifyUnavailable"})
     );
     assert!(waiting.desired_running);
@@ -466,5 +468,17 @@ async fn guarded_legacy_gateway_waits_for_the_local_identify_interval_before_rec
             .iter()
             .any(|event| matches!(event.kind, RecoveryEventKind::Degraded { .. }))
     );
+    assert_eq!(
+        waiting.recovery.unwrap()["deferred"],
+        serde_json::json!("IdentifyBudget")
+    );
+    std::fs::remove_file(root.exit("A")).unwrap();
+    clock.set(29);
+    daemon.0.poll(&credentials).unwrap();
+    assert!(!daemon.0.has_child(&key("A")));
+    clock.set(30);
+    daemon.0.poll(&credentials).unwrap();
+    assert!(daemon.0.has_child(&key("A")));
+    assert_eq!(snapshot(&daemon.0, "A").restarts, 1);
     daemon.shutdown().await;
 }

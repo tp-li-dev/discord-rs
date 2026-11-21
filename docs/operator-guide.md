@@ -146,7 +146,7 @@ botd は Shard ごとに順番に次を行います。
 失敗時の扱いは次のとおりです。
 
 - 待機 Gateway の起動失敗、90 秒以内に ready にならない、activate の送信失敗では、その Shard の待機 Gateway を終了します。稼働中の Gateway は変更しません。
-- activate の後に `standby-active` が 20 秒以内に出ない、または待機 Gateway が終了した場合は操作が失敗します。このとき旧 Gateway はすでに Core から切り離されているため、botd は旧 Gateway を強制終了し、上げた epoch で起動し直します（Identify が 1 回余分に発生します）。待機 Gateway も終了します。
+- activate の後に `standby-active` が 20 秒以内に出ない、または待機 Gateway が終了した場合は操作が失敗します。このとき旧 Gateway はすでに Core から切り離されているため、botd は旧 Gateway を強制終了し、次の Identify 許可を得てから上げた epoch で起動し直します。待機 Gateway も終了します。
 - 先に完了した Shard の更新は残ります。全体の自動ロールバックはありません。
 - 操作全体のサーバー側期限は 120 秒 + 45 秒 × Shard 数です。確認待ちに入った段階は最大 20 秒でその段階を終えます。
 - activate の送信後に失敗した場合の実 Discord 上の Core と Gateway の挙動は未検証です。
@@ -230,18 +230,23 @@ sudo -u discord-rs /opt/discord-rs/bin/botctl gateway-update test --guild 153344
 
 WSL・実 Discord の 2 Shard 試験では、Shard 1 のみの更新と存在しない Shard の拒否、ギルド指定と Shard 指定の併用を確認しました。`!count` の継続は確認待ちです。後続の総数の前提条件などの変更は静的確認のみです（[進捗](progress.md)）。
 
-### 全 Bot を順番に操作する：--all
+### 全 Bot を操作する（--all）
 
 ```bash
 sudo -u discord-rs /opt/discord-rs/bin/botctl gateway-update --all --dry-run --secret-file /etc/discord-rs/botd.secret --port 47321 --json
 sudo -u discord-rs /opt/discord-rs/bin/botctl gateway-update --all --yes --secret-file /etc/discord-rs/botd.secret --port 47321 --json
+sudo -u discord-rs /opt/discord-rs/bin/botctl restart --all --yes --secret-file /etc/discord-rs/botd.secret --port 47321 --json
 ```
 
-`start`・`stop`・`restart` でも同様に使えます。dry-run は変更せず `targets` と `skipped` を表示します。実行には `--yes` が必要で、`--dry-run` と併用できません。`--shard`・`--guild`・`--operation-id` も併用できません。ローカル Shard がない Bot は `skipped` に `reason: "not_local"` として記録されます。
+`--all` は `start`・`stop`・`restart`・`gateway-update` で使えます。`--dry-run` は `targets` と `skipped` を表示し、ローカル Shard がない Bot には `reason: "not_local"` が付きます。実行には `--yes` が必要で、`--dry-run` と併用できません。`--shard`・`--guild`・`--operation-id` も併用できません。範囲限定 principal の `--all` は拒否されます。
 
-実行は 1 Bot の完了を待ってから次へ進み、最初の失敗で停止します。JSON の `ok`、対象数 `total`、成功数 `completed`、失敗した Bot ID の `stopped_at`（成功時は `null`）、Bot ごとの `results`（操作 ID・状態など）、`skipped` を確認します。完了済み Bot の自動巻き戻しはありません。範囲限定 principal は最初の一覧取得が拒否されるため現在 `--all` を使えません（[制約一覧](known-limitations.md)）。
+`start`・`stop`・`gateway-update` の一括実行は、1 Bot の完了を待ってから次へ進み、最初の失敗で停止します。JSON の `ok`、対象数 `total`、成功数 `completed`、失敗した Bot ID の `stopped_at`（成功時は `null`）、Bot ごとの `results`（操作 ID・状態など）、`skipped` を確認します。完了済み Bot の自動巻き戻しはありません。
 
-Oracle・実 Discord の 1 Bot で `--all --yes` の成功を確認しています。複数 Bot の順序と失敗時停止は単体試験・模擬サーバーでの確認で、複数 Bot の実機では未確認です。後続の変更は静的確認のみです。
+`restart --all --yes` では、botd が全ローカル Shard（最大 64 件）を選び、全件分の Identify 枠を確保してから停止を始めます。1 件でも予約できなければ、対象を停止せずに要求全体を拒否します。受け付けた要求の JSON には 1 件の `operation_id`、`operation.command: "restart-all"`、`operation.shards` と `operation.failed_shards` が入ります。結果は `botctl operation ID` で照会できます。受付後の停止・起動の失敗は Shard ごとに確認してください。
+
+一括再起動を使う前に、稼働中の botd と botctl を同じリリースへ更新してください。旧 botctl の一括再起動は Bot ごとの要求を送るため、全体の事前予約は適用されません。対応する botctl が旧 botd に `restart-all` を送ると拒否されます。
+
+従来の逐次実行は Oracle・実 Discord の 1 Bot、順序と失敗時停止は単体試験・模擬サーバーで確認しています。一件の操作としての一括再起動は実機で未確認です。
 
 ### 障害時の確認とバイナリの復旧
 
@@ -308,7 +313,7 @@ botctl restart support --bootstrap-stdin --timeout 30s --json
 
 起動・停止・再起動には、CLIが送信前に生成した操作IDを付けます。`--operation-id ID` で32桁の小文字16進数を指定することもできます。結果にはID、操作対象、状態、所要時間、Shard別の結果・世代、失敗Shardを含みます。`--json` は成功・失敗とも機械可読なJSONをstdoutへ出し、失敗や完了未確認は非ゼロ終了コードで返します。`--json` なしの成功表示は整形JSON、失敗表示はstderrです。
 
-`--timeout` はbootstrap読取・接続・送受信・操作完了待ちを含むCLIの待機上限です。既定は `gateway-update` が300秒、その他は30秒で、0より大きく3600秒以下を指定できます。単位なしと `s` は秒、`ms` はミリ秒で、小数も指定できます。300秒は更新完了の保証ではありません。待機timeoutや通信断でCLIが終了しても、受理済みのdaemon操作を取り消しません。timeoutは更新失敗を意味しないため、新しいIDで同じ操作を送る前に、表示されたIDで結果を確認してください。`--all` は一覧取得後、Bot ごとに待機上限を適用します。
+`--timeout` はbootstrap読取・接続・送受信・操作完了待ちを含むCLIの待機上限です。既定は `gateway-update` が300秒、その他は30秒で、0より大きく3600秒以下を指定できます。単位なしと `s` は秒、`ms` はミリ秒で、小数も指定できます。300秒は更新完了の保証ではありません。待機timeoutや通信断でCLIが終了しても、受理済みのdaemon操作を取り消しません。timeoutは更新失敗を意味しないため、新しいIDで同じ操作を送る前に、表示されたIDで結果を確認してください。`--all` の逐次実行は一覧取得後に Bot ごと、一括再起動は bootstrap 取得後に操作全体で待機上限を適用します。
 
 ```text
 botctl operation 0123456789abcdef0123456789abcdef --bootstrap-stdin --json
@@ -450,6 +455,13 @@ Core（Worker）だけを `kill -9` した場合は、Gatewayがメモリに持�
 
 `child_recovery` はdaemonのGateway監視とWorker側の復旧経路に接続されています。再試行・予算・degraded状態の観測は、孤児の再採用やホスト障害からの安全な分散復旧を意味しません。
 
-実 Discord の Gateway 自動復旧は、単一ホスト・単一 botd 専用のローカル Identify 許可（Bot 単位。同じ Bot は直近の許可から 30 秒以上空け、直近 1 時間で最大 10 回。超えると `IdentifyUnavailable` で `Degraded`）の下で有効です。初回起動と手動 start は常に許可して記録します。複数プロセス・複数ホスト間の調整は未実装、botd 再起動で履歴は消えます。セッションの Resume は未実装で、再起動のたびに Identify を 1 回消費します。ローカル未ビルドで GitHub Actions の検証待ちで、実 Discord・実機では未検証です。`botctl status` では上限超過が `restart_exhausted: true`・`recovery.state` の `Degraded: IdentifyUnavailable`（`desired_running` は false）として見え、復旧イベント（監査）にも同じ理由が出ます。間隔未満の間は `Deferred`（IdentifyBudget）で待ち、再起動回数を消費せず間隔が空くと再起動します。`metrics_feed` はライブラリとテストがありますがdaemonに接続されていません。
+botd は初回自動起動、手動 start / restart、gateway-update の待機起動、自動復旧（更新失敗後を含む）に共通の起動予算を使います。同じ Bot は直近の許可から 30 秒以上空け、直近 1 時間で最大 10 回です。許可を得た起動試行は失敗しても枠を消費します。起動後の Gateway 内の再 Identify は各プロセスのキューで扱い、複数 botd・複数ホストの実送信に対する予算共有は未実装です。botd の再起動で起動許可の履歴は消えます。
+
+- 初回自動起動と自動復旧は間隔待ちを `recovery.deferred: IdentifyBudget` として status に表示し、復旧監査にも記録します。監視 tick で再試行し、待機中は再起動回数を消費しません。`startup_ok` は同期的に分かった起動エラーを示します。各 Shard の起動状況は status で確認してください。上限まで使った Shard は `Degraded: IdentifyUnavailable`（`restart_exhausted: true`、`desired_running: false`）になります。
+- 手動 start は Shard ごとに起動を判定します。間隔が空いていなければ `IdentifyDeferred`、回数枠が足りなければ `IdentifyUnavailable` を Shard の結果に返します。複数 Shard を指定すると一部だけ起動することがあります。
+- 手動 restart は停止前に対象全件の起動枠を予約します。間隔が空いていない場合や、同じ Bot の実 Gateway を複数同時に予約する場合は `IdentifyDeferred`、回数枠が足りなければ `IdentifyUnavailable` を返します。予約拒否時は操作を登録せず、既存の Gateway は稼働を続けます。枠の空きを待って新しい操作として再試行してください。同じ Bot の複数 Shard は間隔を空けて 1 Shard ずつ再起動します。
+- gateway-update は復旧用を含む 2 枠を確認し、待機起動の 1 枠を消費します。間隔待ちは操作表示の `waiting_reason: IdentifyBudget`、期限切れは `IdentifyDeferred`、枠不足は `IdentifyUnavailable` です。復旧枠を保護している間は同じ Bot の新しい start / restart / gateway-update を拒否します。
+
+`metrics_feed` はライブラリとテストがありますがdaemonに接続されていません。
 
 `discord_smoke` は明示実行の読み取り専用REST確認補助CLI（`src/src/bin/discord_smoke.rs`、`src/tests/discord_smoke/cli.rs`）で、GatewayやCoreを起動しません。実Discordでの検証はユーザーが実施する範囲です。性能測定の条件とLinux共有runner（Actions `ubuntu-latest`、AMD EPYC 7763 4vCPU、IPC往復 p99 = 115.5/258.1/973.6 µs、failover検知 Suspected p50 1503.6 ms / FailoverPending p50 3003.1 ms、共有ランナーで本番保証ではない、往復値で片道p99の直接測定ではない）の記録は [benchmarks.md](benchmarks.md) を参照してください。手動ワークフローとして `.github/workflows/stress.yml` と `bench.yml` が用意されていますが、更新負荷中の無停止条件は未達で `src/tests/update_load.rs` は `#[ignore]` です。

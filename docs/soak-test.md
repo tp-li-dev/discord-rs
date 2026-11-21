@@ -60,7 +60,7 @@ cron で自動化する場合（1 時間おき。`/etc/cron.d/soak-hourly` に�
 
 ## 5. 放置のあとに：新しいビルドへの入れ替え（Gateway の無停止更新の実機試験を兼ねる）
 
-放置の記録を取り終えたら、新しいソースを入れ替える。**Core と botd は新しいバイナリで入れ替える必要があり（botd の再起動を含む）、その後の入れ替えからは Gateway だけを `gateway-update` で無停止に更新できる。**
+放置の記録を取り終えたら、新しいソースを入れ替える。**Core と botd は新しいバイナリで入れ替える必要があり（botd の再起動を含む）、その後の入れ替えからは Gateway だけを `gateway-update` で無停止に更新できる。** botctl と botd は同じビルドで入れ替える。特に `restart --all --yes` を使う場合は、両方が一件の一括操作に対応している必要がある。
 
 ```bash
 # 1. 新しい src.zip を展開してビルド（前回と同じ。.gitignore された target は残してよい）
@@ -74,13 +74,15 @@ sudo -u discord-rs /opt/discord-rs/bin/botctl gateway-update test --secret-file 
 # 状態: botctl operation <操作ID>（state が succeeded）。記録: /var/lib/discord-rs/runtime/gateway-update-audit.jsonl
 ```
 一括確認：`sudo bash deploy/dev/update-check.sh test [--repeat N] [--shard N]` は、対象 Bot の shard 数を `botctl inspect` から取得し、更新の前後の PID、Core の不変、旧 Gateway の消滅、各 shard の IPC、マーカー、監査ログ、journald の警告を確認して PASS／FAIL の表を出す（終了コードは全 PASS のときだけ 0）。`--shard N` を省略すると全 shard を更新し、指定するとその shard だけを更新して他の Gateway の PID が変わらないことも確認する。`--repeat N` は更新を N 回繰り返し、2 回以上なら各 Gateway と Core の RSS を初回更新後の値と比較する（20% 以内）。Ubuntu の `python3` が必要。実行の記録：Oracle（実サーバー）で 1 シャードの更新に成功（全 PASS）。WSL（実 Discord、2 シャード）で、全更新と `--shard 1` が全 PASS、Core を落とした直後・存在しないシャード・`--repeat 0` が FAIL／拒否されることを確認（`docs/progress.md`）。表示が期待と違えば、スクリプト側の不具合も疑う。
+`--repeat` でも Bot ごとの Identify 枠を共有する。間隔待ちのまま結果を確認できなければ `IdentifyBudget`、間隔待ちで操作期限に達した場合は `IdentifyDeferred`、回数枠が足りなければ `IdentifyUnavailable` が更新の FAIL 行に表示される。
+
 更新の前後で `sudo soak-report` を取り、Core の PID が変わらないこと、`!count`（または `/ping`）が続くことを確認する。`mv` で置き換えるのは、実行中のファイルに上書きしない（`Text file busy` を避ける）ため。
 
 ### 5.1 うまくいかないとき（戻し方）
 
 - 入れ替え前に `/opt/discord-rs/bin/` の旧バイナリを `*.prev` に退避しておく：`for f in botd botctl src; do sudo cp -p /opt/discord-rs/bin/$f /opt/discord-rs/bin/$f.prev; done`。
 - 戻す：`.prev` を `mv` で元の名前に戻し、`sudo systemctl restart botd`（Bot は数秒止まる）。
-- `gateway-update` が `failed` になった場合は、旧 Gateway が再起動されて Bot は応答し続けるはず。`sudo -u discord-rs /opt/discord-rs/bin/botctl operation <操作ID> ...` と `gateway-update-audit.jsonl` の最後の行、`journalctl -u botd -n 100` を控える。
+- `gateway-update` が `failed` になった場合は、操作結果と現在の `status` で稼働中の Gateway を確認する。待機起動前の Identify 拒否では旧 Gateway が稼働を続ける。昇格後の失敗では自動復旧が Identify の間隔を待つことがある。`botctl operation <操作ID>`、`gateway-update-audit.jsonl` の最後の行、`journalctl -u botd -n 100` を控える。
 - 更新中に同じ `!workers` が二重に返る可能性がある（既知の制限。`docs/known-limitations.md`）。`!count` / `!ping` の重複は Core 側で抑止される想定。
 
 ## 6. 実施記録

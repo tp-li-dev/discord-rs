@@ -1,5 +1,6 @@
 use src::{
     daemon::*,
+    local_identify::LocalIdentifyPolicy,
     placement::{Config, LocalShardIntent},
     shard_runtime::{self, ShardRuntimeSpec},
     supervisor::{Clock, RestartPolicy, Sleep},
@@ -50,6 +51,20 @@ impl Root {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&path).unwrap();
+        Self(path, base)
+    }
+
+    #[cfg(unix)]
+    fn for_separate_cores() -> Self {
+        use std::os::unix::fs::DirBuilderExt;
+
+        // Use a short Linux path with Unix permissions even from a WSL DrvFs checkout.
+        let base = PathBuf::from("/tmp");
+        let path = base.join(format!("id-{:016x}", getrandom::u64().unwrap()));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .unwrap();
         Self(path, base)
     }
 }
@@ -210,7 +225,13 @@ impl Drop for Managed {
     }
 }
 fn managed(specs: Vec<ShardRuntimeSpec>, p: RestartPolicy, clock: &ManualClock) -> Managed {
-    Managed(Daemon::with_clock(specs, p, clock.clone()).unwrap())
+    let mut daemon = Daemon::with_clock(specs, p, clock.clone()).unwrap();
+    // These process-only lifecycle tests exercise their own restart policy.
+    daemon.set_local_identify_policy(LocalIdentifyPolicy {
+        min_interval: Duration::ZERO,
+        ..Default::default()
+    });
+    Managed(daemon)
 }
 async fn eventually(mut test: impl FnMut() -> bool) {
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -386,6 +407,215 @@ async fn botd_rejects_an_unknown_nonce_retry_bot_id_at_startup() {
         String::from_utf8(output.stderr).unwrap().trim_end(),
         "botd: unknown Bot ID in Create Message nonce retry allowlist",
     );
+}
+
+#[tokio::test]
+async fn autostart_defers_a_same_bot_shard_and_starts_another_bot() {
+    let root = Root::new();
+    let clock = ManualClock::default();
+    let plan = specs(&root, &[("A", 0), ("A", 1), ("B", 0)]);
+    let mut daemon = Managed(Daemon::with_clock(plan, policy(), clock.clone()).unwrap());
+    daemon.0.start_all(&credentials).unwrap();
+    assert!(daemon.0.has_child(&key("A", 0)));
+    assert!(!daemon.0.has_child(&key("A", 1)));
+    assert!(daemon.0.has_child(&key("B", 0)));
+    let waiting = &daemon.0.snapshots()[1];
+    assert!(waiting.desired_running);
+    assert_eq!(
+        waiting.recovery.as_ref().unwrap()["deferred"],
+        "IdentifyBudget"
+    );
+    assert_eq!(waiting.restarts, 0);
+    clock.set(29);
+    daemon.0.poll(&credentials).unwrap();
+    assert!(!daemon.0.has_child(&key("A", 1)));
+    clock.set(30);
+    daemon.0.poll(&credentials).unwrap();
+    assert!(daemon.0.has_child(&key("A", 1)));
+}
+
+#[tokio::test]
+async fn autostart_reports_exhaustion_for_only_the_affected_bot() {
+    let root = Root::new();
+    let clock = ManualClock::default();
+    let plan = specs(&root, &[("A", 0), ("A", 1), ("B", 0)]);
+    let mut daemon = Managed(Daemon::with_clock(plan, policy(), clock).unwrap());
+    daemon.0.set_local_identify_policy(LocalIdentifyPolicy {
+        min_interval: Duration::ZERO,
+        max_per_window: 1,
+        ..Default::default()
+    });
+    assert_eq!(
+        daemon.0.start_all(&credentials),
+        Err(DaemonError::IdentifyUnavailable)
+    );
+    let snapshots = daemon.0.snapshots();
+    assert!(daemon.0.has_child(&key("A", 0)));
+    assert!(daemon.0.has_child(&key("B", 0)));
+    assert!(!daemon.0.has_child(&key("A", 1)));
+    assert!(!snapshots[1].desired_running);
+    assert_eq!(
+        snapshots[1].recovery.as_ref().unwrap()["state"],
+        serde_json::json!({"Degraded": "IdentifyUnavailable"})
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_manual_starts_can_only_consume_one_same_bot_grant() {
+    let root = Root::new();
+    let clock = ManualClock::default();
+    let plan = specs(&root, &[("A", 0), ("A", 1), ("B", 0)]);
+    let daemon = Arc::new(tokio::sync::Mutex::new(Managed(
+        Daemon::with_clock(plan, policy(), clock.clone()).unwrap(),
+    )));
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let mut requests = Vec::new();
+    for wanted in [key("A", 0), key("A", 1), key("B", 0)] {
+        let (daemon, barrier) = (Arc::clone(&daemon), Arc::clone(&barrier));
+        requests.push(tokio::spawn(async move {
+            barrier.wait().await;
+            let result = daemon.lock().await.0.start(&wanted, &credentials);
+            (wanted, result)
+        }));
+    }
+    let mut deferred = None;
+    for request in requests {
+        let (wanted, result) = request.await.unwrap();
+        if result == Err(DaemonError::IdentifyDeferred) {
+            assert_eq!(wanted.bot_id, "A");
+            assert!(deferred.replace(wanted).is_none());
+        } else {
+            result.unwrap();
+            assert!(daemon.lock().await.0.has_child(&wanted));
+        }
+    }
+    let deferred = deferred.expect("one same-Bot request must be refused");
+    let mut daemon = daemon.lock().await;
+    clock.set(30);
+    daemon.0.poll(&credentials).unwrap();
+    assert!(
+        !daemon.0.has_child(&deferred),
+        "a refused manual request must not turn into automatic work"
+    );
+    daemon.0.start(&deferred, &credentials).unwrap();
+    assert!(daemon.0.has_child(&deferred));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn standby_and_failed_activation_recovery_share_the_launch_budget() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = Root::for_separate_cores();
+    let program = root.0.join("process-only-gateway");
+    // Cores drain the capability pipe. The standby exits after receiving activation.
+    std::fs::write(
+        &program,
+        r#"#!/bin/sh
+for arg in "$@"; do
+    if [ "$arg" = "--standby" ]; then
+        IFS= read -r line || exit 1
+        exit 17
+    fi
+done
+while IFS= read -r line; do :; done
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let plan = shard_runtime::plan(
+        &[LocalShardIntent {
+            bot_id: "7".into(),
+            shard_id: 0,
+            total_shards: 1,
+            token_env: "TOKEN_A".into(),
+        }],
+        &root.0,
+    )
+    .unwrap();
+    let clock = ManualClock::default();
+    let marker = plan[0].gateway.state_path.join("standby-ready");
+    let mut daemon = Managed(Daemon::with_clock(plan, policy(), clock.clone()).unwrap());
+    daemon.0.set_gateway_program(&program).unwrap();
+    daemon.0.enable_separate_cores().unwrap();
+    daemon.0.set_local_identify_policy(LocalIdentifyPolicy {
+        max_per_window: 4,
+        ..Default::default()
+    });
+    let wanted = key("7", 0);
+    daemon.0.start_all(&credentials).unwrap();
+    assert!(daemon.0.has_child(&wanted));
+    let original = daemon.0.snapshots()[0].identity.clone();
+    std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+    std::fs::write(&marker, b"stale fixture marker").unwrap();
+    assert_eq!(
+        daemon.0.begin_gateway_update(&wanted, &credentials),
+        Ok(false)
+    );
+    assert!(daemon.0.has_child(&wanted));
+    assert_eq!(daemon.0.snapshots()[0].identity, original);
+    assert!(marker.is_file());
+    clock.set(30);
+    assert_eq!(
+        daemon.0.begin_gateway_update(&wanted, &credentials),
+        Ok(true)
+    );
+    assert!(!marker.exists());
+    daemon.0.send_gateway_activation(&wanted).await.unwrap();
+    eventually(|| {
+        matches!(
+            daemon.0.gateway_activation_progress(&wanted),
+            UpdateProgress::Failed(DaemonError::ChildExited)
+        )
+    })
+    .await;
+    daemon.0.fail_gateway_activation(&wanted);
+    eventually(|| {
+        daemon.0.poll(&credentials).unwrap();
+        !daemon.0.has_child(&wanted)
+    })
+    .await;
+
+    clock.set(59);
+    daemon.0.poll(&credentials).unwrap();
+    let waiting = &daemon.0.snapshots()[0];
+    assert!(!daemon.0.has_child(&wanted));
+    assert_eq!(waiting.identity, original);
+    assert_eq!(waiting.restarts, 0);
+    assert_eq!(
+        waiting.recovery.as_ref().unwrap()["deferred"],
+        "IdentifyBudget"
+    );
+    clock.set(60);
+    daemon.0.poll(&credentials).unwrap();
+    assert!(daemon.0.has_child(&wanted));
+    assert_ne!(daemon.0.snapshots()[0].identity, original);
+    assert_eq!(daemon.0.snapshots()[0].restarts, 1);
+
+    // Grants at 0, 30 and 60 leave one slot. A standby needs two, but
+    // an ordinary start can spend the fourth and final slot at 90.
+    clock.set(90);
+    let replacement = daemon.0.snapshots()[0].identity.clone();
+    assert_eq!(
+        daemon.0.begin_gateway_update(&wanted, &credentials),
+        Err(DaemonError::IdentifyUnavailable)
+    );
+    assert!(daemon.0.has_child(&wanted));
+    assert_eq!(daemon.0.snapshots()[0].identity, replacement);
+
+    daemon.0.stop(&wanted, StopMode::Force).unwrap();
+    terminal(&mut daemon.0).await;
+    daemon.0.start(&wanted, &credentials).unwrap();
+    assert!(daemon.0.has_child(&wanted));
+    daemon.0.stop(&wanted, StopMode::Force).unwrap();
+    terminal(&mut daemon.0).await;
+    clock.set(120);
+    assert_eq!(
+        daemon.0.start(&wanted, &credentials),
+        Err(DaemonError::IdentifyUnavailable)
+    );
+    assert!(!daemon.0.has_child(&wanted));
+    daemon.0.stop_cores(Duration::from_secs(2)).await;
 }
 
 #[tokio::test]

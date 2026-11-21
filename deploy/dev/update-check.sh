@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Check separate-mode shards on Ubuntu; run as root.
+# Use botctl and the running botd from the same release.
 set -u
 set -o pipefail
 USER_NAME=discord-rs
@@ -167,7 +168,17 @@ for ((round=1; round<=repeat; round++)); do
     done
   fi
   echo "Operation elapsed: $((SECONDS-start)) s"
-  if [ "$state" = succeeded ]; then record PASS "R$round update" 'operation succeeded'; else record FAIL "R$round update" "operation state: ${state:-unknown}"; fi
+  if [ "$state" = succeeded ]; then
+    record PASS "R$round update" 'operation succeeded'
+  else
+    reason=$(json_string error "$response")
+    case "$reason" in
+      IdentifyDeferred|IdentifyUnavailable) ;;
+      *) reason=$(json_string waiting_reason "$response")
+         [ "$reason" = IdentifyBudget ] || reason= ;;
+    esac
+    record FAIL "R$round update" "operation state: ${state:-unknown}${reason:+ ($reason)}"
+  fi
   # The old Gateway is asked to exit after the hand-over and is killed after 30 s: wait for it
   # to be gone before taking the "after" snapshot, so the new Gateway cannot be mistaken for it.
   deadline=$((SECONDS+40))

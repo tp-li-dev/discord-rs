@@ -1124,6 +1124,7 @@ pub mod control {
                 "start" | "restart" | "gateway-prepare" | "gateway-update" => {
                     selector && id && !self.force && !self.yes
                 }
+                "restart-all" => self.bot.is_none() && id && !self.force && self.yes,
                 "core-restart" => {
                     selector
                         && id
@@ -1187,7 +1188,7 @@ pub mod control {
     pub struct OperationSnapshot {
         pub operation_id: String,
         pub command: String,
-        pub bot_id: String,
+        pub bot_id: Option<String>,
         pub state: OperationState,
         pub elapsed_ms: u128,
         pub shards: Vec<OperationShard>,
@@ -1198,6 +1199,8 @@ pub mod control {
     enum UpdateStage {
         /// The standby is not started yet.
         Begin,
+        #[cfg(unix)]
+        WaitingIdentify,
         /// Started, logging in.
         Warming,
         /// Told to take the Cores; waiting for its confirmation.
@@ -1447,7 +1450,7 @@ pub mod control {
     struct Operation {
         id: String,
         command: String,
-        bot_id: String,
+        bot_id: Option<String>,
         force: bool,
         /// The requested Shard filter (sorted), kept so a repeated ID can be checked for conflicts.
         shards: Option<Vec<u32>>,
@@ -1469,7 +1472,7 @@ pub mod control {
     impl Operation {
         fn new(
             request: &CommandRequest,
-            bot_id: String,
+            bot_id: Option<String>,
             targets: Vec<ShardKey>,
             waiting: HashSet<ShardKey>,
             phase: Phase,
@@ -1494,6 +1497,10 @@ pub mod control {
                 #[cfg(unix)]
                 core_restart: None,
             }
+        }
+
+        fn is_restart(&self) -> bool {
+            matches!(self.command.as_str(), "restart" | "restart-all")
         }
     }
 
@@ -2301,10 +2308,9 @@ pub mod control {
             if self.operation_exists(&request.operation_id) {
                 return Self::error("operation ID conflicts with an earlier request");
             }
-            let busy = self
-                .operations
-                .values()
-                .any(|op| op.bot_id == request.bot && op.finished.is_none());
+            let busy = self.operations.values().any(|op| {
+                op.finished.is_none() && op.targets.iter().any(|key| key.bot_id == request.bot)
+            });
             updates.admit(request, access, busy)
         }
 
@@ -2364,7 +2370,7 @@ pub mod control {
                     .operation_id
                     .as_ref()
                     .and_then(|id| self.operations.get(id))
-                    .map(|op| op.bot_id.clone())
+                    .and_then(|op| op.bot_id.clone())
             } else {
                 request
                     .bot
@@ -2682,7 +2688,7 @@ pub mod control {
                 return reject(self, reply, &recovery, "total_shards_mismatch", None);
             }
             if let Some(old) = self.operations.get(id) {
-                if old.bot_id == key.bot_id
+                if old.bot_id.as_deref() == Some(key.bot_id.as_str())
                     && old.shards == request.shard_filter()
                     && old.force == force
                     && old.core_restart.as_ref().is_some_and(|previous| {
@@ -2783,7 +2789,7 @@ pub mod control {
             }
             let mut op = Operation::new(
                 request,
-                key.bot_id.clone(),
+                Some(key.bot_id.clone()),
                 vec![key],
                 HashSet::new(),
                 Phase::CoreRestart,
@@ -3200,7 +3206,11 @@ pub mod control {
 
         fn operation_view(&self, op: &Operation) -> Value {
             let snapshot = self.snapshot(op);
-            let value = json!({"ok": snapshot.state != OperationState::Failed, "offline": false, "operation": snapshot, "note": if op.command == "core-restart" { CORE_RESTART_NOTE } else { NOTE }});
+            let mut value = json!({"ok": snapshot.state != OperationState::Failed, "offline": false, "operation": snapshot, "note": if op.command == "core-restart" { CORE_RESTART_NOTE } else { NOTE }});
+            #[cfg(unix)]
+            if op.finished.is_none() && op.update_stage == UpdateStage::WaitingIdentify {
+                value["operation"]["waiting_reason"] = json!("IdentifyBudget");
+            }
             #[cfg(unix)]
             if let Some(recovery) = &op.core_restart {
                 if recovery
@@ -3210,7 +3220,6 @@ pub mod control {
                 {
                     return Self::error("audit_pending");
                 }
-                let mut value = value;
                 value["operation"]["core_recovery_version"] = json!(CORE_RECOVERY_VERSION);
                 value["operation"]["source"] = json!("live");
                 value["operation"]["core"] = json!(recovery.target.core);
@@ -3241,6 +3250,9 @@ pub mod control {
             let failed = snapshot.state == OperationState::Failed;
             let first_error = op.errors.values().next().copied();
             op.finished = Some(snapshot);
+            if op.is_restart() {
+                self.daemon.release_restart_identify(&op.targets);
+            }
             if op.command != "core-restart" {
                 for key in &op.targets {
                     self.daemon.hold_restart(key, false);
@@ -3260,7 +3272,7 @@ pub mod control {
                 // The request was recorded before it started; a failure to record the
                 // outcome cannot undo it, so it is only reported.
                 if let Ok(record) =
-                    Self::audit_record(event, &op.id, Some(&op.bot_id), actor, first_error)
+                    Self::audit_record(event, &op.id, op.bot_id.as_deref(), actor, first_error)
                 {
                     self.write_terminal_audit(record);
                 }
@@ -3448,7 +3460,7 @@ pub mod control {
                     }).collect();
                     json!({"ok": true, "offline": false, "note": NOTE, "bot_id": bot.bot_id, "name": bot.name, "shards": shards})
                 }
-                _ => self.admit(request, selected.expect("validated selector").bot_id),
+                _ => self.admit(request, selected.map(|bot| bot.bot_id)),
             }
         }
 
@@ -3460,7 +3472,7 @@ pub mod control {
             })
         }
 
-        fn admit(&mut self, request: &CommandRequest, bot_id: String) -> Value {
+        fn admit(&mut self, request: &CommandRequest, bot_id: Option<String>) -> Value {
             if let Some(response) = self.replay_retry_response() {
                 return response;
             }
@@ -3486,13 +3498,17 @@ pub mod control {
             }
             let mut targets: Vec<_> = self
                 .daemon
-                .snapshots()
-                .into_iter()
-                .filter(|s| s.key.bot_id == bot_id)
-                .map(|s| s.key)
+                .entries
+                .keys()
+                .filter(|key| bot_id.as_ref().is_none_or(|bot| key.bot_id == *bot))
+                .cloned()
                 .collect();
             if targets.is_empty() {
-                return Self::error("bot has no local shards");
+                return Self::error(if bot_id.is_some() {
+                    "bot has no local shards"
+                } else {
+                    "no bot has local shards"
+                });
             }
             if let Some(wanted) = request.shard_filter() {
                 // A Shard that is not local is an error, never silently skipped: the operator
@@ -3511,11 +3527,17 @@ pub mod control {
             if self.core_restart_busy(&targets) {
                 return Self::error("busy");
             }
+            let target_bots: HashSet<_> = targets.iter().map(|key| &key.bot_id).collect();
             let active: Vec<_> = self
                 .operations
                 .iter()
                 .filter(|(_, op)| {
-                    op.bot_id == bot_id && op.finished.is_none() && op.command != "core-restart"
+                    op.finished.is_none()
+                        && op.command != "core-restart"
+                        && op
+                            .targets
+                            .iter()
+                            .any(|key| target_bots.contains(&key.bot_id))
                 })
                 .map(|(id, _)| id.clone())
                 .collect();
@@ -3523,23 +3545,26 @@ pub mod control {
                 return Self::error("bot already has an operation in progress");
             }
             // Superseding an operation also changes its other shards' restart holds and
-            // candidate lifetimes. A filtered force stop must authorize that entire effect.
+            // candidate lifetimes. A force stop must authorize that entire effect.
             // Refuse before finishing anything or installing new holds.
-            if request.shards.is_some()
-                && active.iter().any(|id| {
-                    self.operations[id]
-                        .targets
-                        .iter()
-                        .any(|key| !targets.contains(key))
-                })
-            {
-                return Self::error("another operation is running on other shards of this bot");
+            if active.iter().any(|id| {
+                self.operations[id]
+                    .targets
+                    .iter()
+                    .any(|key| !targets.contains(key))
+            }) {
+                return Self::error(if request.shards.is_some() {
+                    "another operation is running on other shards of this bot"
+                } else {
+                    "restart-all is in progress"
+                });
             }
-            if request.command == "gateway-update"
-                && self.daemon.gateway_update_fallback_pending(&bot_id)
+            if matches!(request.command.as_str(), "start" | "gateway-update")
+                && bot_id
+                    .as_deref()
+                    .is_some_and(|bot| self.daemon.gateway_update_fallback_pending(bot))
             {
-                // Reject before installing any restart holds: the reserved recovery must
-                // be able to run before another update can start. Keep its reservation.
+                // A new operation must not hold the shard with reserved recovery.
                 return Self::error("gateway fallback recovery pending; retry after recovery");
             }
             // Explicit force stop supersedes an earlier drain/restart. The old
@@ -3552,6 +3577,11 @@ pub mod control {
                 }
                 self.finish(&mut old);
                 self.operations.insert(id, old);
+            }
+            if matches!(request.command.as_str(), "restart" | "restart-all")
+                && let Err(error) = self.daemon.reserve_restart_identify(&targets)
+            {
+                return Self::error(&format!("{error:?}"));
             }
             let waiting = if request.command == "start" || request.command == "gateway-update" {
                 HashSet::new()
@@ -3694,19 +3724,26 @@ pub mod control {
                 && op.update_stage != UpdateStage::Activating
             {
                 self.daemon.cancel_gateway_update(&key);
-                op.errors.insert(key, DaemonError::StopTimedOut);
+                let error = if op.update_stage == UpdateStage::WaitingIdentify {
+                    DaemonError::IdentifyDeferred
+                } else {
+                    DaemonError::StopTimedOut
+                };
+                op.errors.insert(key, error);
                 self.finish(op);
                 return;
             }
             match op.update_stage {
-                UpdateStage::Begin => match self.daemon.begin_gateway_update(&key, credentials) {
-                    Ok(true) => op.update_stage = UpdateStage::Warming,
-                    Ok(false) => {}
-                    Err(error) => {
-                        op.errors.insert(key, error);
-                        self.finish(op);
+                UpdateStage::Begin | UpdateStage::WaitingIdentify => {
+                    match self.daemon.begin_gateway_update(&key, credentials) {
+                        Ok(true) => op.update_stage = UpdateStage::Warming,
+                        Ok(false) => op.update_stage = UpdateStage::WaitingIdentify,
+                        Err(error) => {
+                            op.errors.insert(key, error);
+                            self.finish(op);
+                        }
                     }
-                },
+                }
                 UpdateStage::Warming => match self.daemon.gateway_update_progress(&key) {
                     UpdateProgress::Warming => {
                         if op.started.elapsed() >= op.update_timeout {
@@ -3793,7 +3830,12 @@ pub mod control {
                 let key = &op.targets[op.next];
                 op.next += 1;
                 let result = if op.phase == Phase::Starting {
-                    self.daemon.start(key, credentials)
+                    if op.is_restart() {
+                        self.daemon
+                            .start_inner(key, credentials, StartKind::Restart)
+                    } else {
+                        self.daemon.start(key, credentials)
+                    }
                 } else {
                     if self.daemon.has_child(key) {
                         op.waiting.insert(key.clone());
@@ -3807,9 +3849,20 @@ pub mod control {
                 match result {
                     Err(error) => {
                         op.errors.insert(key.clone(), error);
+                        if op.phase == Phase::Stopping && op.is_restart() {
+                            self.finish(op);
+                            return;
+                        }
                         // A failed manual start must not secretly succeed later
                         // through an automatically scheduled restart.
-                        if op.phase == Phase::Starting && error != DaemonError::InvalidState {
+                        if op.phase == Phase::Starting
+                            && !matches!(
+                                error,
+                                DaemonError::InvalidState
+                                    | DaemonError::IdentifyDeferred
+                                    | DaemonError::IdentifyUnavailable
+                            )
+                        {
                             let _ = self.daemon.stop(key, StopMode::WaitForExit);
                         }
                     }
@@ -3846,7 +3899,7 @@ pub mod control {
                 if !op.waiting.is_empty() {
                     return;
                 }
-                if op.command == "restart" && op.errors.is_empty() {
+                if op.is_restart() && op.errors.is_empty() {
                     op.phase = Phase::Starting;
                     op.next = 0;
                     return;
@@ -6251,6 +6304,13 @@ pub mod control {
         #[test]
         fn changed_bot_identity_is_refused_before_supersession_or_restart_holds() {
             let mut plane = plane(1, 2);
+            // Both shards must be reservable for this identity precondition test.
+            plane
+                .daemon
+                .set_local_identify_policy(crate::local_identify::LocalIdentifyPolicy {
+                    min_interval: Duration::ZERO,
+                    ..Default::default()
+                });
             let before = plane.daemon.snapshots();
             let mut restart = request("restart", 0, 1);
             // The selector still resolves, but now to a different identity from the listing.
@@ -6278,6 +6338,27 @@ pub mod control {
             assert_eq!(plane.request(&stop)["ok"], false);
             assert_eq!(plane.operations.len(), 1);
             assert_eq!(plane.request(&query(1))["operation"]["state"], "running");
+        }
+
+        #[test]
+        fn matching_bot_identity_does_not_bypass_restart_identify_spacing() {
+            let mut plane = plane(1, 2);
+            let before = plane.daemon.snapshots();
+            let mut restart = request("restart", 0, 1);
+            restart.expect_bot_id = Some("id-0".into());
+
+            let refused = plane.request(&restart);
+            assert_eq!(refused["ok"], false);
+            assert_eq!(refused["error"], "IdentifyDeferred");
+            assert!(plane.operations.is_empty());
+            assert_eq!(plane.daemon.snapshots(), before);
+            assert!(
+                plane
+                    .daemon
+                    .entries
+                    .values()
+                    .all(|entry| !entry.restart_held)
+            );
         }
 
         #[test]
@@ -6371,6 +6452,12 @@ pub mod control {
         #[tokio::test]
         async fn abnormal_exit_after_admission_cannot_be_reported_as_a_successful_restart() {
             let mut plane = plane(1, 1);
+            plane
+                .daemon
+                .set_local_identify_policy(crate::local_identify::LocalIdentifyPolicy {
+                    min_interval: Duration::ZERO,
+                    ..Default::default()
+                });
             let key = ShardKey {
                 bot_id: "id-0".into(),
                 shard_id: 0,
@@ -6891,7 +6978,7 @@ pub mod control {
             // Call ControlPlane admission directly; no separated Core or child is needed.
             let retry = request("gateway-update", 0, 92);
             for _ in 0..2 {
-                let response = plane.admit(&retry, "id-0".into());
+                let response = plane.admit(&retry, Some("id-0".into()));
                 assert_eq!(response["ok"], false);
                 assert_eq!(
                     response["error"],
@@ -6908,7 +6995,7 @@ pub mod control {
                 assert!(plane.daemon.entries[&protected].update_fallback_reserved);
             }
             // A different Bot can proceed without holding the protected Bot's shards.
-            let other = plane.admit(&request("gateway-update", 1, 93), "id-1".into());
+            let other = plane.admit(&request("gateway-update", 1, 93), Some("id-1".into()));
             assert_eq!(other["ok"], true);
             for entry in plane.daemon.entries.values() {
                 assert_eq!(entry.restart_held, entry.snapshot.key.bot_id == "id-1");
@@ -6921,7 +7008,7 @@ pub mod control {
                 .get_mut(&protected)
                 .unwrap()
                 .update_fallback_reserved = false;
-            let admitted = plane.admit(&retry, "id-0".into());
+            let admitted = plane.admit(&retry, Some("id-0".into()));
             assert_eq!(admitted["ok"], true);
             assert_eq!(plane.operations.len(), 2);
             assert!(
@@ -6963,7 +7050,7 @@ pub mod control {
                 window: Duration::from_secs(3600),
                 max_per_window: 10,
             });
-            let at = Instant::now() - Duration::from_secs(60);
+            let at = Duration::ZERO;
             for _ in 0..9 {
                 daemon.local_identify.record("id-0", at);
             }
@@ -6973,7 +7060,8 @@ pub mod control {
                 instance: daemon.instance,
                 sequence: &mut daemon.sequence,
                 manual: Some(&other),
-                require_shared_admission: true,
+                reserved_restart: None,
+                now: Duration::from_secs(60),
                 local_identify: &mut daemon.local_identify,
                 errors: BTreeMap::new(),
             };
@@ -6981,6 +7069,7 @@ pub mod control {
                 host.try_acquire_identify(other_key),
                 IdentifyAdmission::Pending
             );
+            assert_eq!(host.errors[&other], DaemonError::IdentifyDeferred);
             host.manual = None;
             assert_eq!(
                 host.try_acquire_identify(other_key),
@@ -7007,7 +7096,7 @@ pub mod control {
             use crate::local_identify::{
                 LocalAdmission, LocalIdentifyPolicy, LocalIdentifyRegistry,
             };
-            let now = std::time::Instant::now();
+            let now = Duration::ZERO;
             let mut registry = LocalIdentifyRegistry::with_policy(LocalIdentifyPolicy {
                 min_interval: Duration::from_secs(30),
                 window: Duration::from_secs(3600),
@@ -7015,18 +7104,323 @@ pub mod control {
             });
             registry.record("bot", now);
             assert!(matches!(
-                Daemon::<crate::supervisor::MonotonicClock>::gateway_update_identify_check(
-                    &registry, "bot", now
-                ),
+                registry.try_acquire_standby("bot", now),
                 LocalAdmission::Pending { .. }
             ));
             registry.record("bot", now);
             assert!(matches!(
-                Daemon::<crate::supervisor::MonotonicClock>::gateway_update_identify_check(
-                    &registry, "bot", now
-                ),
+                registry.try_acquire_standby("bot", now),
                 LocalAdmission::Exhausted { .. }
             ));
+        }
+
+        #[cfg(unix)]
+        mod restart_identify {
+            use super::*;
+            use crate::local_identify::LocalIdentifyPolicy;
+
+            fn fixture(
+                bots: usize,
+                shards: u32,
+                max_per_window: u32,
+            ) -> (ControlPlane, tokio::sync::watch::Sender<Duration>) {
+                let mut plane = plane(bots, shards);
+                let specs = plane
+                    .daemon
+                    .entries
+                    .values()
+                    .map(|entry| {
+                        let mut spec = entry.spec.clone();
+                        spec.gateway.program = "/bin/sh".into();
+                        spec.gateway.args =
+                            ["-c", "IFS= read -r line"].map(OsString::from).to_vec();
+                        spec
+                    })
+                    .collect();
+                let (time, clock) = tokio::sync::watch::channel(Duration::ZERO);
+                plane.daemon = Daemon::with_clock(
+                    specs,
+                    RestartPolicy::default(),
+                    MonotonicClock::with_manual_time(clock),
+                )
+                .unwrap();
+                plane.daemon.set_local_identify_policy(LocalIdentifyPolicy {
+                    max_per_window,
+                    ..Default::default()
+                });
+                (plane, time)
+            }
+
+            fn credentials(_: &str) -> Option<OsString> {
+                Some("fixture-only".into())
+            }
+
+            fn key(bot: usize, shard_id: u32) -> ShardKey {
+                ShardKey {
+                    bot_id: format!("id-{bot}"),
+                    shard_id,
+                }
+            }
+
+            fn running_pid(plane: &ControlPlane, key: &ShardKey) -> u32 {
+                let entry = &plane.daemon.entries[key];
+                assert!(entry.snapshot.desired_running);
+                assert!(matches!(entry.snapshot.state, ProcessState::Running));
+                assert!(entry.snapshot.retry_at_ms.is_none());
+                let live = plane
+                    .daemon
+                    .recovery
+                    .snapshot(entry.recovery_key)
+                    .unwrap()
+                    .pid
+                    .unwrap();
+                assert_eq!(entry.snapshot.identity.as_ref().unwrap().pid, live);
+                live
+            }
+
+            async fn complete(plane: &mut ControlPlane, id: usize) -> Value {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        plane.tick(&credentials).await;
+                        let result = plane.request(&query(id));
+                        if result["operation"]["state"] != "running" {
+                            return result;
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .unwrap()
+            }
+
+            async fn cleanup(plane: &mut ControlPlane) {
+                assert!(
+                    plane
+                        .shutdown_children(&credentials, Duration::from_secs(5))
+                        .await
+                        .is_empty()
+                );
+            }
+
+            fn restart_all(id: usize) -> CommandRequest {
+                CommandRequest {
+                    bot: None,
+                    yes: true,
+                    ..request("restart-all", 0, id)
+                }
+            }
+
+            #[tokio::test]
+            async fn manual_restart_reports_identify_exhaustion_and_leaves_no_retry() {
+                let (mut plane, time) = fixture(1, 1, 1);
+                let key = key(0, 0);
+                plane.daemon.start(&key, &credentials).unwrap();
+                let pid = running_pid(&plane, &key);
+                time.send_replace(Duration::from_secs(30));
+
+                let rejected = plane.request(&request("restart", 0, 2));
+                assert_eq!(rejected["ok"], false);
+                assert_eq!(rejected["error"], "IdentifyUnavailable");
+                plane.tick(&credentials).await;
+                assert!(plane.operations.is_empty());
+                assert!(!plane.daemon.entries[&key].restart_held);
+                assert_eq!(running_pid(&plane, &key), pid);
+                cleanup(&mut plane).await;
+            }
+
+            #[tokio::test]
+            async fn spacing_is_refused_before_stop_and_a_new_request_can_restart_at_the_boundary()
+            {
+                let (mut plane, time) = fixture(1, 1, 10);
+                let key = key(0, 0);
+                plane.daemon.start(&key, &credentials).unwrap();
+                let pid = running_pid(&plane, &key);
+                let before = plane.daemon.snapshots();
+                let restart = |id| CommandRequest {
+                    expect_bot_id: Some(key.bot_id.clone()),
+                    ..request("restart", 0, id)
+                };
+                time.send_replace(Duration::from_millis(29_999));
+                let refused = plane.request(&restart(1));
+                assert_eq!(refused["ok"], false);
+                assert_eq!(refused["error"], "IdentifyDeferred");
+                assert_eq!(plane.daemon.snapshots(), before);
+                assert!(!plane.daemon.entries[&key].restart_held);
+                plane.tick(&credentials).await;
+                assert_eq!(running_pid(&plane, &key), pid);
+                assert!(plane.operations.is_empty());
+
+                time.send_replace(Duration::from_secs(30));
+                assert_eq!(plane.request(&restart(2))["ok"], true);
+                assert_eq!(
+                    complete(&mut plane, 2).await["operation"]["state"],
+                    "succeeded"
+                );
+                assert_ne!(running_pid(&plane, &key), pid);
+                assert_eq!(plane.request(&restart(3))["error"], "IdentifyDeferred");
+                cleanup(&mut plane).await;
+            }
+
+            #[tokio::test]
+            async fn failed_stop_releases_the_unused_slot_without_charging_it() {
+                let (mut plane, time) = fixture(1, 2, 2);
+                let old = key(0, 0);
+                let other = key(0, 1);
+                plane.daemon.start(&old, &credentials).unwrap();
+                let recovery_key = plane.daemon.entries[&old].recovery_key;
+                let pipe = plane
+                    .daemon
+                    .recovery
+                    .child_mut(recovery_key)
+                    .unwrap()
+                    .unwrap()
+                    .stdin
+                    .take()
+                    .unwrap();
+                time.send_replace(Duration::from_secs(30));
+                let mut restart = request("restart", 0, 1);
+                restart.shards = Some(vec![0]);
+                assert_eq!(plane.request(&restart)["ok"], true);
+                let result = complete(&mut plane, 1).await;
+                assert_eq!(result["operation"]["state"], "failed");
+                assert_eq!(result["operation"]["shards"][0]["error"], "StopFailed");
+                assert!(plane.daemon.has_child(&old));
+                assert!(!plane.daemon.entries[&old].restart_held);
+                plane.daemon.start(&other, &credentials).unwrap();
+                running_pid(&plane, &other);
+                plane
+                    .daemon
+                    .recovery
+                    .child_mut(recovery_key)
+                    .unwrap()
+                    .unwrap()
+                    .stdin = Some(pipe);
+                // The first request failed before writing. Force is for fixture cleanup.
+                plane.daemon.stop(&old, StopMode::Force).unwrap();
+                cleanup(&mut plane).await;
+            }
+
+            #[tokio::test]
+            async fn restart_shard_list_requires_budget_and_spacing_for_every_replacement() {
+                let (mut plane, time) = fixture(1, 2, 3);
+                let first = key(0, 0);
+                let second = key(0, 1);
+                plane.daemon.start(&first, &credentials).unwrap();
+                time.send_replace(Duration::from_secs(30));
+                plane.daemon.start(&second, &credentials).unwrap();
+                let pids = [running_pid(&plane, &first), running_pid(&plane, &second)];
+
+                let mut restart = request("restart", 0, 1);
+                restart.shards = Some(vec![1, 0]);
+                for (at, denied) in [(60, "IdentifyUnavailable"), (3630, "IdentifyDeferred")] {
+                    time.send_replace(Duration::from_secs(at));
+                    assert_eq!(plane.request(&restart)["error"], denied);
+                    plane.tick(&credentials).await;
+                    assert_eq!(
+                        [running_pid(&plane, &first), running_pid(&plane, &second)],
+                        pids
+                    );
+                    assert!(plane.operations.is_empty());
+                }
+                cleanup(&mut plane).await;
+            }
+
+            #[tokio::test]
+            async fn restart_all_releases_earlier_bot_reservations_if_any_bot_is_denied() {
+                let (mut plane, time) = fixture(2, 1, 2);
+                let first = key(0, 0);
+                let second = key(1, 0);
+                plane.daemon.start(&first, &credentials).unwrap();
+                time.send_replace(Duration::from_secs(1));
+                plane.daemon.start(&second, &credentials).unwrap();
+                let pids = [running_pid(&plane, &first), running_pid(&plane, &second)];
+
+                time.send_replace(Duration::from_secs(30));
+                assert_eq!(plane.request(&restart_all(1))["error"], "IdentifyDeferred");
+                plane.tick(&credentials).await;
+                assert_eq!(
+                    [running_pid(&plane, &first), running_pid(&plane, &second)],
+                    pids
+                );
+                assert!(plane.operations.is_empty());
+
+                // The first Bot could reserve at t=30. Its reservation must
+                // have rolled back when the second Bot was denied.
+                plane
+                    .daemon
+                    .local_identify
+                    .record("id-1", Duration::from_secs(1));
+                time.send_replace(Duration::from_secs(31));
+                assert_eq!(
+                    plane.request(&restart_all(1))["error"],
+                    "IdentifyUnavailable"
+                );
+                plane.tick(&credentials).await;
+                assert_eq!(
+                    [running_pid(&plane, &first), running_pid(&plane, &second)],
+                    pids
+                );
+
+                time.send_replace(Duration::from_secs(3601));
+                let access = super::super::super::update_control::ControlAccess {
+                    subject: "restart-test".into(),
+                    role: "admin".into(),
+                    scope: Some(vec![first.clone(), second.clone()]),
+                };
+                assert_eq!(
+                    plane.request_as(&restart_all(2), &access)["error"],
+                    "control permission or scope denied"
+                );
+                let access = super::super::super::update_control::ControlAccess {
+                    scope: None,
+                    ..access
+                };
+                assert_eq!(plane.request_as(&restart_all(2), &access)["ok"], true);
+                let done = complete(&mut plane, 2).await;
+                assert_eq!(done["operation"]["state"], "succeeded");
+                assert_ne!(running_pid(&plane, &first), pids[0]);
+                assert_ne!(running_pid(&plane, &second), pids[1]);
+                cleanup(&mut plane).await;
+            }
+
+            #[tokio::test]
+            async fn pending_restart_reserves_its_bot_only_and_cannot_be_preempted_by_a_start() {
+                let (mut plane, time) = fixture(2, 2, 2);
+                let target = key(0, 0);
+                let competitor = key(0, 1);
+                let independent = key(1, 0);
+                plane.daemon.start(&target, &credentials).unwrap();
+                plane.daemon.start(&independent, &credentials).unwrap();
+                let original = running_pid(&plane, &target);
+                let other_pid = running_pid(&plane, &independent);
+                time.send_replace(Duration::from_secs(30));
+                let mut first = request("restart", 0, 1);
+                first.shards = Some(vec![0]);
+                assert_eq!(plane.request(&first)["ok"], true);
+
+                // Issue another start while the accepted restart still owns
+                // its slot and before its first stop has been sent.
+                assert_eq!(
+                    plane.daemon.start(&competitor, &credentials),
+                    Err(DaemonError::IdentifyDeferred)
+                );
+                assert!(!plane.daemon.has_child(&competitor));
+                assert_eq!(running_pid(&plane, &target), original);
+                let mut other = request("restart", 1, 2);
+                other.shards = Some(vec![0]);
+                assert_eq!(plane.request(&other)["ok"], true);
+                assert_eq!(
+                    complete(&mut plane, 1).await["operation"]["state"],
+                    "succeeded"
+                );
+                assert_eq!(
+                    complete(&mut plane, 2).await["operation"]["state"],
+                    "succeeded"
+                );
+                assert_ne!(running_pid(&plane, &target), original);
+                assert_ne!(running_pid(&plane, &independent), other_pid);
+                cleanup(&mut plane).await;
+            }
         }
 
         #[test]
@@ -7042,7 +7436,7 @@ pub mod control {
             plane
                 .audit_gateway_update("requested", &id, Some("id-0"), &actor, None)
                 .unwrap();
-            assert_eq!(plane.admit(&req, "id-0".to_owned())["ok"], true);
+            assert_eq!(plane.admit(&req, Some("id-0".into()))["ok"], true);
             plane.gateway_update_actors.insert(id.clone(), actor);
             plane.set_gateway_update_audit(dir.clone());
             let mut op = plane.operations.remove(&id).unwrap();
@@ -7514,6 +7908,8 @@ pub enum DaemonError {
     UnknownBot,
     UnknownShard,
     InvalidState,
+    IdentifyDeferred,
+    IdentifyUnavailable,
     NoRuntime,
     MissingCredential,
     MissingSystemEnvironment,
@@ -7721,7 +8117,6 @@ pub struct Daemon<C = MonotonicClock> {
     clock: std::sync::Arc<C>,
     recovery_events: VecDeque<DaemonRecoveryEvent>,
     recovery_events_dropped: u64,
-    require_shared_recovery_admission: bool,
     local_identify: crate::local_identify::LocalIdentifyRegistry,
     last_now: Duration,
     clock_failed: bool,
@@ -7729,6 +8124,40 @@ pub struct Daemon<C = MonotonicClock> {
     sequence: u64,
     metrics: crate::daemon_metrics::DaemonMetrics,
     log_checked: Option<std::time::Instant>,
+}
+
+#[derive(Clone, Copy)]
+enum GatewayLaunch {
+    Active,
+    #[cfg(unix)]
+    Standby,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StartKind {
+    Automatic,
+    Manual,
+    Restart,
+}
+
+impl Entry {
+    fn acquire_identify(
+        &self,
+        registry: &mut crate::local_identify::LocalIdentifyRegistry,
+        now: Duration,
+        launch: GatewayLaunch,
+    ) -> crate::local_identify::LocalAdmission {
+        use crate::local_identify::LocalAdmission;
+        if self.mock_discord.is_some() {
+            return LocalAdmission::Granted;
+        }
+        let bot = &self.snapshot.key.bot_id;
+        match launch {
+            GatewayLaunch::Active => registry.try_acquire(bot, now),
+            #[cfg(unix)]
+            GatewayLaunch::Standby => registry.try_acquire_standby(bot, now),
+        }
+    }
 }
 
 // Share the exact clock domain with the recovery engine without requiring C: Clone.
@@ -7757,7 +8186,8 @@ struct ProcessRecoveryHost<'a, S> {
     instance: [u8; 16],
     sequence: &'a mut u64,
     manual: Option<&'a ShardKey>,
-    require_shared_admission: bool,
+    reserved_restart: Option<&'a ShardKey>,
+    now: Duration,
     local_identify: &'a mut crate::local_identify::LocalIdentifyRegistry,
     errors: BTreeMap<ShardKey, DaemonError>,
 }
@@ -7773,14 +8203,7 @@ impl<S: CredentialSource> RecoveryHost for ProcessRecoveryHost<'_, S> {
         false
     }
     fn try_acquire_identify(&mut self, key: ChildKey) -> IdentifyAdmission {
-        // This legacy launcher has no Resume/Identify wire contract (no Resume:
-        // every start is a fresh Identify). Automatic real-Discord recovery is
-        // admitted only by the single-host, in-memory LocalIdentifyRegistry
-        // (min interval + rolling-window cap); there is no cross-process or
-        // cross-host coordination. Outside an update reservation, initial and explicit
-        // operator starts are always granted but recorded, so a crash is spaced.
-        // Explicit token-free simulation and trusted process-only callers keep
-        // their existing lifecycle contract; neither is a Discord admission.
+        use crate::local_identify::LocalAdmission;
         // A single local update owns the Bot's fallback opportunity until commit, a
         // pre-activation abort, or its recovery's Identify grant. Defer OTHER starts
         // (even manual ones) without consuming history. This deliberately serializes
@@ -7824,37 +8247,42 @@ impl<S: CredentialSource> RecoveryHost for ProcessRecoveryHost<'_, S> {
         let since = *entry
             .admission_since
             .get_or_insert_with(std::time::Instant::now);
-        if blocked {
-            return IdentifyAdmission::Pending;
-        }
-        let mut admission = IdentifyAdmission::Granted;
-        if entry.mock_discord.is_none() {
-            let now = std::time::Instant::now();
-            let bot = entry.snapshot.key.bot_id.as_str();
-            if entry.update_fallback_reserved
-                || (self.require_shared_admission && self.manual != Some(&entry.snapshot.key))
-            {
-                use crate::local_identify::LocalAdmission;
-                admission = match self.local_identify.try_acquire(bot, now) {
-                    LocalAdmission::Granted => IdentifyAdmission::Granted,
-                    LocalAdmission::Pending { .. } => IdentifyAdmission::Pending,
-                    LocalAdmission::Exhausted { .. } => IdentifyAdmission::Unavailable,
-                };
-            } else {
-                self.local_identify.record(bot, now);
+        let decision = if self.reserved_restart == Some(&entry.snapshot.key) {
+            if entry.mock_discord.is_none() {
+                self.local_identify
+                    .consume_restart(&entry.snapshot.key.bot_id, self.now);
             }
-        }
-        if admission != IdentifyAdmission::Granted {
-            admission
+            LocalAdmission::Granted
+        } else if blocked {
+            LocalAdmission::Pending {
+                retry_after: Duration::ZERO,
+            }
         } else {
-            entry.update_fallback_reserved = false;
-            entry.admission_since = None;
-            if let Some(feed) = &entry.feed {
-                feed.observe(crate::metrics_feed::Observation::IdentifyWait(
-                    since.elapsed(),
-                ));
+            entry.acquire_identify(self.local_identify, self.now, GatewayLaunch::Active)
+        };
+        match decision {
+            LocalAdmission::Granted => {
+                entry.update_fallback_reserved = false;
+                entry.admission_since = None;
+                if let Some(feed) = &entry.feed {
+                    feed.observe(crate::metrics_feed::Observation::IdentifyWait(
+                        since.elapsed(),
+                    ));
+                }
+                IdentifyAdmission::Granted
             }
-            IdentifyAdmission::Granted
+            denial if self.manual == Some(&entry.snapshot.key) => {
+                let error = match denial {
+                    LocalAdmission::Exhausted { .. } => DaemonError::IdentifyUnavailable,
+                    _ => DaemonError::IdentifyDeferred,
+                };
+                self.errors.insert(entry.snapshot.key.clone(), error);
+                // The explicit start is cancelled by its caller. Keep this
+                // stopped slot reusable for a later management operation.
+                IdentifyAdmission::Pending
+            }
+            LocalAdmission::Pending { .. } => IdentifyAdmission::Pending,
+            LocalAdmission::Exhausted { .. } => IdentifyAdmission::Unavailable,
         }
     }
     fn cancel_identify(&mut self, _: ChildKey) {}
@@ -8094,7 +8522,6 @@ impl<C: Clock> Daemon<C> {
             clock,
             recovery_events: VecDeque::new(),
             recovery_events_dropped: 0,
-            require_shared_recovery_admission: false,
             local_identify: crate::local_identify::LocalIdentifyRegistry::default(),
             last_now,
             clock_failed: false,
@@ -8230,35 +8657,55 @@ impl<C: Clock> Daemon<C> {
         self.entries.values().any(|entry| entry.cores.is_some())
     }
 
-    #[cfg(unix)]
-    fn gateway_update_identify_check(
-        registry: &crate::local_identify::LocalIdentifyRegistry,
-        bot: &str,
-        now: std::time::Instant,
-    ) -> crate::local_identify::LocalAdmission {
-        use crate::local_identify::LocalAdmission;
-        let mut probe = registry.clone();
-        let first = probe.try_acquire(bot, now);
-        let when = match first {
-            LocalAdmission::Exhausted { .. } => return first,
-            LocalAdmission::Pending { retry_after } => {
-                match probe.try_acquire(bot, now + retry_after) {
-                    LocalAdmission::Granted => now + retry_after,
-                    other => return other,
-                }
-            }
-            LocalAdmission::Granted => now,
-        };
-        match probe.try_acquire(bot, when) {
-            LocalAdmission::Exhausted { retry_after } => LocalAdmission::Exhausted { retry_after },
-            _ => first,
-        }
-    }
-
     fn gateway_update_fallback_pending(&self, bot_id: &str) -> bool {
         self.entries
             .values()
             .any(|entry| entry.snapshot.key.bot_id == bot_id && entry.update_fallback_reserved)
+    }
+
+    fn reserve_restart_identify(&mut self, targets: &[ShardKey]) -> Result<(), DaemonError> {
+        use crate::local_identify::LocalAdmission;
+        let now = self.now()?;
+        let mut slots_by_bot = BTreeMap::new();
+        for key in targets {
+            let entry = &self.entries[key];
+            if self.gateway_update_fallback_pending(&key.bot_id) {
+                return Err(DaemonError::IdentifyDeferred);
+            }
+            #[cfg(unix)]
+            if entry
+                .cores
+                .as_ref()
+                .is_some_and(|cores| cores.manual_restart_reserved())
+            {
+                return Err(DaemonError::IdentifyDeferred);
+            }
+            if entry.mock_discord.is_none() {
+                *slots_by_bot.entry(key.bot_id.as_str()).or_insert(0) += 1;
+            }
+        }
+        let mut reserved = Vec::new();
+        for (bot, slots) in slots_by_bot {
+            let error = match self.local_identify.reserve_restart(bot, now, slots) {
+                LocalAdmission::Granted => {
+                    reserved.push(bot);
+                    continue;
+                }
+                LocalAdmission::Pending { .. } => DaemonError::IdentifyDeferred,
+                LocalAdmission::Exhausted { .. } => DaemonError::IdentifyUnavailable,
+            };
+            for bot in reserved {
+                self.local_identify.release_restart(bot);
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn release_restart_identify(&mut self, targets: &[ShardKey]) {
+        for key in targets {
+            self.local_identify.release_restart(&key.bot_id);
+        }
     }
 
     /// Starts a standby Gateway for `key` from the same program path (the operator has put
@@ -8271,6 +8718,7 @@ impl<C: Clock> Daemon<C> {
         credentials: &impl CredentialSource,
     ) -> Result<bool, DaemonError> {
         tokio::runtime::Handle::try_current().map_err(|_| DaemonError::NoRuntime)?;
+        let now = self.now()?;
         // A prior failed update may still be waiting for its fallback Identify.
         let fallback_pending = self.gateway_update_fallback_pending(&key.bot_id);
         let sequence = self
@@ -8296,19 +8744,15 @@ impl<C: Clock> Daemon<C> {
         if fallback_pending {
             return Ok(false);
         }
-        if entry.mock_discord.is_none() {
-            use crate::local_identify::LocalAdmission;
-            let now = std::time::Instant::now();
-            match Self::gateway_update_identify_check(&self.local_identify, &entry.spec.bot_id, now)
-            {
-                LocalAdmission::Granted => {}
-                LocalAdmission::Pending { .. } => return Ok(false),
-                LocalAdmission::Exhausted { .. } => return Err(DaemonError::InvalidState),
-            }
-        }
         let spec = &entry.spec.gateway;
         if !safe_path(Path::new(&spec.program)) {
             return Err(DaemonError::InvalidProgram);
+        }
+        use crate::local_identify::LocalAdmission;
+        match entry.acquire_identify(&mut self.local_identify, now, GatewayLaunch::Standby) {
+            LocalAdmission::Granted => {}
+            LocalAdmission::Pending { .. } => return Ok(false),
+            LocalAdmission::Exhausted { .. } => return Err(DaemonError::IdentifyUnavailable),
         }
         let name = &spec.environment.credential_refs[0];
         // The explicit loopback simulation takes no credential, exactly like a normal launch.
@@ -8374,13 +8818,7 @@ impl<C: Clock> Daemon<C> {
             command.env(name, credential);
         }
         let child = command.spawn().map_err(|_| DaemonError::SpawnFailed)?;
-        // The standby logs in with a session of its own: count it like every other explicit
-        // start, so the automatic recovery spacing sees it.
         if entry.mock_discord.is_none() {
-            self.local_identify.record(
-                entry.snapshot.key.bot_id.as_str(),
-                std::time::Instant::now(),
-            );
             entry.update_fallback_reserved = true;
         }
         self.sequence = sequence;
@@ -8747,18 +9185,11 @@ impl<C: Clock> Daemon<C> {
             .collect::<Vec<_>>();
         let mut error = None;
         for key in keys {
-            if let Err(e) = self.start(&key, credentials) {
+            if let Err(e) = self.start_inner(&key, credentials, StartKind::Automatic) {
                 error.get_or_insert(e);
             }
         }
         error.map_or(Ok(()), Err)
-    }
-
-    /// The legacy artifact cannot coordinate a real Discord Identify at its
-    /// send boundary. botd enables this guard; managed Gateway adapters instead
-    /// use the shared Bot scheduler for initial, update and recovery admission.
-    pub fn require_shared_recovery_admission(&mut self) {
-        self.require_shared_recovery_admission = true;
     }
 
     /// Replace the local Identify admission limits (clears recorded history).
@@ -8778,6 +9209,15 @@ impl<C: Clock> Daemon<C> {
         &mut self,
         key: &ShardKey,
         credentials: &impl CredentialSource,
+    ) -> Result<(), DaemonError> {
+        self.start_inner(key, credentials, StartKind::Manual)
+    }
+
+    fn start_inner(
+        &mut self,
+        key: &ShardKey,
+        credentials: &impl CredentialSource,
+        kind: StartKind,
     ) -> Result<(), DaemonError> {
         self.now()?;
         if self.has_child(key) {
@@ -8803,9 +9243,17 @@ impl<C: Clock> Daemon<C> {
         self.recovery
             .hold(entry.recovery_key, false)
             .map_err(|_| DaemonError::InvalidState)?;
-        let result = self.poll_recovery(credentials, Some(key));
+        let result = self.poll_recovery(credentials, Some(key), kind);
         let entry = &self.entries[key];
         let _ = self.recovery.hold(entry.recovery_key, entry.restart_held);
+        if kind == StartKind::Manual
+            && matches!(
+                result,
+                Err(DaemonError::IdentifyDeferred | DaemonError::IdentifyUnavailable)
+            )
+        {
+            self.stop(key, StopMode::WaitForExit)?;
+        }
         result
     }
 
@@ -9001,7 +9449,8 @@ impl<C: Clock> Daemon<C> {
     fn poll_recovery(
         &mut self,
         credentials: &impl CredentialSource,
-        manual: Option<&ShardKey>,
+        requested: Option<&ShardKey>,
+        kind: StartKind,
     ) -> Result<(), DaemonError> {
         let mut first_error = self.now().err();
         #[cfg(unix)]
@@ -9038,15 +9487,16 @@ impl<C: Clock> Daemon<C> {
             credentials,
             instance: self.instance,
             sequence: &mut self.sequence,
-            manual,
-            require_shared_admission: self.require_shared_recovery_admission,
+            manual: requested.filter(|_| kind != StartKind::Automatic),
+            reserved_restart: requested.filter(|_| kind == StartKind::Restart),
+            now: self.last_now,
             local_identify: &mut self.local_identify,
             errors: BTreeMap::new(),
         };
         let mut events = self.recovery.poll(&mut host);
         let errors = host.errors;
         for (key, error) in errors {
-            if manual.is_none_or(|requested| requested == &key) {
+            if requested.is_none_or(|requested| requested == &key) {
                 first_error.get_or_insert(error);
             }
             let entry = self.entries.get_mut(&key).unwrap();
@@ -9095,7 +9545,7 @@ impl<C: Clock> Daemon<C> {
                                 error: DaemonError::TimeOverflow,
                                 code: None,
                             };
-                            if manual.is_none_or(|key| key == &entry.snapshot.key) {
+                            if requested.is_none_or(|key| key == &entry.snapshot.key) {
                                 first_error = Some(DaemonError::TimeOverflow);
                             }
                         }
@@ -9104,8 +9554,17 @@ impl<C: Clock> Daemon<C> {
                                 error: DaemonError::MonitorFailed,
                                 code: None,
                             };
-                            if manual.is_none_or(|key| key == &entry.snapshot.key) {
+                            if requested.is_none_or(|key| key == &entry.snapshot.key) {
                                 first_error.get_or_insert(DaemonError::MonitorFailed);
+                            }
+                        }
+                        DegradedReason::IdentifyUnavailable => {
+                            entry.snapshot.state = ProcessState::Failed {
+                                error: DaemonError::IdentifyUnavailable,
+                                code: None,
+                            };
+                            if requested == Some(&entry.snapshot.key) {
+                                first_error.get_or_insert(DaemonError::IdentifyUnavailable);
                             }
                         }
                         _ => {}
@@ -9135,11 +9594,12 @@ impl<C: Clock> Daemon<C> {
             entry.snapshot.recovery = Some(serde_json::json!({
                 "state":state.state,"generation":state.generation,"pid":state.pid,
                 "restarts":state.restart.restarts,"startup_failures":state.startup_failures,"stable":state.stable,
+                "deferred":state.deferred,
             }));
             if state.pid.is_none()
                 && !entry.snapshot.desired_running
                 && let Err(error) = Self::release_reservation(entry)
-                && manual.is_none_or(|key| key == &entry.snapshot.key)
+                && requested.is_none_or(|key| key == &entry.snapshot.key)
             {
                 first_error.get_or_insert(error);
             }
@@ -9150,7 +9610,7 @@ impl<C: Clock> Daemon<C> {
     /// Only ChildRecovery observes exits and schedules retries. OS liveness is
     /// distinct from authenticated Ready; this legacy wire cannot confirm Ready.
     pub fn poll(&mut self, credentials: &impl CredentialSource) -> Result<(), DaemonError> {
-        self.poll_recovery(credentials, None)
+        self.poll_recovery(credentials, None, StartKind::Automatic)
     }
 
     /// Cancellation-safe: retain the owned Child until poll reaps its exit.
@@ -9160,6 +9620,7 @@ impl<C: Clock> Daemon<C> {
         let entry = self.entries.get_mut(key).ok_or(DaemonError::UnknownShard)?;
         entry.snapshot.desired_running = false;
         entry.snapshot.retry_at_ms = None;
+        entry.admission_since = None;
         if !entry.started {
             return Self::release_reservation(entry);
         }

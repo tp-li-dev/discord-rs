@@ -36,20 +36,51 @@ pub trait Clock: Send + Sync {
     fn sleep_until(&self, deadline: Duration) -> Sleep<'_>;
 }
 
-pub struct MonotonicClock(Instant);
+pub struct MonotonicClock {
+    started: Instant,
+    #[cfg(test)]
+    manual: Option<watch::Receiver<Duration>>,
+}
 
 impl Default for MonotonicClock {
     fn default() -> Self {
-        Self(Instant::now())
+        Self {
+            started: Instant::now(),
+            #[cfg(test)]
+            manual: None,
+        }
+    }
+}
+
+#[cfg(test)]
+impl MonotonicClock {
+    pub(crate) fn with_manual_time(manual: watch::Receiver<Duration>) -> Self {
+        Self {
+            manual: Some(manual),
+            ..Self::default()
+        }
     }
 }
 
 impl Clock for MonotonicClock {
     fn now(&self) -> Duration {
-        self.0.elapsed()
+        #[cfg(test)]
+        if let Some(manual) = &self.manual {
+            return *manual.borrow();
+        }
+        self.started.elapsed()
     }
 
     fn sleep_until(&self, deadline: Duration) -> Sleep<'_> {
+        #[cfg(test)]
+        if let Some(mut manual) = self.manual.clone() {
+            return Box::pin(async move {
+                let now = *manual.borrow_and_update();
+                if now < deadline {
+                    let _ = manual.changed().await;
+                }
+            });
+        }
         Box::pin(async move {
             tokio::time::sleep(deadline.saturating_sub(self.now())).await;
         })
