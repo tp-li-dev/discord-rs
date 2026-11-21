@@ -22,11 +22,22 @@ openraft = { version = "=0.9.26", features = ["serde", "storage-v2", "generic-sn
 
 [workspace]
 members = ["framework", "framework-macros"]
+exclude = ["vendor/twilight-gateway"]
 resolver = "3"
 
+[patch.crates-io]
+twilight-gateway = { path = "vendor/twilight-gateway" }
+
 [dev-dependencies]
+futures-util = { version = "0.3", features = ["sink"] }
 rcgen = "0.13"
 rmp-serde = "1"
+tokio-websockets = { version = "0.13", default-features = false, features = ["server", "sha1_smol"] }
+
+[[test]]
+name = "identify_send_grants"
+path = "tests/identify_send_grants.rs"
+harness = false
 
 [[bin]]
 name = "botctl"
