@@ -108,8 +108,18 @@ echo "--- counters: first -> last ---"
 a=$(nr "$T/first"); b=$(nr "$T/last")
 echo "NRestarts: ${a:-n/a} -> ${b:-n/a}"
 rx=$(gw "$T/first" resumed); ry=$(gw "$T/last" resumed)
-for K in generations closes worker_unavailable; do
-  x=$(gw "$T/first" "$K"); y=$(gw "$T/last" "$K"); echo "$K (sum over gateway.log): $x -> $y"
+gx=$(gw "$T/first" identify_grant_unavailable); gy=$(gw "$T/last" identify_grant_unavailable)
+for K in generations closes worker_unavailable identify_grant_unavailable; do
+  x=$(gw "$T/first" "$K"); y=$(gw "$T/last" "$K")
+  if [ "$K" = worker_unavailable ] && isnum "$x" && isnum "$y"; then
+    if { isnum "$gx" && ! isnum "$gy"; } || { ! isnum "$gx" && isnum "$gy"; }; then
+      echo "$K (sum over gateway.log): n/a (counter definition changed)"
+      add "$K" NA "counter definition changed"
+      continue
+    fi
+    if ! isnum "$gx"; then echo 'worker_unavailable uses the historical all-unavailable-lines counter'; fi
+  fi
+  echo "$K (sum over gateway.log): $x -> $y"
   if isnum "$x" && isnum "$y"; then
     if [ "$K" = closes ] && [ "$y" -lt "$x" ]; then
       add "$K" WATCH "$x->$y (close log count decreased; check rotation)"
@@ -130,7 +140,7 @@ if isnum "$jb"; then
 else add "journal warnings" NA "n/a"; fi
 
 echo "--- verdict ---"
-for m in RSS fds restarts files generations closes worker_unavailable "journal warnings"; do
+for m in RSS fds restarts files generations closes worker_unavailable identify_grant_unavailable "journal warnings"; do
   awk -F'\t' -v m="$m" '
     $1 == m { n++; if ($2 == "WATCH") w = w (w == "" ? "" : "; ") $3; else if ($2 == "OK") ok++ }
     END { if (w != "") print m ": WATCH (" w ")"; else if (ok > 0) print m ": OK"; else print m ": n/a (no data)" }' "$V"

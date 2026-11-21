@@ -27,7 +27,7 @@
 
 - `botd` は設定された Bot/Shard ごとに Gateway 子プロセスを起動・監視し、各 Gateway は Worker プールを所有します。明示的な模擬Discordモードでは複数Bot・Shardの別プロセス起動と隔離を試験しています。実Discordでの複数Shard稼働は、WSLで2 Shardを1回確認しただけで（更新・障害・`--shard`・`--guild`・`--all`。`docs/progress.md` 2026-11-16 夜）、長時間・繰り返し・3 Shard以上は未検証です。プロセスが存在することは Discord Ready、所有権、lease の健全性を意味しません。
 - `botctl` はローカル daemon の ps/status/inspect/shards/start/stop/restart/operation とオフライン設定検証に対応します。update/rollback は既定で成果物をハッシュ確認するオフライン計画、`--yes`（`--bootstrap-stdin` または `--secret-file`）で認証付き要求と操作IDによる再照会を行います。systemd 常駐の botd へは、管理 secret をファイル（`botd --secret-file ABS [--control-port PORT]`、`botctl --secret-file ABS --port PORT`、`botctl secret generate --out ABS` で作成）で渡して接続できます。ファイルは 64 文字の 16 進 1 行で、通常ファイル（シンボリックリンク・追加のハードリンク不可）・モード 0600/0400・所有者が実効ユーザー（root 所有は 0400 かつ `CREDENTIALS_DIRECTORY` 配下のみ）を検査し、満たさなければ拒否します。この検査と systemd 実機での常駐接続は Linux の実機では未検証（CI の試験は模擬環境）で、途中ディレクトリのシンボリックリンク・POSIX ACL・ファイルシステムの強制は検査せず、secret のローテーションには botd の再起動が必要です。読込バッファの消去は最善努力でメモリ全体からの消去は保証しません。実行成功に対応するのは明示的な模擬Discord Gateway-switchモードの Gateway 更新のみです。通常モードと Core/all は必要な制御契約が未接続のため拒否します。logs、nodes、doctor 等の daemon 操作は未実装です。操作履歴は揮発性で、daemon再起動後の子プロセスの自動引継ぎ（孤児の再採用）は未実装です。残存予約は、Linux で `/proc` の走査によりそのShardのGatewayが生きていないと確認できた場合だけ自動削除し、それ以外（生きている・判定不能・Linux以外）は従来どおり拒否します。`botd --stop-children-on-exit`（任意）で SIGINT／SIGTERM 時に子をgracefulに停止します（既定オフ。期限30秒、強制終了はしない）。これらはローカル未ビルドでCI検証待ちです。
-- 配置検証・Shard起動仕様・Identify予算・更新ゲートはありますが、複数ホストへの実配置、設定世代同期、プロセス間・ホスト間でのIdentify予算共有は未完成です。実Discordの推奨Shard数や制限への追従を包括的に検証していません。
+- 配置検証・Shard起動仕様・Identify予算・更新ゲートはありますが、複数ホストへの実配置、設定世代同期、複数 botd・複数ホスト間での Identify 予算共有は未完成です。実Discordの推奨Shard数や制限への追従を包括的に検証していません。
 - ownership、lease、watchdog、failover/failback には状態機械や模擬時計・模擬ネットワークの試験があります。本番のプロセス起動・Discord送信・quorumとの統合は未完成です。botd 既定経路は systemd `Type=notify` 向けに `READY=1`（制御経路 listen 開始後）・`WATCHDOG=1`（`WATCHDOG_USEC` の半分間隔、監視ループの tick 完了後のみ）・`STOPPING=1` を送りますが（`src/sd_notify.rs`）、テスト用クラスタ/Raft/Gateway 切替モードは未対応で、実 systemd での検証は未実施です。3秒検知・30秒安定確認は設定上の目標で、実復旧時間の保証ではありません。実験的 Raft ストアには epoch 永続化がありますが、本番統合や OS suspend 時の時計安全性は未検証です。
 - `cluster.rs` の過半数ACKは試験用シミュレーションであり本番合意ではありません。メインworkspaceの `raft_quorum` は OpenRaft 0.9.26 を用いる実験的な固定メンバー構成で、永続予約・epoch CAS とローカル admission gate を備えます。試験用cluster runtimeとmTLS Raft RPCに接続されますが、本番起動は拒否されます。本番fencingは未検証です。保持予約は明示的な解放が必要で、クラッシュ後の自動引継ぎや強制解除はありません。独立スパイクの評価は [quorum-evaluation.md](quorum-evaluation.md) 参照。実分断・quorum喪失下での二重Active防止を本番環境で保証できません。
 - Gateway並行切替には状態機械に加え、明示的な試験フラグと模擬Discordを使う botd → Gateway → Core のローカルプロセス切替経路があります。実Discord上の新旧WebSocket接続・Shadow・Active移譲・旧REST結果保持、本番 lease との統合は未検証です。この試験経路は production_ready ではありません。
@@ -110,8 +110,10 @@
   - M5（**実装済み・CI 検証待ち**）：Bot 発の全送信（prefix の `create_message`、`!workers`、`update_response`、ephemeral 応答）に `AllowedMentions::default()` を明示（メンション解析なし）。follow-up は現状使っていない。実 Discord での挙動は未検証。ローカル未ビルド。
   - M6：token の環境変数名が不一致（Gateway と `register` は `DISCORD_TOKEN`、`discord_smoke` の既定は `DISCORD_TEST_BOT_TOKEN`）。手順書に明記した。名前の統一は未実施。
 - **低**：再接続バックオフにジッターなし（上限約 255 秒、回数の上限なし）。Identify 枠が尽きていると起動後に最大 `reset_after`（最長 24 時間）黙って待つ。単体起動は SIGTERM 未処理。DM の prefix コマンドは動かない（DIRECT_MESSAGES Intent なし）。`register` の説明文が固定。Gateway 子の環境に token があり、`/proc/PID/environ` から同一ユーザーまたは root が読める。HTTP プロキシ非対応（twilight 側）。
-- **実 Gateway の起動許可**：単一 botd 内で、初回・手動・更新の待機起動・自動復旧が同じ Bot 単位の上限（許可間隔 30 秒、直近 1 時間で最大 10 回）を共有する。起動後の再 Identify や複数 botd・複数ホストの実送信は対象外。botd を再起動すると許可履歴は消える。 [設計と未決定事項](design-decisions/09-identify-scheduler.md)
-- **未実装（再掲）**：プロセス再起動をまたぐ Resume（session はメモリのみ。再起動は毎回新規 Identify）、複数プロセス・複数ホスト間の Identify 調整（プロセス内のみ）。
+- **実 Gateway の Identify**：単一 botd 内で、初回・手動・更新の待機起動・自動復旧が同じ Bot 単位の上限（許可間隔 30 秒、直近 1 時間で最大 10 枠）を共有する。
+  - `--identify-send-grants` OFF（既定）では、起動後の再 Identify は Gateway ごとの Twilight キューで扱い、共有予算の対象外。botd を再起動するとメモリ上の起動許可履歴が消える。既存 Gateway に送信許可チャネルはなく、生き残った Gateway はキューを使い続ける。
+  - ON では、稼働中の Gateway の再 Identify も共有予算を使う。同一 OS 起動内での botd 再起動ではジャーナルを再生し、boot ID が変わった場合は検出時点から 1 時間と許可の有効期間（2 秒）分を保留する。再起動前の Gateway のチャネルは復元されず、その Gateway の新規 Identify は保留される。Heartbeat と Resume は許可待ちの対象外で、後継 Gateway は新チャネルを使う。
+- **未実装（再掲）**：Gateway プロセス再起動をまたぐ Resume（セッションはプロセスのメモリに保持するため、新しい Gateway には初回 Identify が必要）、複数 botd・複数ホスト間の Identify 調整。 [起動許可](design-decisions/09-identify-scheduler.md)・[送信許可](design-decisions/11-identify-send-grant.md)
 
 ## P3 の Core 手動再起動
 

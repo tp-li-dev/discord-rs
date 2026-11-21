@@ -1593,22 +1593,40 @@ async fn run_live_inner(
             }
         })
         .await;
-        let mut response = match exchange_result {
-            Ok(Ok(response)) => response,
-            Ok(Err(error)) => return failure(error, id, last.as_ref()),
-            Err(_) => {
-                return failure(
+        let Ok(Ok(mut response)) = exchange_result else {
+            let (error, outcome_unknown) = match exchange_result {
+                Ok(Err(error)) => (
+                    error,
+                    !matches!(
+                        error,
+                        "cannot encode control request"
+                            | "control request exceeds limit"
+                            | "local daemon unavailable"
+                    ),
+                ),
+                Err(_) => (
                     "daemon request timed out; outcome is unknown; query the operation ID",
-                    id,
-                    last.as_ref(),
-                );
+                    true,
+                ),
+                Ok(Ok(_)) => unreachable!(),
+            };
+            let mut value = failure(error, id, last.as_ref());
+            if options.command == "gateway-update" && outcome_unknown && last.is_none() {
+                value["outcome_unknown"] = json!(true);
             }
+            return value;
         };
         // Errors without an operation (e.g. an ambiguous Bot selector) remain
         // errors; never infer a successful mutation from request acceptance.
         if response["ok"] == false && response.get("operation").is_none() {
             if let Some(id) = id {
                 response["operation_id"] = json!(id);
+            }
+            if options.command == "gateway-update"
+                && let Some(operation) = last
+            {
+                // This was a failed lookup following confirmed admission.
+                response["operation"] = operation;
             }
             return response;
         }
@@ -2451,5 +2469,55 @@ mod default_wait_tests {
             .concat(),
         );
         assert_eq!(explicit.timeout, Duration::from_secs(45));
+    }
+
+    #[tokio::test]
+    async fn gateway_update_distinguishes_rejection_from_a_lost_reply() {
+        for rejection in [Some("bot already has an operation in progress"), None] {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let bootstrap = Bootstrap {
+                port: listener.local_addr().unwrap().port(),
+                secret: [8; 32],
+            };
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let frame = read_frame(&mut stream, REQUEST_LIMIT).await.unwrap();
+                let request: Value = serde_json::from_slice(&frame).unwrap();
+                assert_eq!(request["command"], "gateway-update");
+                if let Some(error) = rejection {
+                    let reply = json!({"ok": false, "error": error});
+                    stream
+                        .write_all(format!("{reply}\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+                request["operation_id"].clone()
+            });
+            let result = run_live(
+                preloaded_options(
+                    &["gateway-update", "test", "--bootstrap-stdin"],
+                    bootstrap.port,
+                ),
+                None,
+                deadline,
+                Some(&bootstrap),
+            )
+            .await;
+            assert_eq!(result["ok"], false);
+            assert_eq!(
+                result["operation_id"],
+                timeout_at(deadline, server).await.unwrap().unwrap()
+            );
+            assert!(result.get("operation").is_none());
+            if let Some(error) = rejection {
+                assert_eq!(result["error"], error);
+                assert!(result.get("outcome_unknown").is_none());
+            } else {
+                assert_eq!(result["outcome_unknown"], true);
+            }
+        }
     }
 }

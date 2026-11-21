@@ -704,3 +704,9 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - **Sol(6.2) との設計議論（`review-2026-11-21-sol-discussion.md`）：** Identify の送信時の調整を完成の条件にする、nonce の Bot ごとの許可リスト、補助プロセスは `PR_SET_PDEATHSIG` を採らず cgroup 案、完成の定義に基準を足す。
 - **WSL の検証での既知の失敗（CI では通る）：** `tests/secret_file`（3 件）、`tests/botctl_secret_file`（2 件）、`e2e_gateway_process_switch` の 1 件。ソースが `/mnt/d`（DrvFs）にあり、権限（0600）を守れないことと、ソケットのパスが 100 バイトを超えることによる環境の問題。`e2e_gateway_process_switch` の 1 件の原因は個別には確認していない。これまでの WSL 検証は `cargo test --workspace` が最初の失敗で止まっていたため、`--no-fail-fast` に改めた。
 - **未検証：** 送信時の許可の実 Discord での動作、Oracle への導入（送信時の許可、Identify の統一、P3、nonce はいずれも Oracle に未導入）、nonce 再試行の Ubuntu での故障注入（最初の POST が成立し応答が失われ、再送が同じ ID を返し、見える投稿が 1 件）、Twilight の取り込みの検査。
+
+## 2026-11-21 訂正：Oracle の放置試験における Identify と切断の判定
+
+- 稼働中の Gateway は無効なセッションを受けた後、同じプロセス世代で再 Identify できる。上記の Oracle 観測で世代数が変わらなかったことから、追加の Identify がなかったとは判断できない。該当する観測区間の Identify 回数は不明。
+- 上記 77 時間の「すべて OK」は当時の出力。現在の `soak-diff.sh` は切断ログの増加を WATCH と判定するため、`closes` 27→56 は **WATCH** になる。
+- 当時の `worker_unavailable` は `unavailable` を含む全行の集計だった。現行のスナップショットでは Worker の診断と Identify 送信許可チャネルの失敗をそれぞれ数える。

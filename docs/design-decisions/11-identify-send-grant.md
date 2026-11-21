@@ -2,7 +2,10 @@
 
 ## 適用範囲
 
-一つの Linux botd が管理する Bot の、全ローカル Shard と Gateway 世代を対象にする。botd の `--identify-send-grants` で有効化する。無効時は DDR-0007 前半の起動調整と従来の Twilight キューを使う。分散構成への拡張には既存の認証・quorum・lease と連動した共有予算が必要。同じ Discord Bot を別の Bot ID、別の runtime root、別ホスト、または外部クライアントから起動した場合は、この予算の範囲外になる。
+一つの Linux botd が管理する Bot の、全ローカル Shard と Gateway 世代を対象にする。botd の `--identify-send-grants` で有効化する。分散構成への拡張には既存の認証・quorum・lease と連動した共有予算が必要。同じ Discord Bot を別の Bot ID、別の runtime root、別ホスト、または外部クライアントから起動した場合は、この予算の範囲外になる。
+
+- OFF（既定）では初回・手動を含む起動許可を会計し、Gateway 内の再 Identify はその予算の対象外。botd 再起動でメモリ上の履歴は消える。送信許可チャネルは作らず、既存 Gateway は従来の Twilight キューを使う。 [起動許可](09-identify-scheduler.md)
+- ON では既存の起動許可に加え、Gateway 内の再 Identify にも送信許可が必要。同一 OS 起動内で botd が再起動すると履歴を再生し、OS 再起動を検出すると保留期間を設ける。旧 Gateway のチャネルは復元せず、後継 Gateway の起動時に新チャネルを作る。以下は ON の動作を記す。
 
 ## チャネルと互換性
 
