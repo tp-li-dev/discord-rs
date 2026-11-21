@@ -6293,6 +6293,13 @@ pub mod control {
         #[test]
         fn changed_bot_identity_is_refused_before_supersession_or_restart_holds() {
             let mut plane = plane(1, 2);
+            // Both shards must be reservable for this identity precondition test.
+            plane
+                .daemon
+                .set_local_identify_policy(crate::local_identify::LocalIdentifyPolicy {
+                    min_interval: Duration::ZERO,
+                    ..Default::default()
+                });
             let before = plane.daemon.snapshots();
             let mut restart = request("restart", 0, 1);
             // The selector still resolves, but now to a different identity from the listing.
@@ -6320,6 +6327,27 @@ pub mod control {
             assert_eq!(plane.request(&stop)["ok"], false);
             assert_eq!(plane.operations.len(), 1);
             assert_eq!(plane.request(&query(1))["operation"]["state"], "running");
+        }
+
+        #[test]
+        fn matching_bot_identity_does_not_bypass_restart_identify_spacing() {
+            let mut plane = plane(1, 2);
+            let before = plane.daemon.snapshots();
+            let mut restart = request("restart", 0, 1);
+            restart.expect_bot_id = Some("id-0".into());
+
+            let refused = plane.request(&restart);
+            assert_eq!(refused["ok"], false);
+            assert_eq!(refused["error"], "IdentifyDeferred");
+            assert!(plane.operations.is_empty());
+            assert_eq!(plane.daemon.snapshots(), before);
+            assert!(
+                plane
+                    .daemon
+                    .entries
+                    .values()
+                    .all(|entry| !entry.restart_held)
+            );
         }
 
         #[test]
@@ -7196,26 +7224,29 @@ pub mod control {
                 let key = key(0, 0);
                 plane.daemon.start(&key, &credentials).unwrap();
                 let pid = running_pid(&plane, &key);
+                let before = plane.daemon.snapshots();
+                let restart = |id| CommandRequest {
+                    expect_bot_id: Some(key.bot_id.clone()),
+                    ..request("restart", 0, id)
+                };
                 time.send_replace(Duration::from_millis(29_999));
-                assert_eq!(
-                    plane.request(&request("restart", 0, 1))["error"],
-                    "IdentifyDeferred"
-                );
+                let refused = plane.request(&restart(1));
+                assert_eq!(refused["ok"], false);
+                assert_eq!(refused["error"], "IdentifyDeferred");
+                assert_eq!(plane.daemon.snapshots(), before);
+                assert!(!plane.daemon.entries[&key].restart_held);
                 plane.tick(&credentials).await;
                 assert_eq!(running_pid(&plane, &key), pid);
                 assert!(plane.operations.is_empty());
 
                 time.send_replace(Duration::from_secs(30));
-                assert_eq!(plane.request(&request("restart", 0, 2))["ok"], true);
+                assert_eq!(plane.request(&restart(2))["ok"], true);
                 assert_eq!(
                     complete(&mut plane, 2).await["operation"]["state"],
                     "succeeded"
                 );
                 assert_ne!(running_pid(&plane, &key), pid);
-                assert_eq!(
-                    plane.request(&request("restart", 0, 3))["error"],
-                    "IdentifyDeferred"
-                );
+                assert_eq!(plane.request(&restart(3))["error"], "IdentifyDeferred");
                 cleanup(&mut plane).await;
             }
 
