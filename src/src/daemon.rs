@@ -4755,10 +4755,19 @@ pub mod control {
                         .spawn()
                         .unwrap()
                 };
+                let candidate_child = spawn();
+                let candidate_identity = ProcessIdentity {
+                    key: f.key.clone(),
+                    pid: candidate_child.id().unwrap_or(0),
+                    generation: LaunchGeneration {
+                        daemon_instance: [0; 16],
+                        sequence: 0,
+                    },
+                    launch_observed_unix_ms: 0,
+                };
                 entry.candidate = Some(Candidate {
-                    child: spawn(),
-                    #[cfg(target_os = "linux")]
-                    launch_sequence: 0,
+                    child: candidate_child,
+                    identity: candidate_identity,
                     started: f.now,
                     ready_marker: PathBuf::new(),
                     active_marker: PathBuf::new(),
