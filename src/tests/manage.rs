@@ -322,8 +322,10 @@ async fn independent_commands_manage_a_persistent_core() {
             .success()
     );
     let audit = std::fs::read_to_string(runtime.join("audit.jsonl")).unwrap();
+    let rejection_audit = std::fs::read_to_string(runtime.join("rejection-audit.jsonl")).unwrap();
     let records: Vec<serde_json::Value> = audit
         .lines()
+        .chain(rejection_audit.lines())
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
     assert!(
@@ -348,6 +350,8 @@ async fn independent_commands_manage_a_persistent_core() {
     assert_eq!(malformed[0]["result"], "denied");
     assert!(!audit.contains(viewer["secret"].as_str().unwrap()));
     assert!(!audit.contains(admin["secret"].as_str().unwrap()));
+    assert!(!rejection_audit.contains(viewer["secret"].as_str().unwrap()));
+    assert!(!rejection_audit.contains(admin["secret"].as_str().unwrap()));
     assert!(!runtime.join("core.json").exists());
     remove_runtime(&runtime).await;
 }

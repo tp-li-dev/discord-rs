@@ -229,6 +229,8 @@ struct ProcessStatus {
     bot_pid: Option<u32>,
     restarts: u8,
     last_failure: Option<Diagnostic>,
+    #[serde(default)]
+    rejection_audit_dropped: u64,
 }
 #[derive(Debug)]
 struct ProtectedFailure(Diagnostic);
@@ -328,13 +330,14 @@ fn status_message(status: &ProcessStatus) -> String {
         |pid| format!("Botプロセス: 稼働中 (PID: {pid})"),
     );
     format!(
-        "コア: 稼働中 (PID: {})\n{bot}\nDiscord接続: Botのログで確認してください\n直近のエラー: {}\n自動再起動: {}/3",
+        "コア: 稼働中 (PID: {})\n{bot}\nDiscord接続: Botのログで確認してください\n直近のエラー: {}\n自動再起動: {}/3\n拒否監査の未記録: {}",
         status.core_pid,
         status
             .last_failure
             .as_ref()
             .map_or_else(|| "なし".to_owned(), ToString::to_string),
-        status.restarts
+        status.restarts,
+        status.rejection_audit_dropped
     )
 }
 
@@ -725,6 +728,51 @@ impl Rejection {
     }
 }
 
+const REJECTION_AUDIT_QUEUE: usize = 32;
+
+#[derive(Clone)]
+struct RejectionAudit {
+    sender: mpsc::Sender<Rejection>,
+    dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl RejectionAudit {
+    fn spawn<W>(
+        initialize: impl FnOnce() -> W + Send + 'static,
+    ) -> std::io::Result<(Self, oneshot::Receiver<()>)>
+    where
+        W: FnMut(Rejection) -> bool,
+    {
+        let (sender, mut receiver) = mpsc::channel(REJECTION_AUDIT_QUEUE);
+        let (exited, exit) = oneshot::channel();
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let worker_dropped = dropped.clone();
+        std::thread::Builder::new()
+            .name("manage-rejection-audit".into())
+            .spawn(move || {
+                let mut write = initialize();
+                while let Some(rejection) = receiver.blocking_recv() {
+                    if !write(rejection) {
+                        worker_dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                let _ = exited.send(());
+            })?;
+        Ok((Self { sender, dropped }, exit))
+    }
+
+    fn submit(&self, rejection: Rejection) {
+        if self.sender.try_send(rejection).is_err() {
+            self.dropped
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn dropped(&self) -> u64 {
+        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 async fn core(binary: PathBuf) -> Result<(), ErrorBox> {
     let listener = Listener::bind_tcp(port()?).await?;
     let endpoint = Endpoint {
@@ -744,6 +792,20 @@ async fn core(binary: PathBuf) -> Result<(), ErrorBox> {
     tokio::fs::create_dir_all(runtime_dir()).await?;
     let mut audit =
         AuditedExecutor::open(runtime_dir().join("audit.jsonl"), AuditConfig::default())?;
+    // Separate files and writer ownership keep an untrusted connection's sync
+    // off both the supervisor and the durable authorization path.
+    let rejection_path = runtime_dir().join("rejection-audit.jsonl");
+    let (rejection_audit, rejection_exit) = RejectionAudit::spawn(move || {
+        let mut audit = AuditedExecutor::open(rejection_path, AuditConfig::default()).ok();
+        move |rejection: Rejection| {
+            audit.as_mut().is_some_and(|audit| {
+                matches!(
+                    audit.execute(&rejection.audit_request(), || Ok(())),
+                    Err(src::rbac_audit::ExecuteError::Denied(_))
+                )
+            })
+        }
+    })?;
     let metrics = MetricsRegistry::default();
     let mut bot = Some(spawn_bot(&binary).await?);
     let mut desired_running = true;
@@ -753,7 +815,6 @@ async fn core(binary: PathBuf) -> Result<(), ErrorBox> {
     let mut supervision = tokio::time::interval(Duration::from_secs(2));
     let (requests_tx, mut requests_rx) =
         mpsc::channel::<(Request, &'static str, Stream, Session, oneshot::Sender<()>)>(32);
-    let (rejected_tx, mut rejected_rx) = mpsc::channel::<Rejection>(32);
     write_endpoint(&endpoint, "core.json").await?;
     write_endpoint(&viewer_endpoint, "viewer.json").await?;
     println!("??????????Bot?Discord?????????????????");
@@ -762,10 +823,10 @@ async fn core(binary: PathBuf) -> Result<(), ErrorBox> {
         Protocol::Manage,
         keys,
         {
-            let rejected_tx = rejected_tx.clone();
+            let rejected = rejection_audit.clone();
             move |mut stream, session, index| {
                 let requests_tx = requests_tx.clone();
-                let rejected_tx = rejected_tx.clone();
+                let rejected = rejected.clone();
                 async move {
                     let role = if index == 0 { "admin" } else { "viewer" };
                     let Ok(Ok(body)) = tokio::time::timeout(
@@ -774,11 +835,11 @@ async fn core(binary: PathBuf) -> Result<(), ErrorBox> {
                     )
                     .await
                     else {
-                        let _ = rejected_tx.try_send(Rejection::Frame(role));
+                        rejected.submit(Rejection::Frame(role));
                         return;
                     };
                     let Ok(input) = serde_json::from_slice::<Request>(&body) else {
-                        let _ = rejected_tx.try_send(Rejection::Malformed(role));
+                        rejected.submit(Rejection::Malformed(role));
                         return;
                     };
                     // Retain the authenticated slot until the owner is done replying.
@@ -792,8 +853,9 @@ async fn core(binary: PathBuf) -> Result<(), ErrorBox> {
                 }
             }
         },
-        move || {
-            let _ = rejected_tx.try_send(Rejection::Handshake);
+        {
+            let rejected = rejection_audit.clone();
+            move || rejected.submit(Rejection::Handshake)
         },
     ));
     loop {
@@ -803,10 +865,6 @@ async fn core(binary: PathBuf) -> Result<(), ErrorBox> {
                 return Err(failure(Diagnostic::ManagementRejected));
             }
             Some(request) = requests_rx.recv() => request,
-            Some(rejected) = rejected_rx.recv() => {
-                let _ = audit.execute(&rejected.audit_request(), || Ok(()));
-                continue;
-            }
             _ = supervision.tick() => {
                 if let Some(process) = bot.as_mut() {
                     if let Some(status) = process.try_wait()? {
@@ -869,6 +927,7 @@ async fn core(binary: PathBuf) -> Result<(), ErrorBox> {
                 "status" => Ok(status_message(&ProcessStatus {
                     core_pid: std::process::id(), bot_pid: bot.as_ref().and_then(|process| process.id()),
                     restarts: failures, last_failure: last_failure.clone(),
+                    rejection_audit_dropped: rejection_audit.dropped(),
                 })),
                 "start" => {
                     if bot.is_some() { return Ok("Botは既に稼働中です".into()); }
@@ -909,6 +968,7 @@ async fn core(binary: PathBuf) -> Result<(), ErrorBox> {
                     bot_pid: bot.as_ref().and_then(|process| process.id()),
                     restarts: failures,
                     last_failure: last_failure.clone(),
+                    rejection_audit_dropped: rejection_audit.dropped(),
                 }),
             },
             Err(error) => {
@@ -943,6 +1003,8 @@ async fn core(binary: PathBuf) -> Result<(), ErrorBox> {
     }
     server.abort();
     let _ = server.await;
+    drop(rejection_audit);
+    let _ = tokio::time::timeout(Duration::from_secs(2), rejection_exit).await;
     let _ = tokio::fs::remove_file(runtime_dir().join("core.json")).await;
     let _ = tokio::fs::remove_file(runtime_dir().join("viewer.json")).await;
     Ok(())
@@ -1064,6 +1126,53 @@ async fn run() -> Result<(), ErrorBox> {
 mod request_tests {
     use super::*;
 
+    #[tokio::test]
+    async fn stalled_rejection_writer_drops_overflow_without_blocking_authorized_audit() {
+        let (entered, entered_rx) = oneshot::channel();
+        let (resume, resume_rx) = std::sync::mpsc::channel();
+        let (writer, exit) = RejectionAudit::spawn(move || {
+            let mut entered = Some(entered);
+            move |_| {
+                if let Some(entered) = entered.take() {
+                    entered.send(()).unwrap();
+                    resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                }
+                true
+            }
+        })
+        .unwrap();
+        writer.submit(Rejection::Handshake);
+        tokio::time::timeout(Duration::from_secs(2), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        for _ in 0..=REJECTION_AUDIT_QUEUE {
+            writer.submit(Rejection::Handshake);
+        }
+        assert_eq!(writer.dropped(), 1);
+
+        let path =
+            std::env::temp_dir().join(format!("manage-audit-{:x}", getrandom::u64().unwrap()));
+        let mut audit = AuditedExecutor::open(&path, AuditConfig::default()).unwrap();
+        let request = AuditRequest {
+            principal: Principal::authenticated("local-capability", "admin"),
+            operation: "stop".into(),
+            bot_id: Some("local-bot".into()),
+            shard_id: None,
+            remote: false,
+            confirmation: Confirmation::None,
+        };
+        assert_eq!(audit.execute(&request, || Ok(17)).unwrap(), 17);
+        drop(audit);
+        std::fs::remove_file(path).unwrap();
+        drop(writer);
+        resume.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), exit)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn endpoint_file_checks_the_opened_file_before_parsing() {
@@ -1162,6 +1271,7 @@ mod request_tests {
                     bot_pid: None,
                     restarts: 2,
                     last_failure: Some(failure.0),
+                    rejection_audit_dropped: 0,
                 };
                 println!("{}", serde_json::to_string(&state).unwrap());
                 std::process::exit(1);
@@ -1320,6 +1430,7 @@ mod request_tests {
             core_pid: 1,
             bot_pid: None,
             restarts: 3,
+            rejection_audit_dropped: 0,
             last_failure: Some(Diagnostic::ProcessExit {
                 success: false,
                 code: Some(23),
