@@ -44,12 +44,13 @@ while IFS= read -r -d '' f; do
     /gateway generation/ { generations++ }
     /ログイン成功/       { login++ }
     /Gateway 切断/       { closes++ }
-    /unavailable/        { unavailable++ }
+    /(^|: )worker is unavailable$/ { worker_unavailable++ }
+    /(^|: )Identify send grant unavailable$/ { grant_unavailable++ }
     /結果不明/           { unknown++ }
     /Resume 成功/        { resumed++ }
     END {
-      printf "generations=%d login=%d closes=%d worker_unavailable=%d rest_unknown=%d resumed=%d\n",
-             generations, login, closes, unavailable, unknown, resumed
+      printf "generations=%d login=%d closes=%d worker_unavailable=%d rest_unknown=%d resumed=%d identify_grant_unavailable=%d\n",
+             generations, login, closes, worker_unavailable, unknown, resumed, grant_unavailable
     }' "${logs[@]}"
 done < <(find "$ROOT" -name gateway.log -print0 2>/dev/null)
 echo "core duplicates dropped (last): $(grep -h '重複したメッセージ' "$ROOT"/*/*/ipc/core-*.log 2>/dev/null | tail -n 1)"
