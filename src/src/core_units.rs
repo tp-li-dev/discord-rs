@@ -1047,11 +1047,21 @@ mod manual_restart_tests {
     #[test]
     fn peer_availability_rejects_a_reserved_sibling() {
         let mut f = Fixture::new();
-        assert!(f.cores.peer_available(0));
+        // A freshly spawned child can be in a short uninterruptible state (D) while the
+        // kernel loads it; production deliberately treats that as unavailable, so the
+        // fixture waits (bounded) for the steady state before asserting availability.
+        let wait_until_available = |cores: &mut CoreUnits| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !cores.peer_available(0) {
+                assert!(Instant::now() < deadline, "sibling never became available");
+                std::thread::yield_now();
+            }
+        };
+        wait_until_available(&mut f.cores);
         f.cores.reserve_manual_restart(1);
         assert!(!f.cores.peer_available(0));
         f.cores.release_manual_restart(1);
-        assert!(f.cores.peer_available(0));
+        wait_until_available(&mut f.cores);
     }
 
     #[test]
