@@ -23,6 +23,8 @@ pub mod fs_perms;
 pub mod gateway_metadata;
 pub mod gateway_switch;
 pub mod identify;
+#[cfg(target_os = "linux")]
+pub mod identify_grant;
 pub mod interaction_flow;
 pub mod local_control;
 pub mod local_identify;

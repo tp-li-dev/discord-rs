@@ -4750,6 +4750,8 @@ pub mod control {
                 };
                 entry.candidate = Some(Candidate {
                     child: spawn(),
+                    #[cfg(target_os = "linux")]
+                    launch_sequence: 0,
                     started: f.now,
                     ready_marker: PathBuf::new(),
                     active_marker: PathBuf::new(),
@@ -7959,6 +7961,8 @@ pub struct ProcessSnapshot {
     pub restart_exhausted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identify_send_grant: Option<serde_json::Value>,
 }
 
 /// Reads one named reference immediately before spawn. Implementations must not
@@ -8022,6 +8026,8 @@ struct Entry {
 #[cfg(unix)]
 struct Candidate {
     child: Child,
+    #[cfg(target_os = "linux")]
+    launch_sequence: u64,
     started: std::time::Instant,
     ready_marker: PathBuf,
     /// Written by the standby once it has attached to every Core (it is then the Gateway
@@ -8146,17 +8152,25 @@ impl Entry {
         registry: &mut crate::local_identify::LocalIdentifyRegistry,
         now: Duration,
         launch: GatewayLaunch,
+        generation: LaunchGeneration,
+        reserved_restart: bool,
     ) -> crate::local_identify::LocalAdmission {
         use crate::local_identify::LocalAdmission;
         if self.mock_discord.is_some() {
             return LocalAdmission::Granted;
         }
-        let bot = &self.snapshot.key.bot_id;
-        match launch {
-            GatewayLaunch::Active => registry.try_acquire(bot, now),
+        let standby = match launch {
+            GatewayLaunch::Active => false,
             #[cfg(unix)]
-            GatewayLaunch::Standby => registry.try_acquire_standby(bot, now),
-        }
+            GatewayLaunch::Standby => true,
+        };
+        registry.acquire_gateway(
+            &self.snapshot.key,
+            generation,
+            now,
+            standby,
+            reserved_restart,
+        )
     }
 }
 
@@ -8247,18 +8261,22 @@ impl<S: CredentialSource> RecoveryHost for ProcessRecoveryHost<'_, S> {
         let since = *entry
             .admission_since
             .get_or_insert_with(std::time::Instant::now);
-        let decision = if self.reserved_restart == Some(&entry.snapshot.key) {
-            if entry.mock_discord.is_none() {
-                self.local_identify
-                    .consume_restart(&entry.snapshot.key.bot_id, self.now);
-            }
-            LocalAdmission::Granted
-        } else if blocked {
+        let reserved_restart = self.reserved_restart == Some(&entry.snapshot.key);
+        let decision = if blocked && !reserved_restart {
             LocalAdmission::Pending {
                 retry_after: Duration::ZERO,
             }
         } else {
-            entry.acquire_identify(self.local_identify, self.now, GatewayLaunch::Active)
+            entry.acquire_identify(
+                self.local_identify,
+                self.now,
+                GatewayLaunch::Active,
+                LaunchGeneration {
+                    daemon_instance: self.instance,
+                    sequence: self.sequence.saturating_add(1),
+                },
+                reserved_restart,
+            )
         };
         match decision {
             LocalAdmission::Granted => {
@@ -8292,14 +8310,24 @@ impl<S: CredentialSource> RecoveryHost for ProcessRecoveryHost<'_, S> {
             .values_mut()
             .find(|e| e.recovery_key == request.key)
             .unwrap();
+        #[cfg(target_os = "linux")]
+        let previous_sequence = *self.sequence;
         match Daemon::<MonotonicClock>::launch(
             entry,
             self.credentials,
             self.instance,
             self.sequence,
+            self.local_identify,
         ) {
             Ok(child) => Ok(child),
             Err(error) => {
+                #[cfg(target_os = "linux")]
+                if self.local_identify.send_grants.is_some() && *self.sequence == previous_sequence
+                {
+                    // Admission already recorded this generation, even if validation
+                    // failed before launch could allocate it.
+                    *self.sequence = previous_sequence.saturating_add(1);
+                }
                 self.errors.insert(entry.snapshot.key.clone(), error);
                 Err(std::io::Error::other("child launch failed"))
             }
@@ -8465,6 +8493,7 @@ impl<C: Clock> Daemon<C> {
                     retry_at_ms: None,
                     restart_exhausted: false,
                     recovery: None,
+                    identify_send_grant: None,
                 };
                 // Placement permits named Bot IDs too; these numeric keys are
                 // local engine indexes only. Public events retain the real ID.
@@ -8582,11 +8611,34 @@ impl<C: Clock> Daemon<C> {
         Ok(())
     }
 
+    /// Enable send-time admission before launching any local Gateway.
+    #[cfg(target_os = "linux")]
+    pub fn enable_identify_send_grants(&mut self, root: &Path) -> Result<(), DaemonError> {
+        if self.sequence != 0
+            || self.local_identify.send_grants.is_some()
+            || self
+                .entries
+                .values()
+                .any(|entry| entry.started || entry.mock_discord.is_some())
+        {
+            return Err(DaemonError::InvalidState);
+        }
+        self.local_identify.send_grants = Some(
+            crate::identify_grant::service::Service::open(root, self.local_identify.policy())
+                .map_err(|_| DaemonError::IdentifyUnavailable)?,
+        );
+        Ok(())
+    }
+
     /// Explicit token-free Discord simulation. Gateways connect out to the
     /// caller's loopback collector; no listener or remote management is exposed.
     /// Configuration is frozen after the first launch attempt, including failed
     /// attempts. Normal launches never fall back to this mode.
     pub fn enable_mock_discord(&mut self, address: SocketAddr) -> Result<(), DaemonError> {
+        #[cfg(target_os = "linux")]
+        if self.local_identify.send_grants.is_some() {
+            return Err(DaemonError::InvalidState);
+        }
         if self.entries.values().any(|entry| entry.started) {
             return Err(DaemonError::InvalidState);
         }
@@ -8749,10 +8801,26 @@ impl<C: Clock> Daemon<C> {
             return Err(DaemonError::InvalidProgram);
         }
         use crate::local_identify::LocalAdmission;
-        match entry.acquire_identify(&mut self.local_identify, now, GatewayLaunch::Standby) {
+        let generation = LaunchGeneration {
+            daemon_instance: self.instance,
+            sequence,
+        };
+        match entry.acquire_identify(
+            &mut self.local_identify,
+            now,
+            GatewayLaunch::Standby,
+            generation.clone(),
+            false,
+        ) {
             LocalAdmission::Granted => {}
             LocalAdmission::Pending { .. } => return Ok(false),
             LocalAdmission::Exhausted { .. } => return Err(DaemonError::IdentifyUnavailable),
+        }
+        #[cfg(target_os = "linux")]
+        if self.local_identify.send_grants.is_some() {
+            // The launch charge owns this generation from now on, including
+            // admission followed by a missing credential or a spawn error.
+            self.sequence = sequence;
         }
         let name = &spec.environment.credential_refs[0];
         // The explicit loopback simulation takes no credential, exactly like a normal launch.
@@ -8817,13 +8885,25 @@ impl<C: Clock> Daemon<C> {
         } else if let Some(credential) = credential {
             command.env(name, credential);
         }
+        #[cfg(target_os = "linux")]
+        let grant_fd = self
+            .local_identify
+            .send_grants
+            .as_mut()
+            .map(|service| service.attach(&mut command, key, generation, true))
+            .transpose()
+            .map_err(|_| DaemonError::SpawnFailed)?;
         let child = command.spawn().map_err(|_| DaemonError::SpawnFailed)?;
+        #[cfg(target_os = "linux")]
+        drop(grant_fd);
         if entry.mock_discord.is_none() {
             entry.update_fallback_reserved = true;
         }
         self.sequence = sequence;
         entry.candidate = Some(Candidate {
             child,
+            #[cfg(target_os = "linux")]
+            launch_sequence: sequence,
             started: std::time::Instant::now(),
             ready_marker: marker,
             active_marker,
@@ -9005,6 +9085,16 @@ impl<C: Clock> Daemon<C> {
             candidate.child,
         ) {
             Ok(mut old) => {
+                #[cfg(target_os = "linux")]
+                if let Some(service) = &mut self.local_identify.send_grants {
+                    service.promote(
+                        key,
+                        &LaunchGeneration {
+                            daemon_instance: self.instance,
+                            sequence: candidate.launch_sequence,
+                        },
+                    );
+                }
                 if let Some(pipe) = old.stdin.as_mut() {
                     let _ = tokio::time::timeout(Duration::from_millis(500), async {
                         pipe.write_all(shard_runtime::GATEWAY_SHUTDOWN_FRAME)
@@ -9146,7 +9236,20 @@ impl<C: Clock> Daemon<C> {
     }
 
     pub fn snapshots(&self) -> Vec<ProcessSnapshot> {
-        self.entries.values().map(|e| e.snapshot.clone()).collect()
+        self.entries
+            .values()
+            .map(|entry| {
+                let snapshot = entry.snapshot.clone();
+                #[cfg(target_os = "linux")]
+                if let Some(service) = &self.local_identify.send_grants {
+                    return ProcessSnapshot {
+                        identify_send_grant: Some(service.status(&snapshot.key)),
+                        ..snapshot
+                    };
+                }
+                snapshot
+            })
+            .collect()
     }
 
     fn now(&mut self) -> Result<Duration, DaemonError> {
@@ -9193,7 +9296,8 @@ impl<C: Clock> Daemon<C> {
     }
 
     /// Replace the local Identify admission limits (clears recorded history).
-    /// Intended for tests; production uses the documented defaults.
+    /// Intended for tests; production uses the documented defaults. Set this
+    /// before enabling persistent send grants, which keep their initial policy.
     pub fn set_local_identify_policy(
         &mut self,
         policy: crate::local_identify::LocalIdentifyPolicy,
@@ -9262,6 +9366,7 @@ impl<C: Clock> Daemon<C> {
         credentials: &impl CredentialSource,
         instance: [u8; 16],
         sequence: &mut u64,
+        _local_identify: &mut crate::local_identify::LocalIdentifyRegistry,
     ) -> Result<Child, DaemonError> {
         tokio::runtime::Handle::try_current().map_err(|_| DaemonError::NoRuntime)?;
         let spec = &entry.spec.gateway;
@@ -9399,6 +9504,21 @@ impl<C: Clock> Daemon<C> {
         command.process_group(0);
         #[cfg(windows)]
         command.creation_flags(0x0000_0200 | 0x0800_0000); // NEW_PROCESS_GROUP | NO_WINDOW
+        #[cfg(target_os = "linux")]
+        let grant_fd = match _local_identify
+            .send_grants
+            .as_mut()
+            .map(|service| {
+                service.attach(&mut command, &entry.snapshot.key, generation.clone(), false)
+            })
+            .transpose()
+        {
+            Ok(fd) => fd,
+            Err(_) => {
+                Self::release_reservation(entry)?;
+                return Err(DaemonError::SpawnFailed);
+            }
+        };
         let child = match command.spawn() {
             Ok(child) => child,
             Err(_) => {
@@ -9406,6 +9526,8 @@ impl<C: Clock> Daemon<C> {
                 return Err(DaemonError::SpawnFailed);
             }
         };
+        #[cfg(target_os = "linux")]
+        drop(grant_fd);
         let pid = child.id().expect("newly spawned child has a process id");
         entry.graceful_stop = None;
         entry.snapshot.identity = Some(ProcessIdentity {
@@ -9610,7 +9732,18 @@ impl<C: Clock> Daemon<C> {
     /// Only ChildRecovery observes exits and schedules retries. OS liveness is
     /// distinct from authenticated Ready; this legacy wire cannot confirm Ready.
     pub fn poll(&mut self, credentials: &impl CredentialSource) -> Result<(), DaemonError> {
-        self.poll_recovery(credentials, None, StartKind::Automatic)
+        let result = self.poll_recovery(credentials, None, StartKind::Automatic);
+        #[cfg(target_os = "linux")]
+        if self.local_identify.send_grants.is_some() && !self.clock_failed {
+            let fallback = self
+                .entries
+                .values()
+                .filter(|entry| entry.update_fallback_reserved)
+                .map(|entry| entry.snapshot.key.bot_id.as_str())
+                .collect();
+            self.local_identify.poll_send_grants(&fallback);
+        }
+        result
     }
 
     /// Cancellation-safe: retain the owned Child until poll reaps its exit.

@@ -166,6 +166,8 @@ enum StartupFailure {
     MetadataUnavailable,
     InsufficientShards,
     InvalidIdentifyLimits,
+    #[cfg(target_os = "linux")]
+    IdentifyGrantUnavailable,
     InvalidArguments,
     InvalidMockFrame,
     MockUnavailable,
@@ -184,6 +186,8 @@ impl fmt::Display for StartupFailure {
                 "configured shard count is below Discord recommendation [shards_insufficient]"
             }
             Self::InvalidIdentifyLimits => "invalid session start limits [identify_limits_invalid]",
+            #[cfg(target_os = "linux")]
+            Self::IdentifyGrantUnavailable => "Identify send grant unavailable",
             Self::InvalidArguments => "invalid gateway launch arguments [launch_invalid]",
             Self::InvalidMockFrame => "invalid mock input [mock_input_invalid]",
             Self::MockUnavailable => "mock transport unavailable [mock_unavailable]",
@@ -232,6 +236,8 @@ struct GatewayOptions {
     mock_discord: Option<SocketAddr>,
     local_control: bool,
     nonce_retry: bool,
+    #[cfg(target_os = "linux")]
+    identify_grant_fd: Option<std::os::fd::RawFd>,
     /// Directory of the Cores botd runs for this Shard (separated layout). When set, the
     /// Gateway connects to them instead of starting its own Core processes.
     core_dir: Option<PathBuf>,
@@ -249,6 +255,15 @@ impl GatewayOptions {
         while let Some(flag) = args.next() {
             let flag = flag.to_str().ok_or(StartupFailure::InvalidArguments)?;
             match flag {
+                #[cfg(target_os = "linux")]
+                src::identify_grant::GATEWAY_FD_FLAG if options.identify_grant_fd.is_none() => {
+                    options.identify_grant_fd = Some(
+                        args.next()
+                            .and_then(|value| value.to_str().and_then(|id| id.parse().ok()))
+                            .filter(|&fd| fd >= 3)
+                            .ok_or(StartupFailure::InvalidArguments)?,
+                    );
+                }
                 "--local-control" if !options.local_control => options.local_control = true,
                 NONCE_RETRY_FLAG if cfg!(target_os = "linux") && !options.nonce_retry => {
                     options.nonce_retry = true;
@@ -286,6 +301,14 @@ impl GatewayOptions {
                 }
                 _ => return Err(StartupFailure::InvalidArguments),
             }
+        }
+        #[cfg(target_os = "linux")]
+        if options.identify_grant_fd.is_some()
+            && (options.launch.len() != 7
+                || options.mock_discord.is_some()
+                || options.local_control)
+        {
+            return Err(StartupFailure::InvalidArguments);
         }
         if (!options.launch.is_empty() && options.launch.len() != 7)
             || (options.nonce_retry && options.mock_discord.is_some())
@@ -421,7 +444,7 @@ fn control_input() -> (oneshot::Receiver<()>, mpsc::UnboundedReceiver<u64>) {
 async fn run_standby(
     options: &GatewayOptions,
     deployment: worker::DeploymentIdentity,
-    mut shard: Shard,
+    mut shard: LiveShard,
     http: Arc<Client>,
 ) -> Result<(), AppError> {
     const BACKLOG_LIMIT: usize = 512;
@@ -1185,10 +1208,48 @@ async fn run() -> Result<(), AppError> {
     result
 }
 
+enum GatewayQueue {
+    Local(InMemoryQueue),
+    #[cfg(target_os = "linux")]
+    Managed(src::identify_grant::GrantQueue),
+}
+
+impl twilight_gateway_queue::Queue for GatewayQueue {
+    fn enqueue(&self, shard: u32) -> oneshot::Receiver<()> {
+        match self {
+            Self::Local(queue) => queue.enqueue(shard),
+            #[cfg(target_os = "linux")]
+            Self::Managed(queue) => queue.enqueue(shard),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl GatewayQueue {
+    fn take_permit(&self) -> bool {
+        match self {
+            Self::Managed(queue) => queue.take_permit(),
+            Self::Local(_) => false,
+        }
+    }
+}
+
+type LiveShard = Shard<GatewayQueue>;
+
 async fn live_gateway(
     options: &GatewayOptions,
     deployment: &worker::DeploymentIdentity,
-) -> Result<(Shard, Arc<Client>), AppError> {
+) -> Result<(LiveShard, Arc<Client>), AppError> {
+    #[cfg(target_os = "linux")]
+    let grant_socket = options
+        .identify_grant_fd
+        .map(|fd| {
+            // Managed mode accepts a dedicated FD inherited at exec from botd.
+            // This is called once, before attaching to or launching any Core.
+            unsafe { src::identify_grant::GrantQueue::inherited_socket(fd) }
+        })
+        .transpose()
+        .map_err(|_| StartupFailure::IdentifyGrantUnavailable)?;
     let _ = rustls::crypto::ring::default_provider().install_default();
     let shard_id = configured_shard(deployment);
     let token = token_from_env(env::var(options.token_env()))?;
@@ -1202,10 +1263,20 @@ async fn live_gateway(
     let config = ConfigBuilder::new(
         token.into_inner(),
         Intents::GUILD_MESSAGES | Intents::MESSAGE_CONTENT,
-    )
-    .queue(queue)
-    .build();
-    Ok((Shard::with_config(shard_id, config), http))
+    );
+    #[cfg(target_os = "linux")]
+    if let Some(socket) = grant_socket {
+        let managed = src::identify_grant::GrantQueue::new(queue, socket, shard_id.number());
+        let config = config
+            .queue(GatewayQueue::Managed(managed))
+            .identify_guard(GatewayQueue::take_permit)
+            .build();
+        return Ok((Shard::with_config(shard_id, config), http));
+    }
+    Ok((
+        Shard::with_config(shard_id, config.queue(GatewayQueue::Local(queue)).build()),
+        http,
+    ))
 }
 
 type ShardEvent = Result<Event, twilight_gateway::error::ReceiveMessageError>;
@@ -1225,7 +1296,7 @@ async fn event_permit(
 }
 
 async fn live_events(
-    mut shard: Shard,
+    mut shard: LiveShard,
     http: Arc<Client>,
     manager: Arc<worker::Manager>,
     mut backlog: std::collections::VecDeque<ShardEvent>,

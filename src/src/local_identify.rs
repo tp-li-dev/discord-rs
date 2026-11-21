@@ -1,11 +1,12 @@
-//! Per-Bot admission for real Gateway launches in one botd. History is in
-//! memory and is lost on botd restart. Grants count launch attempts, while
-//! Discord's limits apply to Identify frames. The owner injects monotonic time.
+//! Per-Bot admission for real Gateway launches in one botd. With send grants
+//! disabled the launch history is process-local. Both modes use this policy.
 
 use std::{
     collections::{HashMap, VecDeque},
     time::Duration,
 };
+
+use crate::daemon::{LaunchGeneration, ShardKey};
 
 /// Minimum spacing between two Identify grants of the same Bot. Discord allows
 /// one Identify per 5 seconds per max_concurrency bucket; 30
@@ -57,8 +58,15 @@ pub enum LocalAdmission {
 #[derive(Clone, Debug)]
 pub struct LocalIdentifyAdmission {
     policy: LocalIdentifyPolicy,
-    grants: VecDeque<Duration>,
+    grants: VecDeque<Charge>,
     last_grant: Option<Duration>,
+}
+
+#[derive(Clone, Debug)]
+struct Charge {
+    at: Duration,
+    #[cfg(target_os = "linux")]
+    launch: Option<LaunchGeneration>,
 }
 
 impl LocalIdentifyAdmission {
@@ -74,7 +82,7 @@ impl LocalIdentifyAdmission {
         while self
             .grants
             .front()
-            .is_some_and(|at| now.saturating_sub(*at) >= self.policy.window)
+            .is_some_and(|charge| now.saturating_sub(charge.at) >= self.policy.window)
         {
             self.grants.pop_front();
         }
@@ -90,7 +98,7 @@ impl LocalIdentifyAdmission {
         admission
     }
 
-    fn check_slots(&mut self, now: Duration, required_slots: usize) -> LocalAdmission {
+    pub(crate) fn check_slots(&mut self, now: Duration, required_slots: usize) -> LocalAdmission {
         self.prune(now);
         let capacity = (self.policy.max_per_window as usize).min(MAX_RECORDS);
         if required_slots > capacity {
@@ -106,7 +114,8 @@ impl LocalIdentifyAdmission {
         let cooldown = self.last_grant.map_or(Duration::ZERO, |last| {
             self.policy
                 .min_interval
-                .saturating_sub(now.saturating_sub(last))
+                .saturating_add(last)
+                .saturating_sub(now)
         });
         let window_retry = self.window_retry_after(capacity, required_slots, now);
         if window_retry > cooldown {
@@ -134,7 +143,8 @@ impl LocalIdentifyAdmission {
         }
         self.policy
             .window
-            .saturating_sub(now.saturating_sub(self.grants[expiring - 1]))
+            .saturating_add(self.grants[expiring - 1].at)
+            .saturating_sub(now)
     }
 
     pub fn try_acquire(&mut self, now: Duration) -> LocalAdmission {
@@ -148,20 +158,59 @@ impl LocalIdentifyAdmission {
     }
 
     fn push(&mut self, now: Duration) {
+        self.push_charge(Charge {
+            at: now,
+            #[cfg(target_os = "linux")]
+            launch: None,
+        });
+    }
+
+    fn push_charge(&mut self, charge: Charge) {
         if self.grants.len() == MAX_RECORDS {
             self.grants.pop_front();
         }
-        self.grants.push_back(now);
-        self.last_grant = Some(now);
+        self.last_grant = Some(charge.at);
+        self.grants.push_back(charge);
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn record_launch(&mut self, now: Duration, launch: LaunchGeneration) {
+        self.prune(now);
+        self.push_charge(Charge {
+            at: now,
+            launch: Some(launch),
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn remove_launch(&mut self, now: Duration, launch: &LaunchGeneration) -> bool {
+        self.prune(now);
+        let Some(index) = self
+            .grants
+            .iter()
+            .position(|c| c.launch.as_ref() == Some(launch))
+        else {
+            return false;
+        };
+        self.grants.remove(index);
+        self.last_grant = self.grants.back().map(|charge| charge.at);
+        true
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn record_permit(&mut self, expires: Duration) {
+        self.push(expires);
     }
 }
 
 /// Independent history per Bot ID.
-#[derive(Clone, Debug, Default)]
+#[derive(Default)]
 pub struct LocalIdentifyRegistry {
     policy: LocalIdentifyPolicy,
     bots: HashMap<String, LocalIdentifyAdmission>,
     restart_slots: HashMap<String, usize>,
+    #[cfg(target_os = "linux")]
+    pub(crate) send_grants: Option<crate::identify_grant::service::Service>,
 }
 
 impl LocalIdentifyRegistry {
@@ -177,6 +226,11 @@ impl LocalIdentifyRegistry {
         self.bots.clear();
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn policy(&self) -> LocalIdentifyPolicy {
+        self.policy
+    }
+
     fn bot(&mut self, bot_id: &str) -> &mut LocalIdentifyAdmission {
         let policy = self.policy;
         self.bots
@@ -190,6 +244,50 @@ impl LocalIdentifyRegistry {
 
     pub(crate) fn try_acquire_standby(&mut self, bot_id: &str, now: Duration) -> LocalAdmission {
         self.try_acquire_slots(bot_id, now, 2)
+    }
+
+    pub(crate) fn acquire_gateway(
+        &mut self,
+        key: &ShardKey,
+        _generation: LaunchGeneration,
+        now: Duration,
+        standby: bool,
+        reserved_restart: bool,
+    ) -> LocalAdmission {
+        let bot = &key.bot_id;
+        #[cfg(target_os = "linux")]
+        if let Some(service) = &mut self.send_grants {
+            if !reserved_restart && self.restart_slots.contains_key(bot) {
+                return LocalAdmission::Pending {
+                    retry_after: Duration::ZERO,
+                };
+            }
+            let admission = service.launch(key, _generation, if standby { 2 } else { 1 });
+            if admission == LocalAdmission::Granted && reserved_restart {
+                self.take_restart_slot(bot);
+            }
+            return admission;
+        }
+        if reserved_restart {
+            self.consume_restart(bot, now);
+            LocalAdmission::Granted
+        } else if standby {
+            self.try_acquire_standby(bot, now)
+        } else {
+            self.try_acquire(bot, now)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn poll_send_grants(&mut self, fallback_bots: &std::collections::HashSet<&str>) {
+        if let Some(service) = &mut self.send_grants {
+            service.poll(|bot| {
+                (
+                    self.restart_slots.contains_key(bot),
+                    fallback_bots.contains(bot),
+                )
+            });
+        }
     }
 
     fn try_acquire_slots(
@@ -219,6 +317,12 @@ impl LocalIdentifyRegistry {
                 retry_after: Duration::ZERO,
             };
         }
+        #[cfg(target_os = "linux")]
+        let admission = match &mut self.send_grants {
+            Some(service) => service.check(bot_id, slots),
+            None => self.bot(bot_id).check_slots(now, slots),
+        };
+        #[cfg(not(target_os = "linux"))]
         let admission = self.bot(bot_id).check_slots(now, slots);
         if admission != LocalAdmission::Granted {
             return admission;
@@ -234,6 +338,13 @@ impl LocalIdentifyRegistry {
 
     /// Charge at the replacement's launch boundary, even if spawn then fails.
     pub(crate) fn consume_restart(&mut self, bot_id: &str, now: Duration) {
+        self.take_restart_slot(bot_id);
+        let history = self.bot(bot_id);
+        history.prune(now);
+        history.push(now);
+    }
+
+    fn take_restart_slot(&mut self, bot_id: &str) {
         let slots = self
             .restart_slots
             .get_mut(bot_id)
@@ -242,9 +353,6 @@ impl LocalIdentifyRegistry {
         if *slots == 0 {
             self.release_restart(bot_id);
         }
-        let history = self.bot(bot_id);
-        history.prune(now);
-        history.push(now);
     }
 
     pub(crate) fn release_restart(&mut self, bot_id: &str) {

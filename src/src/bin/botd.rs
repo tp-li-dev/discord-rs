@@ -28,7 +28,7 @@ const REQUEST_LIMIT: u64 = 4096;
 const RESPONSE_LIMIT: usize = 64 * 1024;
 const DEADLINE: Duration = Duration::from_secs(3);
 const NONCE_RETRY_FOR: &str = "--enable-create-message-nonce-retry-for";
-const USAGE: &str = "usage: botd --file F --runtime-root ABS --gateway-program ABS (--bootstrap-stdin | --secret-file ABS [--control-port PORT]) [--no-autostart] [--stop-children-on-exit] [--core-mode embedded|separate] [--enable-create-message-nonce-retry-for BOT_ID ...] [--mock-discord LOOPBACK_IP:PORT] [--allow-test-quorum] [--allow-raft-quorum --raft-store ABS --raft-rpc-listen LOOPBACK_IP:PORT --raft-rpc-peer ID=LOOPBACK_IP:PORT ... [--raft-create] [--raft-bootstrap]] [--allow-test-gateway-switch --mock-identify-budget F]";
+const USAGE: &str = "usage: botd --file F --runtime-root ABS --gateway-program ABS (--bootstrap-stdin | --secret-file ABS [--control-port PORT]) [--no-autostart] [--stop-children-on-exit] [--core-mode embedded|separate] [--identify-send-grants] [--enable-create-message-nonce-retry-for BOT_ID ...] [--mock-discord LOOPBACK_IP:PORT] [--allow-test-quorum] [--allow-raft-quorum --raft-store ABS --raft-rpc-listen LOOPBACK_IP:PORT --raft-rpc-peer ID=LOOPBACK_IP:PORT ... [--raft-create] [--raft-bootstrap]] [--allow-test-gateway-switch --mock-identify-budget F]";
 
 struct Options {
     file: PathBuf,
@@ -43,6 +43,7 @@ struct Options {
     core_status_interval_ms: Option<u64>,
     mock_discord: Option<SocketAddr>,
     nonce_retry_bots: HashSet<String>,
+    identify_send_grants: bool,
     allow_test_quorum: bool,
     raft: Option<RaftRuntimeOptions>,
     allow_test_gateway_switch: bool,
@@ -66,6 +67,7 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
     let mut core_status_interval_ms = None;
     let mut mock_discord = None;
     let mut nonce_retry_bots = HashSet::new();
+    let mut identify_send_grants = false;
     let mut allow_test_quorum = false;
     let mut allow_raft_quorum = false;
     let mut raft_store = None;
@@ -80,6 +82,12 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
     let mut control_port = None;
     while let Some(arg) = args.next() {
         let target = match arg.to_str() {
+            Some("--identify-send-grants")
+                if cfg!(target_os = "linux") && !identify_send_grants =>
+            {
+                identify_send_grants = true;
+                continue;
+            }
             Some(NONCE_RETRY_FOR) if cfg!(target_os = "linux") => {
                 let id = args
                     .next()
@@ -290,6 +298,7 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
         core_status_interval_ms,
         mock_discord,
         nonce_retry_bots,
+        identify_send_grants,
         allow_test_quorum,
         raft,
         allow_test_gateway_switch,
@@ -326,6 +335,9 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
     }
     let test_or_raft =
         options.raft.is_some() || options.allow_test_quorum || options.allow_test_gateway_switch;
+    if options.identify_send_grants && (test_or_raft || options.mock_discord.is_some()) {
+        return Err("--identify-send-grants requires standalone live Discord");
+    }
     if options.stop_children_on_exit && test_or_raft {
         return Err("--stop-children-on-exit applies only to the standalone daemon");
     }
@@ -782,6 +794,9 @@ async fn run() -> Result<(), &'static str> {
     if loaded.test_cluster.is_some()
         || loaded.placement.cluster.mode == src::placement::ClusterMode::Quorum
     {
+        if options.identify_send_grants {
+            return Err("--identify-send-grants requires standalone live Discord");
+        }
         return run_test_cluster(options, loaded).await;
     }
     if options.allow_test_quorum {
@@ -798,6 +813,12 @@ async fn run() -> Result<(), &'static str> {
     daemon
         .set_gateway_program(&options.gateway_program)
         .map_err(|_| "invalid gateway program")?;
+    #[cfg(target_os = "linux")]
+    if options.identify_send_grants {
+        daemon
+            .enable_identify_send_grants(&options.runtime_root)
+            .map_err(|_| "Identify send grant journal unavailable")?;
+    }
     daemon
         .configure_create_message_nonce_retry(&config, &options.nonce_retry_bots)
         .map_err(|error| match error {
