@@ -13,6 +13,7 @@ class MeasurementTests(unittest.TestCase):
 
     def score(self):
         value = metrics(self.sent, self.http, self.replies)
+        value["case"] = "core_series"
         value["active_samples"] = 1
         return value
 

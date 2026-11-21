@@ -1,8 +1,14 @@
 //! Bounded open-loop load against real botd/Gateway/Worker and mock HTTP processes.
 //! All scenarios run before asserting acceptance, preserving failure evidence.
+#[path = "fixtures/control_channel.rs"]
+mod control_channel;
+
+use serde::Deserialize;
+use serde_json::{Value, json};
 use std::{
+    io::{self, BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::OnceLock,
     time::Duration,
 };
@@ -202,7 +208,7 @@ fn run_load_cases(cases: &[&str]) {
     let python = if cfg!(windows) { "python" } else { "python3" };
     let mut failed = Vec::new();
     for &case in cases {
-        let status = Command::new(python)
+        let mut child = Command::new(python)
             .arg(manifest.join("tests/fixtures/update_load.py"))
             .args(["--case", case, "--botd", env!("CARGO_BIN_EXE_botd")])
             .args(["--gateway", env!("CARGO_BIN_EXE_src"), "--relay"])
@@ -210,12 +216,53 @@ fn run_load_cases(cases: &[&str]) {
             .arg("--output")
             .arg(root.join(case))
             .env("PYTHONDONTWRITEBYTECODE", "1")
-            .status()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
             .expect("Python 3 is required for the process load fixture");
-        if !status.success() {
+        let forwarded =
+            forward_management_requests(child.stdin.take().unwrap(), child.stdout.take().unwrap());
+        let status = child.wait().expect("wait for process load fixture");
+        if forwarded.is_err() {
+            eprintln!("{case}: management pipe failed");
+        }
+        if !status.success() || forwarded.is_err() {
             failed.push(case);
         }
     }
     println!("load evidence: {}", root.display());
     assert!(failed.is_empty(), "acceptance failed for {failed:?}");
+}
+
+/// The Python fixture drives admission and operation polling separately. Keep its
+/// raw daemon commands on anonymous pipes and use the Rust client on the network.
+fn forward_management_requests(mut input: impl Write, output: impl Read) -> io::Result<()> {
+    #[derive(Deserialize)]
+    struct Request {
+        port: u16,
+        request: Value,
+    }
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let mut secret = [0; 32];
+    getrandom::fill(&mut secret).map_err(|_| io::Error::other("load fixture capability"))?;
+    writeln!(input, "{}", json!({"secret": secret}))?;
+    for line in BufReader::new(output).lines() {
+        let Request { port, request } = serde_json::from_str(&line?)?;
+        let response = rt.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                control_channel::request(port, &secret, &request),
+            )
+            .await
+        });
+        match response {
+            Ok(Ok(body)) => input.write_all(&body)?,
+            _ => input.write_all(b"null")?,
+        }
+        input.write_all(b"\n")?;
+    }
+    Ok(())
 }
