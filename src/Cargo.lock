@@ -1507,6 +1507,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-websockets",
  "toml",
+ "tracing",
  "twilight-gateway",
  "twilight-gateway-queue",
  "twilight-http",

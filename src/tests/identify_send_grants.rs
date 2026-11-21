@@ -29,13 +29,14 @@ mod linux {
         path::{Path, PathBuf},
         sync::{
             Arc,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicU64, AtomicUsize, Ordering},
         },
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
     use tokio::{
-        net::{TcpListener, TcpStream},
-        sync::Mutex,
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream, UnixStream},
+        sync::{Mutex, Notify, oneshot},
         task::JoinHandle,
         time::{interval, sleep, timeout},
     };
@@ -71,6 +72,11 @@ mod linux {
             println!("test send_grants_follow_discord_opcodes ... ok");
             runtime.block_on(promoted_gateway_keeps_the_launch_identity_from_its_journal());
             println!("test promoted_gateway_keeps_the_launch_identity_from_its_journal ... ok");
+            let barrier = Arc::new(IdentifyBarrier::default());
+            tracing::subscriber::with_default(Arc::clone(&barrier), || {
+                runtime.block_on(identify_expiring_after_dequeue_is_held_at_the_sink(barrier));
+            });
+            println!("test identify_expiring_after_dequeue_is_held_at_the_sink ... ok");
         }
     }
 
@@ -366,6 +372,125 @@ mod linux {
                 Some(1)
             );
         }
+    }
+
+    fn boot_ns() -> u64 {
+        let mut stamp = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        assert_eq!(
+            unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut stamp) },
+            0
+        );
+        stamp.tv_sec as u64 * 1_000_000_000 + stamp.tv_nsec as u64
+    }
+
+    #[derive(Default)]
+    struct IdentifyBarrier {
+        first_deadline: AtomicU64,
+        expired: Notify,
+    }
+
+    struct IdentifyEvent(bool);
+
+    impl tracing::field::Visit for IdentifyEvent {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" && format!("{value:?}") == "sending identify" {
+                self.0 = true;
+            }
+        }
+    }
+
+    impl tracing::Subscriber for IdentifyBarrier {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.target() == "twilight_gateway::shard" && metadata.is_event()
+        }
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            if !self.enabled(event.metadata()) {
+                return;
+            }
+            let mut identify = IdentifyEvent(false);
+            event.record(&mut identify);
+            if !identify.0 {
+                return;
+            }
+            let deadline = self.first_deadline.swap(0, Ordering::AcqRel);
+            if deadline != 0 {
+                let now = boot_ns();
+                assert!(
+                    now < deadline,
+                    "permit must still be valid after the queue releases it"
+                );
+                // Twilight has received the oneshot and is constructing the
+                // outbound Identify. Do not return to poll_send until it expires.
+                while boot_ns() < deadline {
+                    std::thread::sleep(Duration::from_nanos(deadline.saturating_sub(boot_ns())));
+                }
+                self.expired.notify_one();
+            }
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    async fn issue_test_permit(socket: &mut UnixStream, deadline: u64) {
+        let mut reply = [0_u8; 10];
+        reply[..2].copy_from_slice(&[1, 1]);
+        reply[2..].copy_from_slice(&deadline.to_le_bytes());
+        socket.write_all(&reply).await.unwrap();
+    }
+
+    async fn identify_expiring_after_dequeue_is_held_at_the_sink(barrier: Arc<IdentifyBarrier>) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let discord = Discord::new().await;
+        let (socket, mut broker) = UnixStream::pair().unwrap();
+        let (release, released) = oneshot::channel();
+        let (requested, replacement_requested) = oneshot::channel();
+        let grant_worker = tokio::spawn({
+            let barrier = Arc::clone(&barrier);
+            async move {
+                assert_eq!(broker.read_u8().await.unwrap(), 1);
+                let deadline = boot_ns() + 2_000_000_000;
+                barrier.first_deadline.store(deadline, Ordering::Release);
+                issue_test_permit(&mut broker, deadline).await;
+                if broker.read_u8().await.ok() == Some(1) {
+                    requested.send(()).unwrap();
+                    released.await.unwrap();
+                    issue_test_permit(&mut broker, boot_ns() + 2_000_000_000).await;
+                }
+            }
+        });
+        let queue = InMemoryQueue::new(0, 0, Duration::from_secs(1), 0);
+        let config = ConfigBuilder::new(String::new(), Intents::empty())
+            .proxy_url(discord.url())
+            .queue(GrantQueue::new(queue, socket, 0))
+            .identify_guard(GrantQueue::take_permit)
+            .build();
+        let mut shard = Shard::with_config(ShardId::ONE, config);
+        tokio::select! {
+            _ = async { while shard.next().await.is_some() {} } => panic!("fixture shard stopped"),
+            () = async {
+                let mut connection = discord.connect().await;
+                connection.hello().await;
+                bounded("Identify left the queue and its permit expired", barrier.expired.notified()).await;
+                connection.held().await;
+                assert_eq!(discord.frames().0, 0);
+                bounded("replacement permit requested", replacement_requested).await.unwrap();
+                release.send(()).unwrap();
+                connection.expect_auth(2).await;
+                connection.held().await;
+                assert_eq!(discord.frames().0, 1);
+            } => {}
+        }
+        grant_worker.await.unwrap();
     }
 
     async fn promoted_gateway_keeps_the_launch_identity_from_its_journal() {

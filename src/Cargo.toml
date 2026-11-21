@@ -32,6 +32,7 @@ twilight-gateway = { path = "vendor/twilight-gateway" }
 futures-util = { version = "0.3", features = ["sink"] }
 rcgen = "0.13"
 rmp-serde = "1"
+tracing = "0.1"
 tokio-websockets = { version = "0.13", default-features = false, features = ["server", "sha1_smol"] }
 
 [[test]]
