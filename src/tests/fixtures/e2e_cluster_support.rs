@@ -679,7 +679,7 @@ stop_margin_ms = {STOP_MARGIN_MS}
         self.monitor.check();
         let bytes = tokio::time::timeout(
             WAIT,
-            crate::control_channel::request(self.nodes[&id].port, &SECRET, &value),
+            super::control_channel::request(self.nodes[&id].port, &SECRET, &value),
         )
         .await
         .unwrap()
