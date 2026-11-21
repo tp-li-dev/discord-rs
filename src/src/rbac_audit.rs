@@ -313,6 +313,14 @@ pub struct AuditedExecutor {
     poisoned: bool,
 }
 
+impl Drop for AuditedExecutor {
+    fn drop(&mut self) {
+        // A child forked by another thread can hold the descriptor until exec.
+        // Release the lock even while that child still has its copy.
+        let _ = self.base.unlock();
+    }
+}
+
 impl AuditedExecutor {
     /// Parent directory must already exist and be private to the daemon user.
     /// Unix new files use 0600; Windows inherits directory ACLs (not verified).
@@ -993,5 +1001,28 @@ mod tests {
             Err(AuditError::CorruptLog)
         ));
         assert_eq!(fs::read(next).unwrap(), bytes);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dropping_executor_releases_lock_with_an_inherited_descriptor() {
+        let dir = TestDirectory::new();
+        let config = AuditConfig::default();
+        let executor = AuditedExecutor::open(dir.log(), config).unwrap();
+        // Like fork, try_clone shares the open file description and its flock.
+        let inherited = executor.base.try_clone().unwrap();
+        assert!(matches!(
+            AuditedExecutor::open(dir.log(), config),
+            Err(AuditError::Busy)
+        ));
+
+        drop(executor);
+        let reopened = AuditedExecutor::open(dir.log(), config).unwrap();
+        drop(inherited);
+        assert!(matches!(
+            AuditedExecutor::open(dir.log(), config),
+            Err(AuditError::Busy)
+        ));
+        drop(reopened);
     }
 }
