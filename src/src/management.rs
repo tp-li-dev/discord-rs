@@ -324,9 +324,25 @@ pub async fn serve<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    serve_with_accept(|| listener.accept(), protocol, keys, handle, rejected).await
+}
+
+async fn serve_with_accept<A, F>(
+    mut accept: impl FnMut() -> A,
+    protocol: Protocol,
+    keys: Vec<Key>,
+    handle: impl Fn(Stream, Session, usize) -> F,
+    rejected: impl Fn(),
+) -> io::Result<()>
+where
+    A: Future<Output = io::Result<Option<Stream>>>,
+    F: Future<Output = ()> + Send + 'static,
+{
     let keys = Arc::new(keys);
     let mut pending = VecDeque::<Handshake>::with_capacity(PRE_AUTH_LIMIT);
     let mut sessions = JoinSet::new();
+    let mut retry_at = None;
+    let mut backoff = Duration::from_millis(10);
     loop {
         tokio::select! {
             biased;
@@ -349,8 +365,26 @@ where
                     Err(_) => rejected(),
                 }
             }
-            accepted = listener.accept() => {
-                let Some(mut stream) = accepted? else { continue };
+            accepted = async {
+                if let Some(at) = retry_at {
+                    tokio::time::sleep_until(at).await;
+                }
+                accept().await
+            } => {
+                let stream = match accepted {
+                    Ok(stream) => {
+                        retry_at = None;
+                        backoff = Duration::from_millis(10);
+                        stream
+                    }
+                    Err(error) if endpoint::recoverable_accept_error(&error) => {
+                        retry_at = Some(tokio::time::Instant::now() + backoff);
+                        backoff = (backoff * 2).min(Duration::from_secs(1));
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                let Some(mut stream) = stream else { continue };
                 if pending.len() == PRE_AUTH_LIMIT {
                     drop(pending.pop_front());
                 }
@@ -370,6 +404,55 @@ mod tests {
     use tokio::io::{DuplexStream, duplex};
 
     const TEST_KEY: [u8; 32] = [7; 32];
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(start_paused = true)]
+    async fn accept_errors_retry_before_authenticating_the_next_connection() {
+        let (mut client, server) = duplex(8192);
+        let mut results = VecDeque::from([
+            Err(io::Error::from_raw_os_error(libc::ECONNABORTED)),
+            Err(io::Error::from_raw_os_error(libc::EMFILE)),
+            Ok(Some(Box::new(server) as Stream)),
+        ]);
+        let fatal = tokio::sync::Notify::new();
+        let fatal_signal = &fatal;
+        let started = tokio::time::Instant::now();
+        let serve = serve_with_accept(
+            || {
+                let result = results.pop_front();
+                async move {
+                    if let Some(result) = result {
+                        return result;
+                    }
+                    fatal_signal.notified().await;
+                    Err(io::Error::from_raw_os_error(libc::EBADF))
+                }
+            },
+            Protocol::Botd,
+            vec![Key::new(&TEST_KEY)],
+            |mut stream, session, _| async move {
+                let body = session.read_request(&mut stream).await.unwrap();
+                session.write_response(&mut stream, &body).await.unwrap();
+            },
+            || panic!("valid client rejected"),
+        );
+        let exchange = async {
+            let key = Key::new(&TEST_KEY);
+            let session = authenticate_client(&mut client, Protocol::Botd, key)
+                .await
+                .unwrap();
+            assert!(started.elapsed() >= Duration::from_millis(30));
+            session.write_request(&mut client, b"status").await.unwrap();
+            assert_eq!(session.read_response(&mut client).await.unwrap(), b"status");
+            fatal.notify_one();
+        };
+        let (result, ()) = timeout(Duration::from_secs(3), async {
+            tokio::join!(serve, exchange)
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EBADF));
+    }
 
     async fn session_pair() -> (Session, Session) {
         let (mut client, mut server) = duplex(8192);

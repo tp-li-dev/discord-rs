@@ -8,6 +8,39 @@ pub trait ControlStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> ControlStream for T {}
 pub type Stream = Box<dyn ControlStream>;
 
+pub(super) fn recoverable_accept_error(error: &io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::Interrupted
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+    ) {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    if matches!(
+        error.raw_os_error(),
+        Some(
+            libc::EMFILE
+                | libc::ENFILE
+                | libc::ENOBUFS
+                | libc::ENOMEM
+                | libc::ENETDOWN
+                | libc::EPROTO
+                | libc::ENOPROTOOPT
+                | libc::EHOSTDOWN
+                | libc::ENONET
+                | libc::EHOSTUNREACH
+                | libc::EOPNOTSUPP
+                | libc::ENETUNREACH
+        )
+    ) {
+        return true;
+    }
+    false
+}
+
 pub enum Listener {
     Tcp(TcpListener),
     #[cfg(target_os = "linux")]
