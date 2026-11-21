@@ -20,6 +20,7 @@ mod tests;
 const JOURNAL_NAME: &str = "identify-send-grants.jsonl";
 const MAX_JOURNAL: u64 = 16 * 1024 * 1024;
 const MAX_LINE: usize = 4096;
+const JOURNAL_VERSION: u8 = 2;
 const UNAVAILABLE: LocalAdmission = LocalAdmission::Exhausted {
     retry_after: Duration::MAX,
 };
@@ -47,6 +48,25 @@ struct Record {
     version: u8,
     at_ns: u64,
     action: Action,
+    sha256: String,
+}
+
+impl Record {
+    fn checksum(&self) -> io::Result<String> {
+        use std::fmt::Write as _;
+        let canonical = serde_json::to_vec(&(self.version, self.at_ns, &self.action))?;
+        let hash = rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256
+            .tls13()
+            .expect("ring TLS 1.3 cipher suite")
+            .common
+            .hash_provider
+            .hash(&canonical);
+        let mut hex = String::with_capacity(64);
+        for byte in hash.as_ref() {
+            write!(hex, "{byte:02x}").expect("writing to a String");
+        }
+        Ok(hex)
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -116,7 +136,10 @@ impl Budget {
             if line.len() > MAX_LINE {
                 return Err(invalid_journal());
             }
-            let record = serde_json::from_slice(line).map_err(|_| invalid_journal())?;
+            let record: Record = serde_json::from_slice(line).map_err(|_| invalid_journal())?;
+            if record.version != JOURNAL_VERSION || record.sha256 != record.checksum()? {
+                return Err(invalid_journal());
+            }
             budget.replay(record)?;
         }
         if complete < bytes.len() {
@@ -237,12 +260,14 @@ impl Budget {
     }
 
     fn append(&mut self, at: Duration, action: Action) -> io::Result<()> {
-        let record = Record {
-            version: VERSION,
-            at_ns: nanos(at),
-            action,
-        };
         let result = (|| {
+            let mut record = Record {
+                version: JOURNAL_VERSION,
+                at_ns: nanos(at),
+                action,
+                sha256: String::new(),
+            };
+            record.sha256 = record.checksum()?;
             let mut bytes = serde_json::to_vec(&record)?;
             if bytes.len() > MAX_LINE || self.len + bytes.len() as u64 + 1 > MAX_JOURNAL {
                 return Err(io::Error::other("Identify grant journal full"));
@@ -260,9 +285,6 @@ impl Budget {
     }
 
     fn replay(&mut self, record: Record) -> io::Result<()> {
-        if record.version != VERSION {
-            return Err(invalid_journal());
-        }
         let at = Duration::from_nanos(record.at_ns);
         if let Action::Boot {
             boot_id,

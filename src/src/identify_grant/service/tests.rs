@@ -163,6 +163,55 @@ fn torn_tail_is_discarded_but_a_corrupt_complete_record_fails_closed() {
 }
 
 #[test]
+fn valid_json_with_a_changed_bot_id_is_rejected_without_repair() {
+    let root = Root::new();
+    {
+        let mut budget = root.budget(BOOT, 0, 4).unwrap();
+        let active = gateway(0, 1);
+        assert_eq!(
+            budget.launch(active.clone(), secs(0), 1),
+            LocalAdmission::Granted
+        );
+        assert_eq!(
+            budget.identify(&active, secs(0), true, false, false).0,
+            State::Granted
+        );
+        assert_eq!(
+            budget.identify(&active, secs(32), false, false, false).0,
+            State::Granted
+        );
+    }
+
+    let journal = std::fs::read_to_string(root.path()).unwrap();
+    let mut lines: Vec<_> = journal.lines().map(str::to_owned).collect();
+    let mut last: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+    assert_eq!(last["action"]["converts_launch"], false);
+    assert_eq!(last["action"]["gateway"]["key"]["bot_id"], "42");
+    last["action"]["gateway"]["key"]["bot_id"] = "43".into();
+    *lines.last_mut().unwrap() = last.to_string();
+    let corrupt = lines.join("\n") + "\n";
+    std::fs::write(root.path(), &corrupt).unwrap();
+    assert!(root.budget(BOOT, 33, 4).is_err());
+    assert_eq!(std::fs::read_to_string(root.path()).unwrap(), corrupt);
+}
+
+#[test]
+fn old_format_complete_records_are_rejected_on_either_boot() {
+    let root = Root::new();
+    let old = serde_json::json!({
+        "version": 1,
+        "at_ns": 0,
+        "action": {"kind": "boot", "boot_id": BOOT, "hold_until_ns": 0},
+    })
+    .to_string()
+        + "\n";
+    std::fs::write(root.path(), &old).unwrap();
+    assert!(root.budget(BOOT, 0, 4).is_err());
+    assert!(root.budget(ANOTHER_BOOT, 0, 4).is_err());
+    assert_eq!(std::fs::read_to_string(root.path()).unwrap(), old);
+}
+
+#[test]
 fn clock_regression_fails_closed_and_reboot_wait_survives_restart() {
     let root = Root::new();
     {
