@@ -140,7 +140,11 @@ impl DaemonFixture {
         if missing_beta_credential {
             command.env_remove("TOKEN_BETA");
         } else {
-            command.env("TOKEN_BETA", "dummy-beta");
+            // Lifecycle scenarios use the explicit loopback fixture mode.
+            // This fixture never connects to Discord.
+            command
+                .args(["--mock-discord", "127.0.0.1:9"])
+                .env("TOKEN_BETA", "dummy-beta");
         }
         let mut child = command.spawn().unwrap();
         let mut bootstrap = json!({"secret": SECRET.to_vec()}).to_string();
@@ -598,6 +602,9 @@ async fn failed_spawn_and_abnormal_graceful_exit_are_not_success() {
         .json(&["operation", operation_id(&failure)], false)
         .await;
     assert_eq!(repeated["operation"], failure["operation"]);
+    fixture.cleanup().await;
+
+    let fixture = DaemonFixture::new().await;
     succeeded(&fixture.json(&["start", ALPHA], true).await);
     let before = fixture.status().await;
     fixture.ready(&before).await;

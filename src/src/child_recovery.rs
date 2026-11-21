@@ -206,6 +206,7 @@ pub struct RecoverySnapshot {
     pub startup_failures: u32,
     pub stable: bool,
     pub held: bool,
+    pub deferred: Option<DeferralReason>,
 }
 
 struct Entry {
@@ -243,6 +244,7 @@ impl Entry {
         }
         self.state = RecoveryState::Degraded(reason);
         self.restart.retry_at = None;
+        self.deferred = None;
         self.ready_at = None;
         self.stable = false;
         self.restart.exhausted = matches!(
@@ -450,6 +452,7 @@ impl<C: Clock> ChildRecovery<C> {
             startup_failures: entry.startup_failures,
             stable: entry.stable,
             held: entry.held,
+            deferred: entry.deferred,
         })
     }
 
@@ -498,6 +501,7 @@ impl<C: Clock> ChildRecovery<C> {
             .get_mut(&key)
             .ok_or(RecoveryError::UnknownChild)?;
         entry.desired = false;
+        entry.deferred = None;
         entry.restart.retry_at = None;
         entry.ready_at = None;
         entry.stable = false;

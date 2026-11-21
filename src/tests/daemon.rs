@@ -1,5 +1,6 @@
 use src::{
     daemon::*,
+    local_identify::LocalIdentifyPolicy,
     placement::{Config, LocalShardIntent},
     shard_runtime::{self, ShardRuntimeSpec},
     supervisor::{Clock, RestartPolicy, Sleep},
@@ -208,7 +209,13 @@ impl Drop for Managed {
     }
 }
 fn managed(specs: Vec<ShardRuntimeSpec>, p: RestartPolicy, clock: &ManualClock) -> Managed {
-    Managed(Daemon::with_clock(specs, p, clock.clone()).unwrap())
+    let mut daemon = Daemon::with_clock(specs, p, clock.clone()).unwrap();
+    // These process-only lifecycle tests exercise their own restart policy.
+    daemon.set_local_identify_policy(LocalIdentifyPolicy {
+        min_interval: Duration::ZERO,
+        ..Default::default()
+    });
+    Managed(daemon)
 }
 async fn eventually(mut test: impl FnMut() -> bool) {
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -236,6 +243,174 @@ async fn terminal(d: &mut Daemon<ManualClock>) {
             .all(|s| !matches!(s.state, ProcessState::Running))
     })
     .await;
+}
+
+#[tokio::test]
+async fn autostart_defers_a_same_bot_shard_and_starts_another_bot() {
+    let root = Root::new();
+    let clock = ManualClock::default();
+    let plan = specs(&root, &[("A", 0), ("A", 1), ("B", 0)]);
+    let mut daemon = Managed(Daemon::with_clock(plan, policy(), clock.clone()).unwrap());
+    daemon.0.start_all(&credentials).unwrap();
+    assert!(daemon.0.has_child(&key("A", 0)));
+    assert!(!daemon.0.has_child(&key("A", 1)));
+    assert!(daemon.0.has_child(&key("B", 0)));
+    let waiting = &daemon.0.snapshots()[1];
+    assert!(waiting.desired_running);
+    assert_eq!(
+        waiting.recovery.as_ref().unwrap()["deferred"],
+        "IdentifyBudget"
+    );
+    assert_eq!(waiting.restarts, 0);
+    clock.set(29);
+    daemon.0.poll(&credentials).unwrap();
+    assert!(!daemon.0.has_child(&key("A", 1)));
+    clock.set(30);
+    daemon.0.poll(&credentials).unwrap();
+    assert!(daemon.0.has_child(&key("A", 1)));
+}
+
+#[tokio::test]
+async fn autostart_reports_exhaustion_for_only_the_affected_bot() {
+    let root = Root::new();
+    let clock = ManualClock::default();
+    let plan = specs(&root, &[("A", 0), ("A", 1), ("B", 0)]);
+    let mut daemon = Managed(Daemon::with_clock(plan, policy(), clock).unwrap());
+    daemon.0.set_local_identify_policy(LocalIdentifyPolicy {
+        min_interval: Duration::ZERO,
+        max_per_window: 1,
+        ..Default::default()
+    });
+    assert_eq!(
+        daemon.0.start_all(&credentials),
+        Err(DaemonError::IdentifyUnavailable)
+    );
+    let snapshots = daemon.0.snapshots();
+    assert!(daemon.0.has_child(&key("A", 0)));
+    assert!(daemon.0.has_child(&key("B", 0)));
+    assert!(!daemon.0.has_child(&key("A", 1)));
+    assert!(!snapshots[1].desired_running);
+    assert_eq!(
+        snapshots[1].recovery.as_ref().unwrap()["state"],
+        serde_json::json!({"Degraded": "IdentifyUnavailable"})
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_manual_starts_can_only_consume_one_same_bot_grant() {
+    let root = Root::new();
+    let clock = ManualClock::default();
+    let plan = specs(&root, &[("A", 0), ("A", 1), ("B", 0)]);
+    let daemon = Arc::new(tokio::sync::Mutex::new(Managed(
+        Daemon::with_clock(plan, policy(), clock.clone()).unwrap(),
+    )));
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let mut requests = Vec::new();
+    for wanted in [key("A", 0), key("A", 1), key("B", 0)] {
+        let (daemon, barrier) = (Arc::clone(&daemon), Arc::clone(&barrier));
+        requests.push(tokio::spawn(async move {
+            barrier.wait().await;
+            let result = daemon.lock().await.0.start(&wanted, &credentials);
+            (wanted, result)
+        }));
+    }
+    let mut deferred = None;
+    for request in requests {
+        let (wanted, result) = request.await.unwrap();
+        if result == Err(DaemonError::IdentifyDeferred) {
+            assert_eq!(wanted.bot_id, "A");
+            assert!(deferred.replace(wanted).is_none());
+        } else {
+            result.unwrap();
+            assert!(daemon.lock().await.0.has_child(&wanted));
+        }
+    }
+    let deferred = deferred.expect("one same-Bot request must be refused");
+    let mut daemon = daemon.lock().await;
+    clock.set(30);
+    daemon.0.poll(&credentials).unwrap();
+    assert!(
+        !daemon.0.has_child(&deferred),
+        "a refused manual request must not turn into automatic work"
+    );
+    daemon.0.start(&deferred, &credentials).unwrap();
+    assert!(daemon.0.has_child(&deferred));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn standby_and_failed_activation_recovery_share_the_launch_budget() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = Root::new();
+    let program = root.0.join("process-only-gateway");
+    // Gateway and Core hold their launch-scoped stdin open. No Discord
+    // connection or Core protocol is involved in this scheduler fixture.
+    std::fs::write(&program, "#!/bin/sh\nwhile IFS= read -r line; do :; done\n").unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let plan = shard_runtime::plan(
+        &[LocalShardIntent {
+            bot_id: "7".into(),
+            shard_id: 0,
+            total_shards: 1,
+            token_env: "TOKEN_A".into(),
+        }],
+        &root.0,
+    )
+    .unwrap();
+    let clock = ManualClock::default();
+    let mut daemon = Managed(Daemon::with_clock(plan, policy(), clock.clone()).unwrap());
+    daemon.0.set_gateway_program(&program).unwrap();
+    daemon.0.enable_separate_cores().unwrap();
+    daemon.0.set_local_identify_policy(LocalIdentifyPolicy {
+        max_per_window: 4,
+        ..Default::default()
+    });
+    let wanted = key("7", 0);
+    daemon.0.start_all(&credentials).unwrap();
+    assert!(daemon.0.has_child(&wanted));
+    let original = daemon.0.snapshots()[0].identity.clone();
+    assert_eq!(
+        daemon.0.begin_gateway_update(&wanted, &credentials),
+        Ok(false)
+    );
+    clock.set(30);
+    assert_eq!(
+        daemon.0.begin_gateway_update(&wanted, &credentials),
+        Ok(true)
+    );
+    daemon.0.send_gateway_activation(&wanted).await.unwrap();
+    daemon.0.fail_gateway_activation(&wanted);
+    eventually(|| {
+        daemon.0.poll(&credentials).unwrap();
+        !daemon.0.has_child(&wanted)
+    })
+    .await;
+
+    clock.set(59);
+    daemon.0.poll(&credentials).unwrap();
+    let waiting = &daemon.0.snapshots()[0];
+    assert!(!daemon.0.has_child(&wanted));
+    assert_eq!(waiting.identity, original);
+    assert_eq!(waiting.restarts, 0);
+    assert_eq!(
+        waiting.recovery.as_ref().unwrap()["deferred"],
+        "IdentifyBudget"
+    );
+    clock.set(60);
+    daemon.0.poll(&credentials).unwrap();
+    assert!(daemon.0.has_child(&wanted));
+    assert_ne!(daemon.0.snapshots()[0].identity, original);
+    clock.set(90);
+    assert_eq!(
+        daemon.0.begin_gateway_update(&wanted, &credentials),
+        Err(DaemonError::IdentifyUnavailable)
+    );
+    assert!(daemon.0.has_child(&wanted));
+
+    daemon.0.stop(&wanted, StopMode::Force).unwrap();
+    terminal(&mut daemon.0).await;
+    daemon.0.stop_cores(Duration::from_secs(2)).await;
 }
 
 #[tokio::test]

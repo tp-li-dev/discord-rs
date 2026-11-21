@@ -1193,6 +1193,8 @@ pub mod control {
     enum UpdateStage {
         /// The standby is not started yet.
         Begin,
+        #[cfg(unix)]
+        WaitingIdentify,
         /// Started, logging in.
         Warming,
         /// Told to take the Cores; waiting for its confirmation.
@@ -3195,7 +3197,11 @@ pub mod control {
 
         fn operation_view(&self, op: &Operation) -> Value {
             let snapshot = self.snapshot(op);
-            let value = json!({"ok": snapshot.state != OperationState::Failed, "offline": false, "operation": snapshot, "note": if op.command == "core-restart" { CORE_RESTART_NOTE } else { NOTE }});
+            let mut value = json!({"ok": snapshot.state != OperationState::Failed, "offline": false, "operation": snapshot, "note": if op.command == "core-restart" { CORE_RESTART_NOTE } else { NOTE }});
+            #[cfg(unix)]
+            if op.finished.is_none() && op.update_stage == UpdateStage::WaitingIdentify {
+                value["operation"]["waiting_reason"] = json!("IdentifyBudget");
+            }
             #[cfg(unix)]
             if let Some(recovery) = &op.core_restart {
                 if recovery
@@ -3205,7 +3211,6 @@ pub mod control {
                 {
                     return Self::error("audit_pending");
                 }
-                let mut value = value;
                 value["operation"]["core_recovery_version"] = json!(CORE_RECOVERY_VERSION);
                 value["operation"]["source"] = json!("live");
                 value["operation"]["core"] = json!(recovery.target.core);
@@ -3530,11 +3535,12 @@ pub mod control {
             {
                 return Self::error("another operation is running on other shards of this bot");
             }
-            if request.command == "gateway-update"
-                && self.daemon.gateway_update_fallback_pending(&bot_id)
+            if matches!(
+                request.command.as_str(),
+                "start" | "restart" | "gateway-update"
+            ) && self.daemon.gateway_update_fallback_pending(&bot_id)
             {
-                // Reject before installing any restart holds: the reserved recovery must
-                // be able to run before another update can start. Keep its reservation.
+                // A new operation must not hold the shard with reserved recovery.
                 return Self::error("gateway fallback recovery pending; retry after recovery");
             }
             // Explicit force stop supersedes an earlier drain/restart. The old
@@ -3689,19 +3695,26 @@ pub mod control {
                 && op.update_stage != UpdateStage::Activating
             {
                 self.daemon.cancel_gateway_update(&key);
-                op.errors.insert(key, DaemonError::StopTimedOut);
+                let error = if op.update_stage == UpdateStage::WaitingIdentify {
+                    DaemonError::IdentifyDeferred
+                } else {
+                    DaemonError::StopTimedOut
+                };
+                op.errors.insert(key, error);
                 self.finish(op);
                 return;
             }
             match op.update_stage {
-                UpdateStage::Begin => match self.daemon.begin_gateway_update(&key, credentials) {
-                    Ok(true) => op.update_stage = UpdateStage::Warming,
-                    Ok(false) => {}
-                    Err(error) => {
-                        op.errors.insert(key, error);
-                        self.finish(op);
+                UpdateStage::Begin | UpdateStage::WaitingIdentify => {
+                    match self.daemon.begin_gateway_update(&key, credentials) {
+                        Ok(true) => op.update_stage = UpdateStage::Warming,
+                        Ok(false) => op.update_stage = UpdateStage::WaitingIdentify,
+                        Err(error) => {
+                            op.errors.insert(key, error);
+                            self.finish(op);
+                        }
                     }
-                },
+                }
                 UpdateStage::Warming => match self.daemon.gateway_update_progress(&key) {
                     UpdateProgress::Warming => {
                         if op.started.elapsed() >= op.update_timeout {
@@ -3804,7 +3817,14 @@ pub mod control {
                         op.errors.insert(key.clone(), error);
                         // A failed manual start must not secretly succeed later
                         // through an automatically scheduled restart.
-                        if op.phase == Phase::Starting && error != DaemonError::InvalidState {
+                        if op.phase == Phase::Starting
+                            && !matches!(
+                                error,
+                                DaemonError::InvalidState
+                                    | DaemonError::IdentifyDeferred
+                                    | DaemonError::IdentifyUnavailable
+                            )
+                        {
                             let _ = self.daemon.stop(key, StopMode::WaitForExit);
                         }
                     }
@@ -6952,7 +6972,7 @@ pub mod control {
                 window: Duration::from_secs(3600),
                 max_per_window: 10,
             });
-            let at = Instant::now() - Duration::from_secs(60);
+            let at = Duration::ZERO;
             for _ in 0..9 {
                 daemon.local_identify.record("id-0", at);
             }
@@ -6962,7 +6982,7 @@ pub mod control {
                 instance: daemon.instance,
                 sequence: &mut daemon.sequence,
                 manual: Some(&other),
-                require_shared_admission: true,
+                now: Duration::from_secs(60),
                 local_identify: &mut daemon.local_identify,
                 errors: BTreeMap::new(),
             };
@@ -6970,6 +6990,7 @@ pub mod control {
                 host.try_acquire_identify(other_key),
                 IdentifyAdmission::Pending
             );
+            assert_eq!(host.errors[&other], DaemonError::IdentifyDeferred);
             host.manual = None;
             assert_eq!(
                 host.try_acquire_identify(other_key),
@@ -6996,7 +7017,7 @@ pub mod control {
             use crate::local_identify::{
                 LocalAdmission, LocalIdentifyPolicy, LocalIdentifyRegistry,
             };
-            let now = std::time::Instant::now();
+            let now = Duration::ZERO;
             let mut registry = LocalIdentifyRegistry::with_policy(LocalIdentifyPolicy {
                 min_interval: Duration::from_secs(30),
                 window: Duration::from_secs(3600),
@@ -7004,18 +7025,64 @@ pub mod control {
             });
             registry.record("bot", now);
             assert!(matches!(
-                Daemon::<crate::supervisor::MonotonicClock>::gateway_update_identify_check(
-                    &registry, "bot", now
-                ),
+                registry.try_acquire_standby("bot", now),
                 LocalAdmission::Pending { .. }
             ));
             registry.record("bot", now);
             assert!(matches!(
-                Daemon::<crate::supervisor::MonotonicClock>::gateway_update_identify_check(
-                    &registry, "bot", now
-                ),
+                registry.try_acquire_standby("bot", now),
                 LocalAdmission::Exhausted { .. }
             ));
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn manual_restart_reports_identify_exhaustion_and_leaves_no_retry() {
+            let mut plane = plane(1, 1);
+            let key = ShardKey {
+                bot_id: "id-0".into(),
+                shard_id: 0,
+            };
+            let entry = plane.daemon.entries.get_mut(&key).unwrap();
+            entry.spec.gateway.program = "/bin/sh".into();
+            entry.spec.gateway.args = ["-c", "IFS= read -r line"].map(OsString::from).to_vec();
+            plane
+                .daemon
+                .set_local_identify_policy(crate::local_identify::LocalIdentifyPolicy {
+                    min_interval: Duration::ZERO,
+                    max_per_window: 1,
+                    ..Default::default()
+                });
+            let credential = |_: &str| Some(OsString::from("fixture-only"));
+            assert_eq!(plane.request(&request("start", 0, 1))["ok"], true);
+            plane.tick(&credential).await;
+            plane.tick(&credential).await;
+            assert_eq!(plane.request(&query(1))["operation"]["state"], "succeeded");
+            let original = plane.daemon.snapshots()[0].identity.clone();
+
+            assert_eq!(plane.request(&request("restart", 0, 2))["ok"], true);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    plane.tick(&credential).await;
+                    let result = plane.request(&query(2));
+                    if result["operation"]["state"] == "failed" {
+                        assert_eq!(
+                            result["operation"]["shards"][0]["error"],
+                            "IdentifyUnavailable"
+                        );
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            plane.tick(&credential).await;
+            assert!(!plane.daemon.has_child(&key));
+            let stopped = &plane.daemon.snapshots()[0];
+            assert!(!stopped.desired_running);
+            assert!(stopped.retry_at_ms.is_none());
+            assert_eq!(stopped.identity, original);
         }
 
         #[test]
@@ -7502,6 +7569,8 @@ pub enum DaemonError {
     InvalidProgram,
     UnknownShard,
     InvalidState,
+    IdentifyDeferred,
+    IdentifyUnavailable,
     NoRuntime,
     MissingCredential,
     MissingSystemEnvironment,
@@ -7709,7 +7778,6 @@ pub struct Daemon<C = MonotonicClock> {
     clock: std::sync::Arc<C>,
     recovery_events: VecDeque<DaemonRecoveryEvent>,
     recovery_events_dropped: u64,
-    require_shared_recovery_admission: bool,
     local_identify: crate::local_identify::LocalIdentifyRegistry,
     last_now: Duration,
     clock_failed: bool,
@@ -7717,6 +7785,33 @@ pub struct Daemon<C = MonotonicClock> {
     sequence: u64,
     metrics: crate::daemon_metrics::DaemonMetrics,
     log_checked: Option<std::time::Instant>,
+}
+
+#[derive(Clone, Copy)]
+enum GatewayLaunch {
+    Active,
+    #[cfg(unix)]
+    Standby,
+}
+
+impl Entry {
+    fn acquire_identify(
+        &self,
+        registry: &mut crate::local_identify::LocalIdentifyRegistry,
+        now: Duration,
+        launch: GatewayLaunch,
+    ) -> crate::local_identify::LocalAdmission {
+        use crate::local_identify::LocalAdmission;
+        if self.mock_discord.is_some() {
+            return LocalAdmission::Granted;
+        }
+        let bot = &self.snapshot.key.bot_id;
+        match launch {
+            GatewayLaunch::Active => registry.try_acquire(bot, now),
+            #[cfg(unix)]
+            GatewayLaunch::Standby => registry.try_acquire_standby(bot, now),
+        }
+    }
 }
 
 // Share the exact clock domain with the recovery engine without requiring C: Clone.
@@ -7745,7 +7840,7 @@ struct ProcessRecoveryHost<'a, S> {
     instance: [u8; 16],
     sequence: &'a mut u64,
     manual: Option<&'a ShardKey>,
-    require_shared_admission: bool,
+    now: Duration,
     local_identify: &'a mut crate::local_identify::LocalIdentifyRegistry,
     errors: BTreeMap<ShardKey, DaemonError>,
 }
@@ -7761,14 +7856,7 @@ impl<S: CredentialSource> RecoveryHost for ProcessRecoveryHost<'_, S> {
         false
     }
     fn try_acquire_identify(&mut self, key: ChildKey) -> IdentifyAdmission {
-        // This legacy launcher has no Resume/Identify wire contract (no Resume:
-        // every start is a fresh Identify). Automatic real-Discord recovery is
-        // admitted only by the single-host, in-memory LocalIdentifyRegistry
-        // (min interval + rolling-window cap); there is no cross-process or
-        // cross-host coordination. Outside an update reservation, initial and explicit
-        // operator starts are always granted but recorded, so a crash is spaced.
-        // Explicit token-free simulation and trusted process-only callers keep
-        // their existing lifecycle contract; neither is a Discord admission.
+        use crate::local_identify::LocalAdmission;
         // A single local update owns the Bot's fallback opportunity until commit, a
         // pre-activation abort, or its recovery's Identify grant. Defer OTHER starts
         // (even manual ones) without consuming history. This deliberately serializes
@@ -7812,37 +7900,36 @@ impl<S: CredentialSource> RecoveryHost for ProcessRecoveryHost<'_, S> {
         let since = *entry
             .admission_since
             .get_or_insert_with(std::time::Instant::now);
-        if blocked {
-            return IdentifyAdmission::Pending;
-        }
-        let mut admission = IdentifyAdmission::Granted;
-        if entry.mock_discord.is_none() {
-            let now = std::time::Instant::now();
-            let bot = entry.snapshot.key.bot_id.as_str();
-            if entry.update_fallback_reserved
-                || (self.require_shared_admission && self.manual != Some(&entry.snapshot.key))
-            {
-                use crate::local_identify::LocalAdmission;
-                admission = match self.local_identify.try_acquire(bot, now) {
-                    LocalAdmission::Granted => IdentifyAdmission::Granted,
-                    LocalAdmission::Pending { .. } => IdentifyAdmission::Pending,
-                    LocalAdmission::Exhausted { .. } => IdentifyAdmission::Unavailable,
-                };
-            } else {
-                self.local_identify.record(bot, now);
+        let decision = if blocked {
+            LocalAdmission::Pending {
+                retry_after: Duration::ZERO,
             }
-        }
-        if admission != IdentifyAdmission::Granted {
-            admission
         } else {
-            entry.update_fallback_reserved = false;
-            entry.admission_since = None;
-            if let Some(feed) = &entry.feed {
-                feed.observe(crate::metrics_feed::Observation::IdentifyWait(
-                    since.elapsed(),
-                ));
+            entry.acquire_identify(self.local_identify, self.now, GatewayLaunch::Active)
+        };
+        match decision {
+            LocalAdmission::Granted => {
+                entry.update_fallback_reserved = false;
+                entry.admission_since = None;
+                if let Some(feed) = &entry.feed {
+                    feed.observe(crate::metrics_feed::Observation::IdentifyWait(
+                        since.elapsed(),
+                    ));
+                }
+                IdentifyAdmission::Granted
             }
-            IdentifyAdmission::Granted
+            denial if self.manual == Some(&entry.snapshot.key) => {
+                let error = match denial {
+                    LocalAdmission::Exhausted { .. } => DaemonError::IdentifyUnavailable,
+                    _ => DaemonError::IdentifyDeferred,
+                };
+                self.errors.insert(entry.snapshot.key.clone(), error);
+                // The explicit start is cancelled by its caller. Keep this
+                // stopped slot reusable for a later management operation.
+                IdentifyAdmission::Pending
+            }
+            LocalAdmission::Pending { .. } => IdentifyAdmission::Pending,
+            LocalAdmission::Exhausted { .. } => IdentifyAdmission::Unavailable,
         }
     }
     fn cancel_identify(&mut self, _: ChildKey) {}
@@ -8082,7 +8169,6 @@ impl<C: Clock> Daemon<C> {
             clock,
             recovery_events: VecDeque::new(),
             recovery_events_dropped: 0,
-            require_shared_recovery_admission: false,
             local_identify: crate::local_identify::LocalIdentifyRegistry::default(),
             last_now,
             clock_failed: false,
@@ -8188,31 +8274,6 @@ impl<C: Clock> Daemon<C> {
         self.entries.values().any(|entry| entry.cores.is_some())
     }
 
-    #[cfg(unix)]
-    fn gateway_update_identify_check(
-        registry: &crate::local_identify::LocalIdentifyRegistry,
-        bot: &str,
-        now: std::time::Instant,
-    ) -> crate::local_identify::LocalAdmission {
-        use crate::local_identify::LocalAdmission;
-        let mut probe = registry.clone();
-        let first = probe.try_acquire(bot, now);
-        let when = match first {
-            LocalAdmission::Exhausted { .. } => return first,
-            LocalAdmission::Pending { retry_after } => {
-                match probe.try_acquire(bot, now + retry_after) {
-                    LocalAdmission::Granted => now + retry_after,
-                    other => return other,
-                }
-            }
-            LocalAdmission::Granted => now,
-        };
-        match probe.try_acquire(bot, when) {
-            LocalAdmission::Exhausted { retry_after } => LocalAdmission::Exhausted { retry_after },
-            _ => first,
-        }
-    }
-
     fn gateway_update_fallback_pending(&self, bot_id: &str) -> bool {
         self.entries
             .values()
@@ -8229,6 +8290,7 @@ impl<C: Clock> Daemon<C> {
         credentials: &impl CredentialSource,
     ) -> Result<bool, DaemonError> {
         tokio::runtime::Handle::try_current().map_err(|_| DaemonError::NoRuntime)?;
+        let now = self.now()?;
         // A prior failed update may still be waiting for its fallback Identify.
         let fallback_pending = self.gateway_update_fallback_pending(&key.bot_id);
         let sequence = self
@@ -8254,19 +8316,15 @@ impl<C: Clock> Daemon<C> {
         if fallback_pending {
             return Ok(false);
         }
-        if entry.mock_discord.is_none() {
-            use crate::local_identify::LocalAdmission;
-            let now = std::time::Instant::now();
-            match Self::gateway_update_identify_check(&self.local_identify, &entry.spec.bot_id, now)
-            {
-                LocalAdmission::Granted => {}
-                LocalAdmission::Pending { .. } => return Ok(false),
-                LocalAdmission::Exhausted { .. } => return Err(DaemonError::InvalidState),
-            }
-        }
         let spec = &entry.spec.gateway;
         if !safe_path(Path::new(&spec.program)) {
             return Err(DaemonError::InvalidProgram);
+        }
+        use crate::local_identify::LocalAdmission;
+        match entry.acquire_identify(&mut self.local_identify, now, GatewayLaunch::Standby) {
+            LocalAdmission::Granted => {}
+            LocalAdmission::Pending { .. } => return Ok(false),
+            LocalAdmission::Exhausted { .. } => return Err(DaemonError::IdentifyUnavailable),
         }
         let name = &spec.environment.credential_refs[0];
         // The explicit loopback simulation takes no credential, exactly like a normal launch.
@@ -8332,13 +8390,7 @@ impl<C: Clock> Daemon<C> {
             command.env(name, credential);
         }
         let child = command.spawn().map_err(|_| DaemonError::SpawnFailed)?;
-        // The standby logs in with a session of its own: count it like every other explicit
-        // start, so the automatic recovery spacing sees it.
         if entry.mock_discord.is_none() {
-            self.local_identify.record(
-                entry.snapshot.key.bot_id.as_str(),
-                std::time::Instant::now(),
-            );
             entry.update_fallback_reserved = true;
         }
         self.sequence = sequence;
@@ -8705,18 +8757,11 @@ impl<C: Clock> Daemon<C> {
             .collect::<Vec<_>>();
         let mut error = None;
         for key in keys {
-            if let Err(e) = self.start(&key, credentials) {
+            if let Err(e) = self.start_inner(&key, credentials, false) {
                 error.get_or_insert(e);
             }
         }
         error.map_or(Ok(()), Err)
-    }
-
-    /// The legacy artifact cannot coordinate a real Discord Identify at its
-    /// send boundary. botd enables this guard; managed Gateway adapters instead
-    /// use the shared Bot scheduler for initial, update and recovery admission.
-    pub fn require_shared_recovery_admission(&mut self) {
-        self.require_shared_recovery_admission = true;
     }
 
     /// Replace the local Identify admission limits (clears recorded history).
@@ -8736,6 +8781,15 @@ impl<C: Clock> Daemon<C> {
         &mut self,
         key: &ShardKey,
         credentials: &impl CredentialSource,
+    ) -> Result<(), DaemonError> {
+        self.start_inner(key, credentials, true)
+    }
+
+    fn start_inner(
+        &mut self,
+        key: &ShardKey,
+        credentials: &impl CredentialSource,
+        manual: bool,
     ) -> Result<(), DaemonError> {
         self.now()?;
         if self.has_child(key) {
@@ -8761,9 +8815,17 @@ impl<C: Clock> Daemon<C> {
         self.recovery
             .hold(entry.recovery_key, false)
             .map_err(|_| DaemonError::InvalidState)?;
-        let result = self.poll_recovery(credentials, Some(key));
+        let result = self.poll_recovery(credentials, Some(key), manual);
         let entry = &self.entries[key];
         let _ = self.recovery.hold(entry.recovery_key, entry.restart_held);
+        if manual
+            && matches!(
+                result,
+                Err(DaemonError::IdentifyDeferred | DaemonError::IdentifyUnavailable)
+            )
+        {
+            self.stop(key, StopMode::WaitForExit)?;
+        }
         result
     }
 
@@ -8959,7 +9021,8 @@ impl<C: Clock> Daemon<C> {
     fn poll_recovery(
         &mut self,
         credentials: &impl CredentialSource,
-        manual: Option<&ShardKey>,
+        requested: Option<&ShardKey>,
+        manual: bool,
     ) -> Result<(), DaemonError> {
         let mut first_error = self.now().err();
         #[cfg(unix)]
@@ -8996,15 +9059,15 @@ impl<C: Clock> Daemon<C> {
             credentials,
             instance: self.instance,
             sequence: &mut self.sequence,
-            manual,
-            require_shared_admission: self.require_shared_recovery_admission,
+            manual: requested.filter(|_| manual),
+            now: self.last_now,
             local_identify: &mut self.local_identify,
             errors: BTreeMap::new(),
         };
         let mut events = self.recovery.poll(&mut host);
         let errors = host.errors;
         for (key, error) in errors {
-            if manual.is_none_or(|requested| requested == &key) {
+            if requested.is_none_or(|requested| requested == &key) {
                 first_error.get_or_insert(error);
             }
             let entry = self.entries.get_mut(&key).unwrap();
@@ -9053,7 +9116,7 @@ impl<C: Clock> Daemon<C> {
                                 error: DaemonError::TimeOverflow,
                                 code: None,
                             };
-                            if manual.is_none_or(|key| key == &entry.snapshot.key) {
+                            if requested.is_none_or(|key| key == &entry.snapshot.key) {
                                 first_error = Some(DaemonError::TimeOverflow);
                             }
                         }
@@ -9062,8 +9125,17 @@ impl<C: Clock> Daemon<C> {
                                 error: DaemonError::MonitorFailed,
                                 code: None,
                             };
-                            if manual.is_none_or(|key| key == &entry.snapshot.key) {
+                            if requested.is_none_or(|key| key == &entry.snapshot.key) {
                                 first_error.get_or_insert(DaemonError::MonitorFailed);
+                            }
+                        }
+                        DegradedReason::IdentifyUnavailable => {
+                            entry.snapshot.state = ProcessState::Failed {
+                                error: DaemonError::IdentifyUnavailable,
+                                code: None,
+                            };
+                            if requested == Some(&entry.snapshot.key) {
+                                first_error.get_or_insert(DaemonError::IdentifyUnavailable);
                             }
                         }
                         _ => {}
@@ -9093,11 +9165,12 @@ impl<C: Clock> Daemon<C> {
             entry.snapshot.recovery = Some(serde_json::json!({
                 "state":state.state,"generation":state.generation,"pid":state.pid,
                 "restarts":state.restart.restarts,"startup_failures":state.startup_failures,"stable":state.stable,
+                "deferred":state.deferred,
             }));
             if state.pid.is_none()
                 && !entry.snapshot.desired_running
                 && let Err(error) = Self::release_reservation(entry)
-                && manual.is_none_or(|key| key == &entry.snapshot.key)
+                && requested.is_none_or(|key| key == &entry.snapshot.key)
             {
                 first_error.get_or_insert(error);
             }
@@ -9108,7 +9181,7 @@ impl<C: Clock> Daemon<C> {
     /// Only ChildRecovery observes exits and schedules retries. OS liveness is
     /// distinct from authenticated Ready; this legacy wire cannot confirm Ready.
     pub fn poll(&mut self, credentials: &impl CredentialSource) -> Result<(), DaemonError> {
-        self.poll_recovery(credentials, None)
+        self.poll_recovery(credentials, None, false)
     }
 
     /// Cancellation-safe: retain the owned Child until poll reaps its exit.
@@ -9118,6 +9191,7 @@ impl<C: Clock> Daemon<C> {
         let entry = self.entries.get_mut(key).ok_or(DaemonError::UnknownShard)?;
         entry.snapshot.desired_running = false;
         entry.snapshot.retry_at_ms = None;
+        entry.admission_since = None;
         if !entry.started {
             return Self::release_reservation(entry);
         }

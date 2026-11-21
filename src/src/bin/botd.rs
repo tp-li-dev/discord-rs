@@ -804,7 +804,6 @@ async fn run() -> Result<(), &'static str> {
         .map_err(|_| "cannot inspect local daemon control")?
         .port();
     let audit = RecoveryAudit::open(options.runtime_root.join("recovery-audit.jsonl")).await?;
-    daemon.require_shared_recovery_admission();
     let credentials = EnvironmentCredentials;
     // Partial startup failures remain visible through snapshots. Dropping this
     // daemon, including any error below, deliberately does not force-kill children.

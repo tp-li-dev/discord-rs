@@ -10,7 +10,7 @@ use std::{
 
 fn main() {
     let words: Vec<_> = std::env::args().skip(1).collect();
-    if words.len() != 14 {
+    if !matches!(words.len(), 14 | 16) {
         std::process::exit(80);
     }
     let args: HashMap<_, _> = words
@@ -23,11 +23,15 @@ fn main() {
         "ab200-beta" => ("TOKEN_BETA", "dummy-beta"),
         _ => std::process::exit(81),
     };
+    let mock = args.get("--mock-discord") == Some(&"127.0.0.1:9");
+    if words.len() != if mock { 16 } else { 14 } {
+        std::process::exit(80);
+    }
     let isolated = args["--token-env"] == token_name
-        && std::env::var(token_name).ok().as_deref() == Some(value)
+        && (mock || std::env::var(token_name).ok().as_deref() == Some(value))
         && ["TOKEN_ALPHA", "TOKEN_BETA", "DISCORD_TOKEN", "PATH"]
             .iter()
-            .filter(|name| **name != token_name)
+            .filter(|name| mock || **name != token_name)
             .all(|name| std::env::var_os(name).is_none());
     if !isolated {
         std::process::exit(82);

@@ -1,18 +1,14 @@
-//! Single-host, in-memory Identify admission for automatic Gateway recovery.
-//!
-//! This is NOT a shared Bot-wide scheduler. It only protects one botd process
-//! from restarting a crashing real-Discord Gateway too quickly. Several botd
-//! processes or hosts managing the same Bot are not coordinated, and the state
-//! is lost when botd restarts. Time is injected (`Instant` arguments) so the
-//! rules are testable without sleeping; this module never reads a clock.
+//! Per-Bot admission for real Gateway launches in one botd. History is in
+//! memory and is lost on botd restart. Grants count launch attempts, while
+//! Discord's limits apply to Identify frames. The owner injects monotonic time.
 
 use std::{
     collections::{HashMap, VecDeque},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 /// Minimum spacing between two Identify grants of the same Bot. Discord allows
-/// one Identify per 5 seconds per shard (per max_concurrency bucket); 30
+/// one Identify per 5 seconds per max_concurrency bucket; 30
 /// seconds keeps a crash loop far from that limit and leaves time for a
 /// previous Gateway to be observed as gone.
 pub const MIN_IDENTIFY_INTERVAL: Duration = Duration::from_secs(30);
@@ -26,8 +22,7 @@ pub const IDENTIFY_WINDOW: Duration = Duration::from_secs(60 * 60);
 /// still allowing several genuine recoveries.
 pub const MAX_IDENTIFIES_PER_WINDOW: u32 = 10;
 
-/// Bound on remembered grants, so operator-driven manual starts (which are
-/// recorded but never refused) cannot grow the history without limit.
+/// Upper bound on the local policy's rolling count.
 const MAX_RECORDS: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -62,7 +57,8 @@ pub enum LocalAdmission {
 #[derive(Clone, Debug)]
 pub struct LocalIdentifyAdmission {
     policy: LocalIdentifyPolicy,
-    grants: VecDeque<Instant>,
+    grants: VecDeque<Duration>,
+    last_grant: Option<Duration>,
 }
 
 impl LocalIdentifyAdmission {
@@ -70,53 +66,86 @@ impl LocalIdentifyAdmission {
         Self {
             policy,
             grants: VecDeque::new(),
+            last_grant: None,
         }
     }
 
-    fn prune(&mut self, now: Instant) {
+    fn prune(&mut self, now: Duration) {
         while self
             .grants
             .front()
-            .is_some_and(|at| now.saturating_duration_since(*at) >= self.policy.window)
+            .is_some_and(|at| now.saturating_sub(*at) >= self.policy.window)
         {
             self.grants.pop_front();
         }
     }
 
-    /// Decide for an automatic Identify and record it when granted.
-    pub fn try_acquire(&mut self, now: Instant) -> LocalAdmission {
+    /// Decide and record a single grant. A standby also needs capacity for a
+    /// subsequent fallback, which will request its own grant if needed.
+    fn try_acquire_slots(&mut self, now: Duration, required_slots: usize) -> LocalAdmission {
         self.prune(now);
-        if self.grants.len() >= self.policy.max_per_window as usize {
-            let retry_after = self.grants.front().map_or(Duration::ZERO, |oldest| {
-                (*oldest + self.policy.window).saturating_duration_since(now)
-            });
-            return LocalAdmission::Exhausted { retry_after };
+        let capacity = (self.policy.max_per_window as usize).min(MAX_RECORDS);
+        if required_slots > capacity {
+            return LocalAdmission::Exhausted {
+                retry_after: Duration::MAX,
+            };
         }
-        if let Some(last) = self.grants.back() {
-            let elapsed = now.saturating_duration_since(*last);
-            if elapsed < self.policy.min_interval {
-                return LocalAdmission::Pending {
-                    retry_after: self.policy.min_interval - elapsed,
-                };
-            }
+        if self.grants.len() >= capacity {
+            return LocalAdmission::Exhausted {
+                retry_after: self.window_retry_after(capacity, required_slots, now),
+            };
+        }
+        let cooldown = self.last_grant.map_or(Duration::ZERO, |last| {
+            self.policy
+                .min_interval
+                .saturating_sub(now.saturating_sub(last))
+        });
+        let window_retry = self.window_retry_after(capacity, required_slots, now);
+        if window_retry > cooldown {
+            return LocalAdmission::Exhausted {
+                retry_after: window_retry,
+            };
+        }
+        if !cooldown.is_zero() {
+            return LocalAdmission::Pending {
+                retry_after: cooldown,
+            };
         }
         self.push(now);
         LocalAdmission::Granted
     }
 
-    /// Record an Identify that was allowed by other means (initial start,
-    /// explicit operator start) without refusing it, so that an immediately
-    /// following automatic recovery is still spaced and counted.
-    pub fn record(&mut self, now: Instant) {
+    fn window_retry_after(
+        &self,
+        capacity: usize,
+        required_slots: usize,
+        now: Duration,
+    ) -> Duration {
+        let expiring = (self.grants.len() + required_slots).saturating_sub(capacity);
+        if expiring == 0 {
+            return Duration::ZERO;
+        }
+        self.policy
+            .window
+            .saturating_sub(now.saturating_sub(self.grants[expiring - 1]))
+    }
+
+    pub fn try_acquire(&mut self, now: Duration) -> LocalAdmission {
+        self.try_acquire_slots(now, 1)
+    }
+
+    #[cfg(test)]
+    fn record(&mut self, now: Duration) {
         self.prune(now);
         self.push(now);
     }
 
-    fn push(&mut self, now: Instant) {
+    fn push(&mut self, now: Duration) {
         if self.grants.len() == MAX_RECORDS {
             self.grants.pop_front();
         }
         self.grants.push_back(now);
+        self.last_grant = Some(now);
     }
 }
 
@@ -147,11 +176,16 @@ impl LocalIdentifyRegistry {
             .or_insert_with(|| LocalIdentifyAdmission::new(policy))
     }
 
-    pub fn try_acquire(&mut self, bot_id: &str, now: Instant) -> LocalAdmission {
+    pub fn try_acquire(&mut self, bot_id: &str, now: Duration) -> LocalAdmission {
         self.bot(bot_id).try_acquire(now)
     }
 
-    pub fn record(&mut self, bot_id: &str, now: Instant) {
+    pub(crate) fn try_acquire_standby(&mut self, bot_id: &str, now: Duration) -> LocalAdmission {
+        self.bot(bot_id).try_acquire_slots(now, 2)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record(&mut self, bot_id: &str, now: Duration) {
         self.bot(bot_id).record(now);
     }
 }
@@ -166,7 +200,7 @@ mod tests {
 
     #[test]
     fn first_is_granted_and_next_within_interval_is_pending_with_remaining_time() {
-        let t0 = Instant::now();
+        let t0 = Duration::ZERO;
         let mut a = LocalIdentifyAdmission::new(LocalIdentifyPolicy::default());
         assert_eq!(a.try_acquire(t0), LocalAdmission::Granted);
         assert_eq!(
@@ -181,7 +215,7 @@ mod tests {
 
     #[test]
     fn eleventh_identify_in_an_hour_is_exhausted_and_recovers_after_the_window() {
-        let t0 = Instant::now();
+        let t0 = Duration::ZERO;
         let mut a = LocalIdentifyAdmission::new(LocalIdentifyPolicy::default());
         for i in 0..10 {
             assert_eq!(a.try_acquire(t0 + secs(30 * i)), LocalAdmission::Granted);
@@ -202,7 +236,7 @@ mod tests {
 
     #[test]
     fn record_counts_and_spaces_without_refusing() {
-        let t0 = Instant::now();
+        let t0 = Duration::ZERO;
         let mut a = LocalIdentifyAdmission::new(LocalIdentifyPolicy::default());
         a.record(t0);
         assert_eq!(
@@ -222,7 +256,7 @@ mod tests {
 
     #[test]
     fn bots_are_independent() {
-        let t0 = Instant::now();
+        let t0 = Duration::ZERO;
         let mut r = LocalIdentifyRegistry::default();
         assert_eq!(r.try_acquire("a", t0), LocalAdmission::Granted);
         assert_eq!(r.try_acquire("b", t0), LocalAdmission::Granted);
@@ -238,8 +272,52 @@ mod tests {
     }
 
     #[test]
+    fn standby_at_cooldown_boundary_spends_one_of_two_required_slots() {
+        let mut registry = LocalIdentifyRegistry::with_policy(LocalIdentifyPolicy {
+            max_per_window: 2,
+            ..Default::default()
+        });
+        assert_eq!(registry.try_acquire("a", secs(0)), LocalAdmission::Granted);
+        assert_eq!(
+            registry.try_acquire_standby("a", secs(30)),
+            LocalAdmission::Exhausted {
+                retry_after: secs(3570)
+            }
+        );
+        assert_eq!(
+            registry.try_acquire_standby("a", secs(3600)),
+            LocalAdmission::Granted
+        );
+        assert_eq!(
+            registry.try_acquire("a", secs(3630)),
+            LocalAdmission::Granted
+        );
+        assert!(matches!(
+            registry.try_acquire("a", secs(3660)),
+            LocalAdmission::Exhausted { .. }
+        ));
+    }
+
+    #[test]
+    fn cooldown_can_outlive_the_rolling_window() {
+        let mut admission = LocalIdentifyAdmission::new(LocalIdentifyPolicy {
+            min_interval: secs(30),
+            window: secs(5),
+            max_per_window: 1,
+        });
+        assert_eq!(admission.try_acquire(secs(0)), LocalAdmission::Granted);
+        assert_eq!(
+            admission.try_acquire(secs(5)),
+            LocalAdmission::Pending {
+                retry_after: secs(25)
+            }
+        );
+        assert_eq!(admission.try_acquire(secs(30)), LocalAdmission::Granted);
+    }
+
+    #[test]
     fn history_is_bounded() {
-        let t0 = Instant::now();
+        let t0 = Duration::ZERO;
         let mut a = LocalIdentifyAdmission::new(LocalIdentifyPolicy::default());
         for _ in 0..(MAX_RECORDS * 2) {
             a.record(t0);
