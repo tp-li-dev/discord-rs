@@ -302,7 +302,10 @@ journalctl --disk-usage                             # 容量確認
 - systemd `Type=notify` / `WatchdogSec` の実機での動作確認（botd は `sd_notify` 対応済み。実 systemd では未検証のため unit では無効）。
 - Gateway 子プロセスのログ収集（journald に出ない）。
 - 本番での Raft quorum 有効化（拒否のまま）、分散 Identify・failover の本番統合。
-- 実 Discord の Gateway 自動復旧は、単一ホスト・単一 botd 専用のローカル Identify 許可（Bot 単位。同じ Bot は直近の許可から 30 秒以上空け、直近 1 時間で最大 10 回。超えると `IdentifyUnavailable` で `Degraded`）の下で有効です。初回起動と手動 start は常に許可して記録します。複数プロセス・複数ホスト間の調整は未実装、botd 再起動で履歴は消えます。セッションの Resume は未実装で、再起動のたびに Identify を 1 回消費します。ローカル未ビルドで GitHub Actions の検証待ちで、実 Discord・実機では未検証です。
+- 実 Discord の Gateway は、単一 botd 内で Bot 単位の Identify 予算を共有します（許可間隔 30 秒以上、直近 1 時間で最大 10 枠）。初回自動起動と自動復旧は、間隔待ちなら監視 tick で再試行し、枠不足では `Degraded: IdentifyUnavailable` になります。手動 start は間隔待ちで `IdentifyDeferred`、枠不足で `IdentifyUnavailable` を返します。手動 restart の予約と更新時の扱いは [運用ガイド](operator-guide.md#復旧と検証の境界) を参照してください。
+  - `--identify-send-grants` OFF（既定）では稼働中の Gateway の再 Identify は botd の予算対象外です。botd 再起動で起動許可履歴は消えます。送信許可チャネルはなく、生き残った Gateway は従来の Twilight キューで再 Identify します。
+  - ON では稼働中の Gateway の再 Identify も共有予算を使います。同じ OS 起動内の botd 再起動では同じ runtime root の履歴を再生し、OS 再起動後に boot ID の変化を検出すると 1 時間と許可の有効期間（2 秒）分を保留します。旧 Gateway のチャネルは復元されず、新規 Identify は保留されます。Heartbeat と Resume は許可待ちの対象外で、後継 Gateway には起動時に新チャネルを渡します。
+  - Gateway プロセスを入れ替えた場合、セッションがメモリにしかないため新たに Identify が必要です。複数 botd・複数ホストの予算共有は未実装です。実 Discord での送信許可の挙動は未検証です。
 - 複数ホストでの実障害（ホスト停止・網分断・failover）。
 - 無停止更新、`botctl update`/`rollback` の本番実行、原子的 rollback。
 - 孤児プロセスの再採用（未実装）、停電時の永続性、`--stop-children-on-exit` ＋ `SIGTERM` → `KillMode=mixed` 停止と

@@ -461,7 +461,14 @@ Core（Worker）だけを `kill -9` した場合は、Gatewayがメモリに持�
 
 `child_recovery` はdaemonのGateway監視とWorker側の復旧経路に接続されています。再試行・予算・degraded状態の観測は、孤児の再採用やホスト障害からの安全な分散復旧を意味しません。
 
-botd は初回自動起動、手動 start / restart、gateway-update の待機起動、自動復旧（更新失敗後を含む）に共通の起動予算を使います。同じ Bot は直近の許可から 30 秒以上空け、直近 1 時間で最大 10 回です。許可を得た起動試行は失敗しても枠を消費します。起動後の Gateway 内の再 Identify は各プロセスのキューで扱い、複数 botd・複数ホストの実送信に対する予算共有は未実装です。botd の再起動で起動許可の履歴は消えます。
+botd は初回自動起動、手動 start / restart、gateway-update の待機起動、自動復旧（更新失敗後を含む）に共通の Bot 単位の予算を使います。許可間隔は 30 秒以上、直近 1 時間で最大 10 枠です。許可を得た起動試行は失敗しても枠を消費します。予算の共有範囲は一つの botd が管理するローカル Shard です。
+
+| `--identify-send-grants` | Gateway 内の再 Identify | botd 再起動後の履歴 | 稼働中の Gateway |
+| --- | --- | --- | --- |
+| OFF（既定） | Gateway ごとの Twilight キューで扱い、botd の予算には含まれません。 | メモリ上の起動許可履歴が消えます。 | 送信許可チャネルは作りません。生き残った Gateway は従来のキューで再 Identify できます。 |
+| ON（Linux） | 送信前に許可を取得し、再 Identify ごとに同じ Bot の予算を消費します。 | 同じ OS 起動内では同じ runtime root のジャーナルを再生します。OS 再起動後に boot ID の変化を検出すると、その観測から 1 時間と許可の有効期間（2 秒）分を保留します。 | botd を終了すると旧チャネルは失われ、再起動後も復元されません。生き残った Gateway は新たな許可が必要な Identify を保留します。Heartbeat と Resume は許可待ちの対象外です。後継 Gateway は起動時に新しいチャネルを受け取ります。 |
+
+ON で運用するには対応版の botd と Gateway が必要です。既存のプロセスにチャネルは後付けされないため、設定を切り替える際は Gateway を停止・入れ替えしてください。詳細は [Identify の送信許可](design-decisions/11-identify-send-grant.md) を参照してください。
 
 - 初回自動起動と自動復旧は間隔待ちを `recovery.deferred: IdentifyBudget` として status に表示し、復旧監査にも記録します。監視 tick で再試行し、待機中は再起動回数を消費しません。`startup_ok` は同期的に分かった起動エラーを示します。各 Shard の起動状況は status で確認してください。上限まで使った Shard は `Degraded: IdentifyUnavailable`（`restart_exhausted: true`、`desired_running: false`）になります。
 - 手動 start は Shard ごとに起動を判定します。間隔が空いていなければ `IdentifyDeferred`、回数枠が足りなければ `IdentifyUnavailable` を Shard の結果に返します。複数 Shard を指定すると一部だけ起動することがあります。
