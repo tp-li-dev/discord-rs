@@ -5,6 +5,9 @@ use std::{
     sync::OnceLock,
 };
 
+#[path = "fixture_manifest.rs"]
+mod fixture_manifest;
+
 pub fn artifact_root() -> PathBuf {
     std::env::current_exe()
         .expect("integration test executable")
@@ -48,32 +51,12 @@ fn build() -> PathBuf {
         std::process::id(),
         getrandom::u64().unwrap()
     );
-    let mut manifest: toml::Value = toml::from_str(
-        r#"
-[package]
-name = "interaction-worker-fixture"
-version = "0.0.0"
-edition = "2024"
-publish = false
-[workspace]
-[dependencies]
-src = { path = "" }
-bot-framework = { path = "" }
-tokio = { version = "1", features = ["macros", "rt", "time"] }
-[[bin]]
-name = ""
-path = ""
-"#,
-    )
-    .unwrap();
-    let path = |value: &Path| toml::Value::String(value.to_str().unwrap().to_owned());
-    manifest["dependencies"]["src"]["path"] = path(root);
-    manifest["dependencies"]["bot-framework"]["path"] = path(&root.join("framework"));
-    manifest["bin"][0]["name"] = toml::Value::String(name.clone());
-    manifest["bin"][0]["path"] = path(&root.join("tests/fixtures/interaction_worker.rs"));
-    let manifest_path = project.join("Cargo.toml");
-    std::fs::write(&manifest_path, toml::to_string(&manifest).unwrap()).unwrap();
-    std::fs::copy(root.join("Cargo.lock"), project.join("Cargo.lock")).unwrap();
+    let manifest_path = fixture_manifest::write_fixture_project(
+        &project,
+        "interaction-worker-fixture",
+        &name,
+        "tests/fixtures/interaction_worker.rs",
+    );
     let target = artifact_root()
         .parent()
         .and_then(Path::parent)

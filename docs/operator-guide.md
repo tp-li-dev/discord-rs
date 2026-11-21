@@ -451,6 +451,12 @@ Core（Worker）だけを `kill -9` した場合は、Gatewayがメモリに持�
 
 `DISCORD_WORKER_FILE` を使う場合は親とreloadに同じ絶対パスを渡します。更新指定ファイルと `workers/` は任意バイナリ実行につながるため、信頼する管理者だけに書込権限を限定してください。Windows ACL はサポート外（Windows非対応）です。成果物の署名検証、全ログ経路の秘密マスクは検証・実装が残っています。
 
+## Twilight の更新確認
+
+保守時はリポジトリルートで `bash deploy/dev/check-upstream-updates.sh` を実行します（`curl` と Python 3 が必要です）。
+同じ系列の最新パッチと、系列を問わない最新の通常リリースを表示します。取得不能時も終了コードは 0 で、更新は手動です。
+候補があれば上流の変更履歴とセキュリティ修正を確認し、[パッチの移植手順](../src/vendor/twilight-gateway/UPSTREAM.md#更新手順linux)に従ってください。
+
 ## 復旧と検証の境界
 
 `child_recovery` はdaemonのGateway監視とWorker側の復旧経路に接続されています。再試行・予算・degraded状態の観測は、孤児の再採用やホスト障害からの安全な分散復旧を意味しません。
