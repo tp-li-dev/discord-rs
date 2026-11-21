@@ -16,7 +16,8 @@ use tokio::{
 };
 
 #[cfg(test)]
-use tokio::io::AsyncWriteExt;
+#[path = "../../tests/fixtures/control_channel.rs"]
+mod control_channel;
 
 const REQUEST_LIMIT: usize = 4096;
 const CORE_USAGE: &str = "usage: botctl core status BOT --shard N | botctl core restart BOT --shard N --core K [--expect-incarnation ID] [--force] [--yes]; both require (--bootstrap-stdin | --secret-file ABS (--port PORT | --socket ABS)) and accept [--json] [--timeout 30s]";
@@ -997,6 +998,7 @@ async fn run_core(options: Options, mut deadline: Instant) -> Value {
             };
             return preview_error("rejected", error);
         }
+        Ok(Err(AUTHENTICATION_FAILED)) => return preview_error("rejected", AUTHENTICATION_FAILED),
         Ok(Err(_)) => return preview_error("rejected", unsupported),
         Err(_) => {
             return preview_error(
@@ -1097,6 +1099,9 @@ async fn restart_core(
         .await
         {
             Ok(Ok(response)) => response,
+            Ok(Err(AUTHENTICATION_FAILED)) if sending => {
+                return core_outcome("rejected", Some(AUTHENTICATION_FAILED), Some(&id));
+            }
             Ok(Err(_)) if sending => {
                 // The daemon might have admitted the request before the reply was lost.
                 sending = false;
@@ -1959,8 +1964,8 @@ mod default_wait_tests {
             .unwrap();
             let server = tokio::spawn(async move {
                 let (mut mutation, _) = listener.accept().await.unwrap();
-                let frame = read_frame(&mut mutation, REQUEST_LIMIT).await.unwrap();
-                let request: Value = serde_json::from_slice(&frame).unwrap();
+                let (session, request) =
+                    crate::control_channel::botd_request(&mut mutation, &[7; 32]).await;
                 assert_eq!(request["command"], "core-restart");
                 assert_eq!(request["bot"], "alpha");
                 assert_eq!(request["expect_bot_id"], "101");
@@ -1973,15 +1978,18 @@ mod default_wait_tests {
                 let id = request["operation_id"].as_str().unwrap();
                 assert!(valid_operation_id(id));
                 if state == "failed" {
-                    mutation
-                        .write_all(b"{\"ok\":false,\"error\":\"shard_not_running\"}\n")
+                    session
+                        .write_response(
+                            &mut mutation,
+                            br#"{"ok":false,"error":"shard_not_running"}"#,
+                        )
                         .await
                         .unwrap();
                 }
                 drop(mutation); // The other cases lose the reply after the request arrives.
                 let (mut query, _) = listener.accept().await.unwrap();
-                let frame = read_frame(&mut query, REQUEST_LIMIT).await.unwrap();
-                let request: Value = serde_json::from_slice(&frame).unwrap();
+                let (session, request) =
+                    crate::control_channel::botd_request(&mut query, &[7; 32]).await;
                 assert_eq!(request["command"], "operation");
                 assert_eq!(request["operation_id"], id);
                 assert!(request.get("expect_empty").is_none());
@@ -2000,8 +2008,8 @@ mod default_wait_tests {
                     "shard": 1, "core": 0, "state": state, "terminal_audit": audit,
                     "incarnation": null, "reason": reason
                 }});
-                query
-                    .write_all(format!("{reply}\n").as_bytes())
+                session
+                    .write_response(&mut query, &serde_json::to_vec(&reply).unwrap())
                     .await
                     .unwrap();
             });
@@ -2344,9 +2352,9 @@ mod default_wait_tests {
                 let mut ids = Vec::new();
                 for index in 0..5 {
                     let (mut stream, _) = listener.accept().await.unwrap();
-                    let frame = read_frame(&mut stream, REQUEST_LIMIT).await.unwrap();
-                    let request: Value = serde_json::from_slice(&frame).unwrap();
-                    assert_eq!(request["secret"], json!(vec![7_u8; 32]));
+                    let (session, request) =
+                        crate::control_channel::botd_request(&mut stream, &[7; 32]).await;
+                    assert!(request.get("secret").is_none());
                     let reply = if index == 0 {
                         assert_eq!(request["command"], "ps");
                         assert!(request.get("expect_bot_id").is_none());
@@ -2379,9 +2387,10 @@ mod default_wait_tests {
                             "state": state, "elapsed_ms": 0, "shards": [], "failed_shards": []
                         }})
                     };
-                    let mut frame = serde_json::to_vec(&reply).unwrap();
-                    frame.push(b'\n');
-                    stream.write_all(&frame).await.unwrap();
+                    session
+                        .write_response(&mut stream, &serde_json::to_vec(&reply).unwrap())
+                        .await
+                        .unwrap();
                 }
                 assert_ne!(ids[0], ids[1]);
             });
@@ -2433,8 +2442,8 @@ mod default_wait_tests {
             let mut operation_id = String::new();
             for command in ["inspect", "restart", "operation"] {
                 let (mut stream, _) = listener.accept().await.unwrap();
-                let frame = read_frame(&mut stream, REQUEST_LIMIT).await.unwrap();
-                let request: Value = serde_json::from_slice(&frame).unwrap();
+                let (session, request) =
+                    crate::control_channel::botd_request(&mut stream, &[8; 32]).await;
                 assert_eq!(request["command"], command);
                 let reply = if command == "inspect" {
                     assert!(request.get("expect_total_shards").is_none());
@@ -2455,9 +2464,10 @@ mod default_wait_tests {
                         "elapsed_ms": 0, "shards": [], "failed_shards": []
                     }})
                 };
-                let mut frame = serde_json::to_vec(&reply).unwrap();
-                frame.push(b'\n');
-                stream.write_all(&frame).await.unwrap();
+                session
+                    .write_response(&mut stream, &serde_json::to_vec(&reply).unwrap())
+                    .await
+                    .unwrap();
             }
         });
         let result = timeout_at(
@@ -2516,13 +2526,13 @@ mod default_wait_tests {
             let deadline = Instant::now() + Duration::from_secs(3);
             let server = tokio::spawn(async move {
                 let (mut stream, _) = listener.accept().await.unwrap();
-                let frame = read_frame(&mut stream, REQUEST_LIMIT).await.unwrap();
-                let request: Value = serde_json::from_slice(&frame).unwrap();
+                let (session, request) =
+                    crate::control_channel::botd_request(&mut stream, &[8; 32]).await;
                 assert_eq!(request["command"], "gateway-update");
                 if let Some(error) = rejection {
                     let reply = json!({"ok": false, "error": error});
-                    stream
-                        .write_all(format!("{reply}\n").as_bytes())
+                    session
+                        .write_response(&mut stream, &serde_json::to_vec(&reply).unwrap())
                         .await
                         .unwrap();
                 }

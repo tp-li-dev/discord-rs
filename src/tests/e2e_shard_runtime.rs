@@ -1,6 +1,9 @@
 //! Real botd -> real src Gateway -> real Worker processes, without Discord.
 //! The collector and REST endpoint are loopback-only testkit fixtures. These
 //! tests do not establish distributed ownership, live Discord or TLS guarantees.
+#[path = "fixtures/control_channel.rs"]
+mod control_channel;
+
 use serde_json::{Value, json};
 use src::{
     placement::Config,
@@ -10,8 +13,7 @@ use src::{
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     future::Future,
-    io::{BufRead, Write},
-    net::{SocketAddr, TcpStream as BlockingStream},
+    io::Write,
     path::{Path, PathBuf},
     process::Stdio,
     sync::atomic::{AtomicU64, Ordering},
@@ -19,7 +21,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    net::{TcpListener, TcpStream, tcp::OwnedReadHalf, tcp::OwnedWriteHalf},
+    net::{TcpListener, tcp::OwnedReadHalf, tcp::OwnedWriteHalf},
     process::Child,
 };
 
@@ -302,23 +304,10 @@ impl Fixture {
         }
     }
 
-    async fn request(&self, mut request: Value) -> Value {
-        request["secret"] = json!(SECRET.to_vec());
-        let mut stream = bounded(TcpStream::connect(("127.0.0.1", self.port)))
+    async fn request(&self, request: Value) -> Value {
+        let bytes = bounded(control_channel::request(self.port, &SECRET, &request))
             .await
             .unwrap();
-        let mut bytes = serde_json::to_vec(&request).unwrap();
-        bytes.push(b'\n');
-        bounded(stream.write_all(&bytes)).await.unwrap();
-        let mut bytes = Vec::new();
-        bounded(
-            BufReader::new(stream)
-                .take(64 * 1024 + 1)
-                .read_until(b'\n', &mut bytes),
-        )
-        .await
-        .unwrap();
-        assert!(bytes.len() <= 64 * 1024);
         check_no_credentials(&bytes);
         serde_json::from_slice(&bytes).expect("authenticated botd response")
     }
@@ -492,22 +481,8 @@ impl Drop for Fixture {
     }
 }
 
-fn blocking_request(port: u16, mut request: Value) -> Option<Value> {
-    let address: SocketAddr = ([127, 0, 0, 1], port).into();
-    let mut stream = BlockingStream::connect_timeout(&address, Duration::from_millis(500)).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(1))).ok()?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(1)))
-        .ok()?;
-    request["secret"] = json!(SECRET.to_vec());
-    let mut bytes = serde_json::to_vec(&request).ok()?;
-    bytes.push(b'\n');
-    stream.write_all(&bytes).ok()?;
-    let mut response = Vec::new();
-    std::io::BufReader::new(stream)
-        .read_until(b'\n', &mut response)
-        .ok()?;
-    serde_json::from_slice(&response).ok()
+fn blocking_request(port: u16, request: Value) -> Option<Value> {
+    control_channel::blocking_request(port, &SECRET, &request)
 }
 
 fn succeeded(result: &Value) {

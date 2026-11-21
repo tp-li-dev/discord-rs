@@ -7,6 +7,9 @@
 //! the Gateway stays; stopping botd stops Gateway and Cores with nothing left behind.
 #![cfg(unix)]
 
+#[path = "fixtures/control_channel.rs"]
+mod control_channel;
+
 use serde_json::{Value, json};
 use std::{
     ffi::OsStr,
@@ -327,22 +330,10 @@ async fn control(port: u16, value: Value) -> Value {
     panic!("audit replay still pending after 200 attempts on test daemon port {port}");
 }
 
-async fn control_once(port: u16, mut value: Value) -> Value {
-    value["secret"] = json!(SECRET);
-    let mut stream = bounded(tokio::net::TcpStream::connect(("127.0.0.1", port)))
+async fn control_once(port: u16, value: Value) -> Value {
+    let reply = bounded(control_channel::request(port, &SECRET, &value))
         .await
-        .unwrap();
-    let mut bytes = serde_json::to_vec(&value).unwrap();
-    bytes.push(b'\n');
-    bounded(stream.write_all(&bytes)).await.unwrap();
-    let mut reply = Vec::new();
-    bounded(BufReader::new(stream).read_until(b'\n', &mut reply))
-        .await
-        .unwrap();
-    assert!(
-        !reply.is_empty(),
-        "test daemon on port {port} closed the control connection without a response"
-    );
+        .expect("authenticated control reply");
     serde_json::from_slice(&reply).expect("daemon response")
 }
 
@@ -1351,15 +1342,10 @@ async fn botctl_core_recovery_refuses_a_daemon_without_preview() {
     let port = listener.local_addr().unwrap().port();
     let server = async {
         let (mut stream, _) = listener.accept().await.unwrap();
-        let mut line = Vec::new();
-        BufReader::new(&mut stream)
-            .read_until(b'\n', &mut line)
-            .await
-            .unwrap();
-        let request: Value = serde_json::from_slice(&line).unwrap();
+        let (_, request) = control_channel::botd_request(&mut stream, &SECRET).await;
         assert_eq!(request["command"], "core-preview");
         assert_eq!(request["shard"], 0);
-        // Older botd closes the session for an invalid command.
+        // This authenticated peer closes the session for an unsupported command.
         drop(stream);
     };
     let (output, ()) = bounded(async {
@@ -1413,11 +1399,8 @@ async fn botctl_core_recovery_prints_the_operation_id_before_the_mutation_reply(
     .unwrap();
     let mut stderr = BufReader::new(child.stderr.take().unwrap());
     bounded(async {
-        let (stream, _) = listener.accept().await.unwrap();
-        let mut stream = BufReader::new(stream);
-        let mut line = String::new();
-        stream.read_line(&mut line).await.unwrap();
-        let preview: Value = serde_json::from_str(&line).unwrap();
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let (session, preview) = control_channel::botd_request(&mut stream, &SECRET).await;
         assert_eq!(preview["command"], "core-preview");
         let reply = json!({"ok": true, "bot_id": "101", "total_shards": 1, "shard": 0,
             "cores": [
@@ -1425,13 +1408,11 @@ async fn botctl_core_recovery_prints_the_operation_id_before_the_mutation_reply(
                 {"running": false, "empty": true, "incarnation": null, "status": null},
             ]
         });
-        stream.get_mut().write_all(format!("{reply}\n").as_bytes()).await.unwrap();
+        session.write_response(&mut stream, &serde_json::to_vec(&reply).unwrap()).await.unwrap();
 
-        let (stream, _) = listener.accept().await.unwrap();
-        let mut stream = BufReader::new(stream);
-        line.clear();
-        stream.read_line(&mut line).await.unwrap();
-        let mutation: Value = serde_json::from_str(&line).unwrap();
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let (session, mutation) = control_channel::botd_request(&mut stream, &SECRET).await;
+        let mut line = String::new();
         assert_eq!(mutation["command"], "core-restart");
         let id = mutation["operation_id"].as_str().unwrap();
         assert_eq!(id.len(), 32);
@@ -1443,7 +1424,7 @@ async fn botctl_core_recovery_prints_the_operation_id_before_the_mutation_reply(
                 break;
             }
         }
-        stream.get_mut().write_all(b"{\"ok\":false,\"error\":\"incarnation_mismatch\",\"rejected\":true}\n").await.unwrap();
+        session.write_response(&mut stream, br#"{"ok":false,"error":"incarnation_mismatch","rejected":true}"#).await.unwrap();
         let output = child.wait_with_output().await.unwrap();
         assert_eq!(output.status.code(), Some(1));
         let result: Value = serde_json::from_slice(&output.stdout).unwrap();

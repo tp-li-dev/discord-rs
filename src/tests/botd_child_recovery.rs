@@ -1,13 +1,15 @@
 //! Owned-process fault injection through real botd/Gateway/Core executables.
 //! Discord is the explicit loopback simulator: these tests do not establish
 //! live Discord, persistent Identify budgets, or distributed lease guarantees.
+#[path = "fixtures/control_channel.rs"]
+mod control_channel;
+
 use serde_json::{Value, json};
 use src::testkit::{MockDiscord, MockReply};
 use std::{
     collections::BTreeSet,
     future::Future,
-    io::{BufRead, Write},
-    net::{SocketAddr, TcpStream as BlockingStream},
+    io::Write,
     path::{Path, PathBuf},
     process::Stdio,
     sync::atomic::{AtomicU64, Ordering},
@@ -15,7 +17,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    net::{TcpListener, TcpStream, tcp::OwnedReadHalf, tcp::OwnedWriteHalf},
+    net::{TcpListener, tcp::OwnedReadHalf, tcp::OwnedWriteHalf},
     process::Child,
 };
 
@@ -404,45 +406,16 @@ impl Drop for Fixture {
     }
 }
 
-async fn request(port: u16, mut value: Value) -> Value {
-    value["secret"] = json!(SECRET);
-    let mut stream = bounded(TcpStream::connect(("127.0.0.1", port)))
+async fn request(port: u16, value: Value) -> Value {
+    let bytes = bounded(control_channel::request(port, &SECRET, &value))
         .await
         .unwrap();
-    let mut bytes = serde_json::to_vec(&value).unwrap();
-    bytes.push(b'\n');
-    bounded(stream.write_all(&bytes)).await.unwrap();
-    let mut bytes = Vec::new();
-    bounded(
-        BufReader::new(stream)
-            .take(64 * 1024 + 1)
-            .read_until(b'\n', &mut bytes),
-    )
-    .await
-    .unwrap();
-    assert!(bytes.len() <= 64 * 1024);
     no_secrets(&bytes);
     serde_json::from_slice(&bytes).expect("authenticated daemon response")
 }
 
-fn blocking_request(port: u16, mut value: Value) -> Option<Value> {
-    let address: SocketAddr = ([127, 0, 0, 1], port).into();
-    let mut stream = BlockingStream::connect_timeout(&address, Duration::from_millis(300)).ok()?;
-    stream
-        .set_read_timeout(Some(Duration::from_millis(500)))
-        .ok()?;
-    stream
-        .set_write_timeout(Some(Duration::from_millis(500)))
-        .ok()?;
-    value["secret"] = json!(SECRET);
-    let mut bytes = serde_json::to_vec(&value).ok()?;
-    bytes.push(b'\n');
-    stream.write_all(&bytes).ok()?;
-    let mut bytes = Vec::new();
-    std::io::BufReader::new(stream)
-        .read_until(b'\n', &mut bytes)
-        .ok()?;
-    serde_json::from_slice(&bytes).ok()
+fn blocking_request(port: u16, value: Value) -> Option<Value> {
+    control_channel::blocking_request(port, &SECRET, &value)
 }
 
 fn row<'a>(status: &'a Value, bot: &str, shard: u32) -> &'a Value {

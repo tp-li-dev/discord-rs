@@ -1,6 +1,8 @@
+#[path = "fixtures/control_channel.rs"]
+mod control_channel;
+
 use src::placement::{Config, PlacementError};
 use std::{
-    io::{BufRead, BufReader, Write},
     net::TcpListener,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -82,24 +84,19 @@ fn management_reply_errors_and_log_display_are_masked() {
     let dir = directory("redaction-test");
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
+    let admin = "ab".repeat(32); // Synthetic endpoint credential.
+    let viewer = "12".repeat(32);
     std::fs::write(
         dir.join("core.json"),
-        serde_json::to_vec(&serde_json::json!({"port":port,"secret":"fake-auth-capability"}))
-            .unwrap(),
+        serde_json::to_vec(&serde_json::json!({"port":port,"secret":admin})).unwrap(),
     )
     .unwrap();
     let server = std::thread::spawn(move || {
         for ok in [true, false] {
-            let (mut socket, _) = listener.accept().unwrap();
-            socket.set_read_timeout(Some(DEADLINE)).unwrap();
-            socket.set_write_timeout(Some(DEADLINE)).unwrap();
-            let mut line = String::new();
-            BufReader::new(socket.try_clone().unwrap())
-                .read_line(&mut line)
-                .unwrap();
-            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
-            assert_eq!(request["secret"], "fake-auth-capability");
-            writeln!(socket, "{}", serde_json::json!({"ok":ok,"message":"request /webhooks/123/fake-url-capability failed Authorization: Bearer fake-header-capability"})).unwrap();
+            let (socket, _) = listener.accept().unwrap();
+            let mut peer = control_channel::BlockingPeer::manage(socket, &admin, &viewer).unwrap();
+            assert_eq!(peer.read()["command"], "status");
+            peer.reply(&serde_json::json!({"ok":ok,"message":"request /webhooks/123/fake-url-capability failed Authorization: Bearer fake-header-capability"}));
         }
     });
     for success in [true, false] {

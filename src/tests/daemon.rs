@@ -1,3 +1,6 @@
+#[path = "fixtures/control_channel.rs"]
+mod control_channel;
+
 use src::{
     daemon::*,
     local_identify::LocalIdentifyPolicy,
@@ -15,7 +18,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 #[derive(Clone, Default)]
 struct ManualClock(Arc<Mutex<Duration>>);
@@ -1305,25 +1308,26 @@ async fn botd_binary_bootstraps_authenticated_read_only_local_status() {
         ([4; 32], "status", false),
         (secret, "stop", false),
     ] {
-        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .unwrap();
-        let mut request =
-            serde_json::json!({"secret": supplied.to_vec(), "command": command}).to_string();
-        request.push('\n');
-        stream.write_all(request.as_bytes()).await.unwrap();
-        stream.shutdown().await.unwrap();
-        let mut response = Vec::new();
-        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
-            .await
-            .unwrap()
-            .unwrap();
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            control_channel::request(port, &supplied, &serde_json::json!({"command": command})),
+        )
+        .await
+        .unwrap();
         if permitted {
-            let response: serde_json::Value = serde_json::from_slice(&response).unwrap();
+            let response: serde_json::Value = serde_json::from_slice(&response.unwrap()).unwrap();
             assert_eq!(response["status"]["processes"], serde_json::json!([]));
             assert_eq!(response["status"]["monitor_ok"], true);
         } else {
-            assert!(response.is_empty());
+            let kind = response.unwrap_err().kind();
+            if supplied == secret {
+                assert!(matches!(
+                    kind,
+                    std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+                ));
+            } else {
+                assert_eq!(kind, std::io::ErrorKind::PermissionDenied);
+            }
         }
     }
     child.kill().await.unwrap();
@@ -1383,18 +1387,13 @@ fn main() {
 }
 
 async fn live_status(port: u16, secret: [u8; 32]) -> serde_json::Value {
-    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
-        .await
-        .unwrap();
-    let mut request =
-        serde_json::json!({"secret": secret.to_vec(), "command": "status"}).to_string();
-    request.push('\n');
-    stream.write_all(request.as_bytes()).await.unwrap();
-    let mut reply = Vec::new();
-    tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut reply))
-        .await
-        .unwrap()
-        .unwrap();
+    let reply = tokio::time::timeout(
+        Duration::from_secs(5),
+        control_channel::request(port, &secret, &serde_json::json!({"command":"status"})),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     serde_json::from_slice(&reply).unwrap()
 }
 

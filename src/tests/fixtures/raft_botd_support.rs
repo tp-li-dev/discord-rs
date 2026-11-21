@@ -1,4 +1,7 @@
 //! Real botd/Raft process fixture. Both health and Raft RPC proxies preserve TLS.
+#[path = "control_channel.rs"]
+mod control_channel;
+
 // Reuse the established collector, credential checks and continuous PID monitor;
 // its ACK-only process launcher is deliberately unused by this fixture.
 #[allow(dead_code)]
@@ -277,30 +280,18 @@ impl Cluster {
         let _ = sender.await;
     }
 
-    pub async fn request(&self, id: u64, mut value: Value) -> Value {
+    pub async fn request(&self, id: u64, request: Value) -> Value {
         self.monitor.check();
-        value["secret"] = json!(SECRET.to_vec());
-        let mut bytes = serde_json::to_vec(&value).unwrap();
-        bytes.push(b'\n');
-        let value = tokio::time::timeout(WAIT, async {
-            let mut stream = TcpStream::connect(("127.0.0.1", self.nodes[&id].port))
-                .await
-                .unwrap();
-            stream.write_all(&bytes).await.unwrap();
-            let mut bytes = Vec::new();
-            BufReader::new(stream)
-                .take(FRAME_LIMIT + 1)
-                .read_until(b'\n', &mut bytes)
-                .await
-                .unwrap();
-            assert!(bytes.len() as u64 <= FRAME_LIMIT);
-            no_secrets(&bytes);
-            serde_json::from_slice(&bytes).expect("authenticated Raft botd JSON response")
-        })
+        let bytes = tokio::time::timeout(
+            WAIT,
+            control_channel::request(self.nodes[&id].port, &SECRET, &request),
+        )
         .await
+        .unwrap()
         .unwrap();
+        no_secrets(&bytes);
         self.monitor.check();
-        value
+        serde_json::from_slice(&bytes).expect("authenticated Raft botd JSON response")
     }
 
     pub async fn isolate_rpc(&self, id: u64, isolated: bool) {

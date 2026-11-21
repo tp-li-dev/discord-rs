@@ -1,6 +1,5 @@
 use serde_json::{Value, json};
 use src::{
-    local_control::DaemonControlEnvelope,
     rbac_audit::{AuditConfig, AuditError, AuditedExecutor, Denial, ExecuteError, Principal},
     update_rollback::{Action, UpdateControlRequest},
 };
@@ -333,57 +332,48 @@ fn malformed_manifest_is_denied_before_the_execution_closure() {
 #[test]
 fn strict_wire_contract_rejects_injected_identity_unknown_and_duplicate_fields() {
     for action in [Action::Update, Action::Rollback] {
-        let mut wire = serde_json::to_value(request(action)).unwrap();
-        // A fixed synthetic control capability, never used with a live daemon.
-        wire["secret"] = json!(vec![7_u8; 32]);
+        let wire = serde_json::to_value(request(action)).unwrap();
         let valid = serde_json::to_string(&wire).unwrap();
-        let decoded: DaemonControlEnvelope<UpdateControlRequest> =
-            serde_json::from_str(&valid).unwrap();
-        assert_eq!(decoded.secret, [7; 32]);
-        decoded.request.validate().unwrap();
+        let decoded: UpdateControlRequest = serde_json::from_str(&valid).unwrap();
+        decoded.validate().unwrap();
 
         for (key, value) in [
             ("role", json!("admin")),
             ("subject", json!("operator-one")),
             ("authenticated", json!(true)),
             ("unknown", json!(true)),
+            ("secret", json!(vec![7_u8; 32])),
         ] {
             let mut injected = wire.clone();
             injected[key] = value;
             assert!(
-                serde_json::from_value::<DaemonControlEnvelope<UpdateControlRequest>>(injected)
-                    .is_err(),
+                serde_json::from_value::<UpdateControlRequest>(injected).is_err(),
                 "injected field {key} must be rejected"
             );
         }
 
         let mut nested_unknown = wire.clone();
         nested_unknown["manifest"]["role"] = json!("admin");
-        assert!(
-            serde_json::from_value::<DaemonControlEnvelope<UpdateControlRequest>>(nested_unknown)
-                .is_err()
-        );
+        assert!(serde_json::from_value::<UpdateControlRequest>(nested_unknown).is_err());
 
         for (key, value) in [
-            ("secret", json!(vec![7_u8; 32])),
+            ("operation_id", wire["operation_id"].clone()),
             ("command", json!(action)),
             ("yes", json!(true)),
             ("manifest", wire["manifest"].clone()),
         ] {
             let duplicate = format!("{{\"{key}\":{value},{}", &valid[1..]);
             assert!(
-                serde_json::from_str::<DaemonControlEnvelope<UpdateControlRequest>>(&duplicate)
-                    .is_err(),
+                serde_json::from_str::<UpdateControlRequest>(&duplicate).is_err(),
                 "duplicate field {key} must be rejected"
             );
         }
 
-        for key in ["secret", "yes", "operation_id", "manifest"] {
+        for key in ["command", "yes", "operation_id", "manifest"] {
             let mut missing = wire.clone();
             missing.as_object_mut().unwrap().remove(key);
             assert!(
-                serde_json::from_value::<DaemonControlEnvelope<UpdateControlRequest>>(missing)
-                    .is_err(),
+                serde_json::from_value::<UpdateControlRequest>(missing).is_err(),
                 "missing field {key} must be rejected"
             );
         }

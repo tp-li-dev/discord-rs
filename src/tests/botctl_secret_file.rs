@@ -308,3 +308,160 @@ async fn botd_refuses_unsafe_secret_files_and_conflicting_options() {
         assert!(!String::from_utf8_lossy(&output.stderr).contains(&hex));
     }
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn unix_socket_is_private_and_connects_real_cli() {
+    use std::os::unix::fs::{DirBuilderExt, symlink};
+
+    struct PrivateDir(PathBuf);
+    impl Drop for PrivateDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    let base = PathBuf::from(format!("/tmp/drs-ctl-{}", std::process::id()));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&base)
+        .unwrap();
+    let _cleanup = PrivateDir(base.clone());
+    let socket = base.join("ctl.sock");
+    let secret = base.join("admin.secret");
+    std::fs::write(base.join("placement.toml"), CONFIG).unwrap();
+    generate(&secret).await;
+    let secret = secret.to_str().unwrap();
+    let sock = socket.to_str().unwrap();
+    assert!(sock.len() < 100);
+    let launch = ["--secret-file", secret, "--control-socket", sock];
+    let mut child = botd_command(&base, &launch)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut announcement = String::new();
+    bounded(BufReader::new(child.stdout.take().unwrap()).read_line(&mut announcement))
+        .await
+        .unwrap();
+    let value: Value = serde_json::from_str(&announcement).unwrap();
+    assert_eq!(value["local_only"], true);
+    assert!(value.get("port").is_some_and(Value::is_null));
+    assert_eq!(
+        std::fs::metadata(&socket).unwrap().permissions().mode() & 0o7777,
+        0o600
+    );
+
+    let status = ["status", "--secret-file", secret, "--socket", sock];
+    assert!(botctl(&status).await.status.success());
+    assert!(
+        !botctl(&[&status[..], &["--port", "47321"]].concat())
+            .await
+            .status
+            .success()
+    );
+    assert!(
+        !bounded(
+            botd_command(&base, &[&launch[..], &["--control-port", "47321"]].concat()).output()
+        )
+        .await
+        .unwrap()
+        .status
+        .success()
+    );
+
+    let link = base.join("link.sock");
+    symlink(&socket, &link).unwrap();
+    assert!(
+        !botctl(&[
+            "status",
+            "--secret-file",
+            secret,
+            "--socket",
+            link.to_str().unwrap()
+        ])
+        .await
+        .status
+        .success()
+    );
+    let alias = base.join("alias");
+    symlink(&base, &alias).unwrap();
+    assert!(
+        !botctl(&[
+            "status",
+            "--secret-file",
+            secret,
+            "--socket",
+            alias.join("ctl.sock").to_str().unwrap()
+        ])
+        .await
+        .status
+        .success()
+    );
+    assert!(
+        !bounded(
+            botd_command(
+                &base,
+                &[
+                    "--secret-file",
+                    secret,
+                    "--control-socket",
+                    alias.join("new.sock").to_str().unwrap()
+                ]
+            )
+            .output()
+        )
+        .await
+        .unwrap()
+        .status
+        .success()
+    );
+    assert!(
+        !bounded(botd_command(&base, &launch).output())
+            .await
+            .unwrap()
+            .status
+            .success(),
+        "an existing socket must not be replaced"
+    );
+    assert!(botctl(&status).await.status.success());
+
+    for path in [&socket, &base] {
+        let original = std::fs::metadata(path).unwrap().permissions();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!botctl(&status).await.status.success());
+        std::fs::set_permissions(path, original).unwrap();
+    }
+    let new_socket = base.join("new.sock");
+    std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        !bounded(
+            botd_command(
+                &base,
+                &[
+                    "--secret-file",
+                    secret,
+                    "--control-socket",
+                    new_socket.to_str().unwrap()
+                ]
+            )
+            .output()
+        )
+        .await
+        .unwrap()
+        .status
+        .success()
+    );
+    std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(!new_socket.exists());
+    assert!(botctl(&status).await.status.success());
+
+    let pid = child.id().unwrap() as libc::pid_t;
+    // SAFETY: this test owns the still-running child process.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGINT) }, 0);
+    assert!(bounded(child.wait()).await.unwrap().success());
+    assert!(
+        !socket.exists(),
+        "graceful shutdown should remove its own socket"
+    );
+}

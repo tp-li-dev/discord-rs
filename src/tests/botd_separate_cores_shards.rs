@@ -1,6 +1,9 @@
 //! Process-level two-shard separation with the loopback Discord simulator.
 #![cfg(unix)]
 
+#[path = "fixtures/control_channel.rs"]
+mod control_channel;
+
 use serde_json::{Value, json};
 use std::{
     future::Future,
@@ -215,34 +218,28 @@ async fn control(port: u16, value: Value) -> Value {
     panic!("audit replay did not finish");
 }
 
-async fn control_once(port: u16, mut value: Value) -> Value {
-    value["secret"] = json!(SECRET);
-    let mut stream = bounded(tokio::net::TcpStream::connect(("127.0.0.1", port)))
+async fn control_once(port: u16, value: Value) -> Value {
+    let reply = bounded(control_channel::request(port, &SECRET, &value))
         .await
-        .unwrap();
-    let mut bytes = serde_json::to_vec(&value).unwrap();
-    bytes.push(b'\n');
-    bounded(stream.write_all(&bytes)).await.unwrap();
-    let mut reply = Vec::new();
-    bounded(BufReader::new(stream).read_until(b'\n', &mut reply))
-        .await
-        .unwrap();
+        .expect("authenticated control reply");
     serde_json::from_slice(&reply).expect("daemon response")
 }
 
 /// Like `control`, but an invalid request (rejected before any handler runs) is answered by
 /// closing the connection without a response, which is returned as `None`.
-async fn control_or_closed(port: u16, mut value: Value) -> Option<Value> {
-    value["secret"] = json!(SECRET);
-    let mut stream = bounded(tokio::net::TcpStream::connect(("127.0.0.1", port)))
-        .await
-        .unwrap();
-    let mut bytes = serde_json::to_vec(&value).unwrap();
-    bytes.push(b'\n');
-    bounded(stream.write_all(&bytes)).await.unwrap();
-    let mut reply = Vec::new();
-    let _ = bounded(BufReader::new(stream).read_until(b'\n', &mut reply)).await;
-    serde_json::from_slice(&reply).ok()
+async fn control_or_closed(port: u16, value: Value) -> Option<Value> {
+    match bounded(control_channel::request(port, &SECRET, &value)).await {
+        Ok(reply) => Some(serde_json::from_slice(&reply).expect("daemon response")),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+            ) =>
+        {
+            None
+        }
+        Err(error) => panic!("authenticated request failed: {error}"),
+    }
 }
 
 #[tokio::test]

@@ -21,28 +21,9 @@ use tokio::{
 
 type ErrorBox = Box<dyn Error + Send + Sync>;
 const DEFAULT_PORT: u16 = 39483;
-// Former newline framing is exercised only by the regression test for its bounds.
 #[cfg(test)]
-const MAX_REQUEST_BYTES: usize = 4095;
-
-#[cfg(test)]
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, BufReader};
-
-#[cfg(test)]
-async fn read_frame<R: AsyncBufRead + Unpin>(
-    reader: &mut R,
-    limit: usize,
-) -> std::io::Result<Option<Vec<u8>>> {
-    let mut line = Vec::new();
-    reader
-        .take((limit + 1) as u64)
-        .read_until(b'\n', &mut line)
-        .await?;
-    if line.len() > limit || line.last() != Some(&b'\n') {
-        return Ok(None);
-    }
-    Ok(Some(line))
-}
+#[path = "../../tests/fixtures/control_channel.rs"]
+mod control_channel;
 
 // The private endpoint file has explicit serde; Secret itself remains non-serializable.
 mod secret_wire {
@@ -695,7 +676,7 @@ async fn core(binary: PathBuf) -> Result<(), ErrorBox> {
                 async move {
                     let frame = tokio::time::timeout(
                         Duration::from_secs(3),
-                        session.read_request(&mut stream, management::MANAGE_REQUEST_LIMIT),
+                        session.read_request(&mut stream),
                     )
                     .await;
                     let input = match frame {
@@ -707,6 +688,7 @@ async fn core(binary: PathBuf) -> Result<(), ErrorBox> {
                         return;
                     };
                     let role = if index == 0 { "admin" } else { "viewer" };
+                    // Retain the authenticated slot until the owner is done replying.
                     let (done, completed) = oneshot::channel();
                     if requests_tx
                         .try_send((input, role, stream, session, done))
@@ -1199,7 +1181,6 @@ mod request_tests {
 
     #[test]
     fn subprocess_management_reply_and_json_errors_never_echo_wire_text() {
-        use std::io::{BufRead, Write};
         let directory = env::temp_dir().join(format!(
             "manage-output-{}-{}",
             std::process::id(),
@@ -1208,24 +1189,20 @@ mod request_tests {
         std::fs::create_dir(&directory).unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
+        let admin = "9a".repeat(32);
+        let viewer = "38".repeat(32);
         std::fs::write(
             directory.join("core.json"),
-            serde_json::to_vec(&serde_json::json!({"port":port,"secret":FIXTURE})).unwrap(),
+            serde_json::to_vec(&serde_json::json!({"port":port,"secret":admin})).unwrap(),
         )
         .unwrap();
         let server = std::thread::spawn(move || {
             for ok in [true, false] {
-                let (mut socket, _) = listener.accept().unwrap();
-                socket
-                    .set_read_timeout(Some(Duration::from_secs(10)))
-                    .unwrap();
-                let mut input = String::new();
-                std::io::BufReader::new(socket.try_clone().unwrap())
-                    .read_line(&mut input)
-                    .unwrap();
-                let value: serde_json::Value = serde_json::from_str(&input).unwrap();
-                assert_eq!(value["secret"], FIXTURE);
-                writeln!(socket, "{}", serde_json::json!({"ok":ok,"message":FIXTURE})).unwrap();
+                let (socket, _) = listener.accept().unwrap();
+                let mut peer =
+                    crate::control_channel::BlockingPeer::manage(socket, &admin, &viewer).unwrap();
+                assert_eq!(peer.read()["command"], "status");
+                peer.reply(&serde_json::json!({"ok":ok,"message":FIXTURE}));
             }
         });
         for success in [true, false] {
@@ -1261,28 +1238,51 @@ mod request_tests {
 
     #[tokio::test]
     async fn request_frame_limits_and_termination() {
-        let valid = vec![b'x'; MAX_REQUEST_BYTES - 1]
-            .into_iter()
-            .chain(*b"\n")
-            .collect::<Vec<_>>();
-        assert_eq!(
-            read_frame(&mut BufReader::new(valid.as_slice()), MAX_REQUEST_BYTES)
-                .await
-                .unwrap(),
-            Some(valid)
-        );
-        let oversized = vec![b'x'; MAX_REQUEST_BYTES + 100];
-        assert!(
-            read_frame(&mut BufReader::new(oversized.as_slice()), MAX_REQUEST_BYTES)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            read_frame(&mut BufReader::new(&b"unfinished"[..]), MAX_REQUEST_BYTES)
-                .await
-                .unwrap()
-                .is_none()
-        );
+        use std::io::ErrorKind;
+        for (size, expected) in [
+            (management::MANAGE_REQUEST_LIMIT, None),
+            (
+                management::MANAGE_REQUEST_LIMIT + 1,
+                Some(ErrorKind::InvalidData),
+            ),
+            (1, Some(ErrorKind::UnexpectedEof)),
+        ] {
+            let (mut client, mut server) = tokio::io::duplex(8192);
+            let sender = async {
+                let key = Key::from_legacy_secret(&"de".repeat(32)).unwrap();
+                let session = management::authenticate_client(&mut client, Protocol::Manage, key)
+                    .await
+                    .unwrap();
+                if expected.is_none() {
+                    session
+                        .write_request(&mut client, &vec![b'x'; size])
+                        .await
+                        .unwrap();
+                } else {
+                    client
+                        .write_all(&(size as u32).to_be_bytes())
+                        .await
+                        .unwrap();
+                }
+                client.shutdown().await.unwrap();
+            };
+            let receiver = async {
+                let keys = [
+                    Key::from_legacy_secret(&"de".repeat(32)).unwrap(),
+                    Key::from_legacy_secret(&"47".repeat(32)).unwrap(),
+                ];
+                let (session, role) =
+                    management::authenticate_server(&mut server, Protocol::Manage, &keys)
+                        .await
+                        .unwrap();
+                assert_eq!(role, 0);
+                session.read_request(&mut server).await
+            };
+            let ((), result) = tokio::join!(sender, receiver);
+            match expected {
+                None => assert_eq!(result.unwrap().len(), size),
+                Some(kind) => assert_eq!(result.unwrap_err().kind(), kind),
+            }
+        }
     }
 }

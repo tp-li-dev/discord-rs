@@ -1,5 +1,8 @@
 //! Authenticated botctl ↔ botd process integration, using a test-only Gateway.
 //! This proves local process control, not Discord readiness or distributed leases.
+#[path = "fixtures/control_channel.rs"]
+mod control_channel;
+
 use serde_json::{Value, json};
 use src::{
     placement::Config,
@@ -217,9 +220,8 @@ impl DaemonFixture {
         }
     }
 
-    async fn raw(&self, mut request: Value) -> Value {
-        request["secret"] = json!(SECRET.to_vec());
-        let reply = raw(self.port, request).await;
+    async fn raw(&self, request: Value) -> Value {
+        let reply = raw(self.port, &SECRET, &request).await.unwrap();
         serde_json::from_slice(&reply).expect("authenticated response")
     }
 
@@ -351,18 +353,8 @@ fn succeeded(value: &Value) {
     assert!(!value["operation"]["shards"].as_array().unwrap().is_empty());
 }
 
-async fn raw(port: u16, value: Value) -> Vec<u8> {
-    bounded(async {
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        let mut request = value.to_string();
-        request.push('\n');
-        stream.write_all(request.as_bytes()).await.unwrap();
-        stream.shutdown().await.unwrap();
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response).await.unwrap();
-        response
-    })
-    .await
+async fn raw(port: u16, key: &[u8; 32], value: &Value) -> std::io::Result<Vec<u8>> {
+    bounded(control_channel::request(port, key, value)).await
 }
 
 #[tokio::test]
@@ -656,13 +648,52 @@ async fn failed_spawn_and_abnormal_graceful_exit_are_not_success() {
 async fn wrong_authentication_cannot_read_or_mutate_daemon() {
     let fixture = DaemonFixture::new().await;
     parse_output(cli(fixture.port, [20; 32], &["status"]).await, false);
-    let reply = raw(fixture.port, json!({"secret":vec![20;32], "command":"start", "bot":BETA, "operation_id":"44444444444444444444444444444444"})).await;
-    assert!(reply.is_empty());
+    let denied = raw(
+        fixture.port,
+        &[20; 32],
+        &json!({"command":"start", "bot":BETA,
+        "operation_id":"44444444444444444444444444444444"}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
     assert!(
         processes(&fixture.status().await)
             .iter()
             .all(|p| p["identity"].is_null())
     );
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn botd_admits_status_while_more_than_32_idle_clients_hold_sockets() {
+    let fixture = DaemonFixture::new().await;
+    let mut held = Vec::new();
+    for _ in 0..40 {
+        held.push(
+            bounded(TcpStream::connect(("127.0.0.1", fixture.port)))
+                .await
+                .unwrap(),
+        );
+    }
+    // The oldest connection is evicted before its initial-frame deadline.
+    let mut byte = [0; 1];
+    let closed = tokio::time::timeout(Duration::from_millis(900), held[0].read(&mut byte))
+        .await
+        .expect("oldest incomplete connection was not evicted");
+    assert!(matches!(closed, Ok(0) | Err(_)));
+    let response = tokio::time::timeout(
+        Duration::from_millis(900),
+        control_channel::request(fixture.port, &SECRET, &json!({"command":"status"})),
+    )
+    .await
+    .expect("idle clients delayed authenticated status")
+    .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&response).unwrap()["ok"],
+        true
+    );
+    drop(held);
     fixture.cleanup().await;
 }
 

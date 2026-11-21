@@ -1,3 +1,6 @@
+#[path = "fixtures/control_channel.rs"]
+mod control_channel;
+
 use std::{
     path::{Path, PathBuf},
     process::Stdio,
@@ -93,20 +96,30 @@ async fn remove_runtime(runtime: &Path) {
     .expect("fixture cleanup deadline");
 }
 
-async fn raw_request(port: u16, request: serde_json::Value) -> Vec<u8> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
-        .await
-        .unwrap();
-    let mut frame = serde_json::to_vec(&request).unwrap();
-    frame.push(b'\n');
-    stream.write_all(&frame).await.unwrap();
-    let mut response = Vec::new();
-    tokio::time::timeout(DEADLINE, stream.read_to_end(&mut response))
-        .await
-        .unwrap()
-        .unwrap();
-    response
+async fn raw_request(port: u16, secret: &str, request: serde_json::Value) -> Vec<u8> {
+    use src::management::{self, Key, Protocol};
+    let mut stream = management::connect_tcp(port).await.unwrap();
+    let key = Key::from_legacy_secret(secret).unwrap();
+    match tokio::time::timeout(
+        DEADLINE,
+        control_channel::exchange(&mut stream, Protocol::Manage, key, &request),
+    )
+    .await
+    .unwrap()
+    {
+        Ok(response) => response,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            Vec::new()
+        }
+        Err(error) => panic!("management request failed: {error}"),
+    }
 }
 
 async fn cli(runtime: &std::path::Path, port: u16, command: &str) -> std::process::Output {
@@ -190,7 +203,7 @@ async fn independent_commands_manage_a_persistent_core() {
         closed = tokio::io::AsyncReadExt::read(&mut idle, &mut byte) => {
             panic!("idle client closed before authenticated status completed: {:?}", closed.map_err(|e| e.kind()));
         }
-        response = raw_request(port, serde_json::json!({"secret":admin["secret"],"command":"status"})) => response,
+        response = raw_request(port, admin["secret"].as_str().unwrap(), serde_json::json!({"command":"status"})) => response,
     };
     let response: serde_json::Value = serde_json::from_slice(&response).unwrap();
     assert_eq!(response["ok"], true);
@@ -202,16 +215,18 @@ async fn independent_commands_manage_a_persistent_core() {
     );
     drop(idle);
     assert_ne!(viewer["secret"], admin["secret"]);
-    let viewer_request =
-        |command: &str| serde_json::json!({"secret": viewer["secret"], "command": command});
+    let viewer_key = viewer["secret"].as_str().unwrap();
+    let viewer_request = |command: &str| serde_json::json!({"command": command});
     let response: serde_json::Value =
-        serde_json::from_slice(&raw_request(port, viewer_request("status")).await).unwrap();
+        serde_json::from_slice(&raw_request(port, viewer_key, viewer_request("status")).await)
+            .unwrap();
     assert_eq!(response["ok"], true);
     let response: serde_json::Value =
-        serde_json::from_slice(&raw_request(port, viewer_request("stop")).await).unwrap();
+        serde_json::from_slice(&raw_request(port, viewer_key, viewer_request("stop")).await)
+            .unwrap();
     assert_eq!(response["ok"], false);
-    let spoof = serde_json::json!({"secret": viewer["secret"], "command": "stop", "role": "admin"});
-    let response = raw_request(port, spoof).await;
+    let spoof = serde_json::json!({"command": "stop", "role": "admin"});
+    let response = raw_request(port, viewer_key, spoof).await;
     assert!(
         response.is_empty()
             || serde_json::from_slice::<serde_json::Value>(&response).unwrap()["ok"] == false
@@ -219,7 +234,8 @@ async fn independent_commands_manage_a_persistent_core() {
     assert!(
         raw_request(
             port,
-            serde_json::json!({"secret": "invalid-credential", "command": "status"})
+            &"ac".repeat(32),
+            serde_json::json!({"command": "status"})
         )
         .await
         .is_empty()
@@ -247,8 +263,18 @@ async fn independent_commands_manage_a_persistent_core() {
                 .unwrap(),
         );
     }
-    // Observe a reader being rejected or timing out before releasing the pool.
-    // Sleeping for 3.3 seconds assumed all readers had already been scheduled.
+    // Hold all the sockets open while authenticating through the separate pool.
+    let response = raw_request(
+        port,
+        admin["secret"].as_str().unwrap(),
+        serde_json::json!({"command":"status"}),
+    )
+    .await;
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&response).unwrap()["ok"],
+        true
+    );
+    // Observe eviction or expiry before releasing the sockets.
     let mut byte = [0; 1];
     let closed = tokio::time::timeout(
         DEADLINE,

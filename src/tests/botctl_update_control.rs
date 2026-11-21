@@ -1,8 +1,12 @@
 //! Client/contract tests using a mock daemon, never a deployment or Discord.
+#[path = "fixtures/control_channel.rs"]
+mod control_channel;
+
+use control_channel::BlockingPeer;
 use serde_json::{Value, json};
-use src::{local_control::DaemonControlEnvelope, update_rollback::UpdateControlRequest};
+use src::update_rollback::UpdateControlRequest;
 use std::{
-    io::{BufRead, BufReader, Read, Write},
+    io::{Read, Write},
     net::{Ipv4Addr, TcpListener, TcpStream},
     path::PathBuf,
     process::{Command, Output, Stdio},
@@ -10,7 +14,6 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use subtle::ConstantTimeEq;
 
 const CAPABILITY: [u8; 32] = [41; 32];
 const ID: &str = "0123456789abcdef0123456789abcdef";
@@ -123,7 +126,7 @@ fn listener() -> TcpListener {
     listener.set_nonblocking(true).unwrap();
     listener
 }
-fn accept(listener: &TcpListener) -> TcpStream {
+fn accept_raw(listener: &TcpListener) -> TcpStream {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         match listener.accept() {
@@ -141,27 +144,23 @@ fn accept(listener: &TcpListener) -> TcpStream {
         }
     }
 }
-fn read(stream: &mut TcpStream) -> Value {
-    let mut bytes = Vec::new();
-    BufReader::new(stream)
-        .take(4097)
-        .read_until(b'\n', &mut bytes)
-        .unwrap();
-    assert!(bytes.len() <= 4096 && bytes.last() == Some(&b'\n'));
-    serde_json::from_slice(&bytes).unwrap()
+fn accept(listener: &TcpListener) -> BlockingPeer {
+    BlockingPeer::botd(accept_raw(listener), &CAPABILITY).unwrap()
 }
-fn reply(stream: &mut TcpStream, value: &Value) {
-    writeln!(stream, "{value}").unwrap();
+fn read(stream: &mut BlockingPeer) -> Value {
+    stream.read()
+}
+fn reply(stream: &mut BlockingPeer, value: &Value) {
+    stream.reply(value);
 }
 fn bootstrap(listener: &TcpListener) -> Value {
     json!({"port":listener.local_addr().unwrap().port(),"secret":CAPABILITY})
 }
-fn accept_update(listener: &TcpListener) -> TcpStream {
+fn accept_update(listener: &TcpListener) -> BlockingPeer {
     let mut stream = accept(listener);
     let inspect = read(&mut stream);
     assert_eq!(inspect["command"], "inspect");
     assert_eq!(inspect["bot"], "first");
-    assert_eq!(inspect["secret"], json!(CAPABILITY));
     reply(
         &mut stream,
         &json!({"ok":true,"offline":false,"bot":{"bot_id":"bot-one","total_shards":2}}),
@@ -194,16 +193,13 @@ fn update_and_rollback_use_authenticated_contract_and_poll_without_replay() {
             let server = thread::spawn(move || {
                 let mut stream = accept_update(&listener);
                 let request = read(&mut stream);
-                let wire: DaemonControlEnvelope<UpdateControlRequest> =
-                    serde_json::from_value(request.clone()).unwrap();
-                assert!(bool::from(wire.secret.ct_eq(&CAPABILITY)));
-                wire.request.validate().unwrap();
-                assert_eq!(wire.request.command_name(), command);
-                assert_eq!(wire.request.bot, "bot-one");
-                assert_eq!(wire.request.operation_id, ID);
+                let wire: UpdateControlRequest = serde_json::from_value(request.clone()).unwrap();
+                wire.validate().unwrap();
+                assert_eq!(wire.command_name(), command);
+                assert_eq!(wire.bot, "bot-one");
+                assert_eq!(wire.operation_id, ID);
                 assert!(
-                    wire.request
-                        .manifest
+                    wire.manifest
                         .artifacts
                         .core
                         .as_ref()
@@ -218,7 +214,6 @@ fn update_and_rollback_use_authenticated_contract_and_poll_without_replay() {
                 let query = read(&mut stream);
                 assert_eq!(query["command"], "operation");
                 assert_eq!(query["operation_id"], ID);
-                assert_eq!(query["secret"], json!(CAPABILITY));
                 assert_eq!(query["yes"], false);
                 assert!(query.get("manifest").is_none());
                 assert!(query.get("bot").is_none());
@@ -275,18 +270,19 @@ fn rejected_authentication_and_unsupported_daemon_are_fail_closed() {
         }
         let server = thread::spawn(move || {
             if reject_auth {
-                let mut stream = accept(&listener);
-                let request = read(&mut stream);
-                assert_ne!(request["secret"], json!(CAPABILITY));
+                let error = BlockingPeer::botd(accept_raw(&listener), &CAPABILITY)
+                    .err()
+                    .unwrap();
+                assert!(matches!(
+                    error.kind(),
+                    std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+                ));
                 return;
             }
             let mut stream = accept_update(&listener);
             let request = read(&mut stream);
-            let wire: DaemonControlEnvelope<UpdateControlRequest> =
-                serde_json::from_value(request).unwrap();
-            if !bool::from(wire.secret.ct_eq(&CAPABILITY)) {
-                return;
-            }
+            let wire: UpdateControlRequest = serde_json::from_value(request).unwrap();
+            wire.validate().unwrap();
             reply(
                 &mut stream,
                 &json!({"ok":false,"offline":false,"error":"unsupported command"}),
@@ -412,19 +408,17 @@ fn mock_daemon_binds_server_roles_and_audits_update_and_rollback() {
             let log_for_server = log.clone();
             let server = thread::spawn(move || {
                 let mut stream = accept_update(&listener);
-                let wire: DaemonControlEnvelope<UpdateControlRequest> =
-                    serde_json::from_value(read(&mut stream)).unwrap();
-                let principal =
-                    if !bool::from(wire.secret.ct_eq(&CAPABILITY)) || role == "anonymous" {
-                        Principal::unauthenticated()
-                    } else {
-                        // Server configuration supplies the role, never the JSON body.
-                        Principal::authenticated("mock-operator", role)
-                    };
+                let wire: UpdateControlRequest = serde_json::from_value(read(&mut stream)).unwrap();
+                let principal = if role == "anonymous" {
+                    Principal::unauthenticated()
+                } else {
+                    // Server configuration supplies the role, never the JSON body.
+                    Principal::authenticated("mock-operator", role)
+                };
                 let mut audit =
                     AuditedExecutor::open(log_for_server, AuditConfig::default()).unwrap();
                 let mut calls = 0;
-                let result = audit.execute_update(&wire.request, principal, false, || {
+                let result = audit.execute_update(&wire, principal, false, || {
                     calls += 1;
                     Ok(operation(command, "succeeded", ID, "core"))
                 });
@@ -466,7 +460,6 @@ fn operation_requery_validates_affected_shards_without_original_manifest() {
             let mut stream = accept(&listener);
             let request = read(&mut stream);
             assert_eq!(request["command"], "operation");
-            assert_eq!(request["secret"], json!(CAPABILITY));
             let mut response = operation("update", "succeeded", ID, "core");
             if !valid {
                 response["operation"]["shards"] = json!([]);

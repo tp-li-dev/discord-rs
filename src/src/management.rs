@@ -27,6 +27,8 @@ const AUTHENTICATED_LIMIT: usize = 32;
 const HANDSHAKE_STAGE: Duration = Duration::from_secs(1);
 pub const AUTHENTICATION_FAILED: &str =
     "local control authentication failed; check the peer release and management credentials";
+const LEGACY_BOTCTL_REJECTION: &[u8] =
+    b"{\"ok\":false,\"offline\":false,\"error\":\"incompatible local control protocol; upgrade botctl and botd together\"}\n";
 pub const RESPONSE_LIMIT: usize = 65535;
 pub const BOTD_REQUEST_LIMIT: usize = 4095;
 pub const MANAGE_REQUEST_LIMIT: usize = 4094;
@@ -137,8 +139,10 @@ pub async fn authenticate_client<S: AsyncRead + AsyncWrite + Unpin>(
             client: nonce()?,
             server: [0; FIELD],
         };
-        stream.write_all(protocol.magic()).await?;
-        stream.write_all(&transcript.client).await?;
+        let mut hello = [0; 8 + FIELD];
+        hello[..8].copy_from_slice(protocol.magic());
+        hello[8..].copy_from_slice(&transcript.client);
+        stream.write_all(&hello).await?;
         read_magic(stream, protocol).await?;
         stream.read_exact(&mut transcript.server).await?;
         let expected = transcript.tag(&key, b'S', &[]);
@@ -171,7 +175,17 @@ pub async fn authenticate_server<S: AsyncRead + AsyncWrite + Unpin>(
     }
     let mut client = [0; FIELD];
     timeout(HANDSHAKE_STAGE, async {
-        read_magic(stream, protocol).await?;
+        let mut magic = [0; 8];
+        stream.read_exact(&mut magic).await?;
+        if &magic != protocol.magic() {
+            // Historical botctl expects a JSON error. Reject from the prefix
+            // alone, without reading its bearer credential or parsing a body.
+            if matches!(protocol, Protocol::Botd) && magic[0] == b'{' {
+                let _ = stream.write_all(LEGACY_BOTCTL_REJECTION).await;
+                let _ = stream.shutdown().await;
+            }
+            return Err(auth_error());
+        }
         stream.read_exact(&mut client).await?;
         Ok::<(), io::Error>(())
     })
@@ -183,11 +197,13 @@ pub async fn authenticate_server<S: AsyncRead + AsyncWrite + Unpin>(
             client,
             server: nonce()?,
         };
-        stream.write_all(protocol.magic()).await?;
-        stream.write_all(&transcript.server).await?;
+        let mut challenge = Vec::with_capacity(8 + (1 + keys.len()) * FIELD);
+        challenge.extend_from_slice(protocol.magic());
+        challenge.extend_from_slice(&transcript.server);
         for key in keys {
-            stream.write_all(&transcript.tag(key, b'S', &[])).await?;
+            challenge.extend_from_slice(&transcript.tag(key, b'S', &[]));
         }
+        stream.write_all(&challenge).await?;
         let mut proof = [0; FIELD];
         stream.read_exact(&mut proof).await?;
         // Always check both legacy roles. Prefer the first configured key if equal.
@@ -220,12 +236,8 @@ impl Session {
         self.write_frame(stream, b'Q', body).await
     }
 
-    pub async fn read_request(
-        &self,
-        stream: &mut (impl AsyncRead + Unpin),
-        limit: usize,
-    ) -> io::Result<Vec<u8>> {
-        self.read_frame(stream, b'Q', limit).await
+    pub async fn read_request(&self, stream: &mut (impl AsyncRead + Unpin)) -> io::Result<Vec<u8>> {
+        self.read_frame(stream, b'Q', self.request_limit()).await
     }
 
     pub async fn write_response(
@@ -349,5 +361,175 @@ where
                 }));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{DuplexStream, duplex};
+
+    const TEST_KEY: [u8; 32] = [7; 32];
+
+    async fn session_pair() -> (Session, Session) {
+        let (mut client, mut server) = duplex(8192);
+        let keys = [Key::new(&TEST_KEY)];
+        let (client, server) = tokio::join!(
+            authenticate_client(&mut client, Protocol::Botd, Key::new(&TEST_KEY)),
+            authenticate_server(&mut server, Protocol::Botd, &keys)
+        );
+        (client.unwrap(), server.unwrap().0)
+    }
+
+    #[tokio::test]
+    async fn request_mac_replay_and_modified_response_are_rejected() {
+        let (first_client, first_server) = session_pair().await;
+        let (_, second_server) = session_pair().await;
+        let mut wire = Vec::new();
+        first_client
+            .write_request(&mut wire, br#"{"command":"status"}"#)
+            .await
+            .unwrap();
+        let request = first_server
+            .read_request(&mut wire.as_slice())
+            .await
+            .unwrap();
+        assert_eq!(request.as_slice(), br#"{"command":"status"}"#);
+        let error = second_server
+            .read_request(&mut wire.as_slice())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        for change_client in [false, true] {
+            let original = &first_server.transcript;
+            let mut transcript = Transcript {
+                protocol: original.protocol,
+                client: original.client,
+                server: original.server,
+            };
+            if change_client {
+                transcript.client[0] ^= 1;
+            } else {
+                transcript.server[0] ^= 1;
+            }
+            let changed = Session {
+                transcript,
+                key: first_server.key.clone(),
+            };
+            let error = changed
+                .read_request(&mut wire.as_slice())
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        }
+
+        wire.clear();
+        first_server
+            .write_response(&mut wire, br#"{"ok":true}"#)
+            .await
+            .unwrap();
+        assert!(
+            first_client
+                .read_response(&mut wire.as_slice())
+                .await
+                .is_ok()
+        );
+        wire[5] ^= 1;
+        let error = first_client
+            .read_response(&mut wire.as_slice())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn reflected_proofs_are_rejected_in_both_directions() {
+        let (mut client, mut server) = duplex(8192);
+        let keys = [Key::new(&TEST_KEY)];
+        let echo_server_proof = async {
+            client.write_all(Protocol::Botd.magic()).await.unwrap();
+            client.write_all(&[4; FIELD]).await.unwrap();
+            let mut challenge = [0; 8 + 2 * FIELD];
+            client.read_exact(&mut challenge).await.unwrap();
+            client.write_all(&challenge[8 + FIELD..]).await.unwrap();
+        };
+        let ((), result) = tokio::join!(
+            echo_server_proof,
+            authenticate_server(&mut server, Protocol::Botd, &keys)
+        );
+        assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::PermissionDenied));
+
+        let (mut client, mut server) = duplex(8192);
+        let echo_client_proof = async move {
+            read_magic(&mut server, Protocol::Botd).await.unwrap();
+            let mut transcript = Transcript {
+                protocol: Protocol::Botd,
+                client: [0; FIELD],
+                server: [5; FIELD],
+            };
+            server.read_exact(&mut transcript.client).await.unwrap();
+            let client_proof = transcript.tag(&Key::new(&TEST_KEY), b'C', &[]);
+            server.write_all(Protocol::Botd.magic()).await.unwrap();
+            server.write_all(&transcript.server).await.unwrap();
+            server.write_all(&client_proof).await.unwrap();
+            let mut next = [0; 1];
+            assert_eq!(server.read(&mut next).await.unwrap(), 0);
+        };
+        let authenticate = async move {
+            let result =
+                authenticate_client(&mut client, Protocol::Botd, Key::new(&TEST_KEY)).await;
+            assert!(
+                matches!(result, Err(error) if error.kind() == io::ErrorKind::PermissionDenied)
+            );
+        };
+        timeout(Duration::from_secs(3), async {
+            tokio::join!(echo_client_proof, authenticate);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn partial_first_frame_does_not_extend_deadline() {
+        let (mut client, mut server) = duplex(8192);
+        let keys = [Key::new(&TEST_KEY)];
+        let slowly = async {
+            for byte in b"DRSB" {
+                client.write_all(&[*byte]).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(170)).await;
+            }
+            // Keep the writer open so a truncated frame cannot explain the error.
+            std::future::pending::<()>().await;
+        };
+        let result = timeout(Duration::from_millis(1800), async {
+            tokio::select! {
+                result = authenticate_server(&mut server, Protocol::Botd, &keys) => result,
+                _ = slowly => unreachable!(),
+            }
+        })
+        .await
+        .expect("partial input must expire at the initial deadline");
+        assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::TimedOut));
+    }
+
+    #[tokio::test]
+    async fn botd_rejects_legacy_client_before_dispatch() {
+        let (mut client, mut server): (DuplexStream, DuplexStream) = duplex(8192);
+        let keys = [Key::new(&TEST_KEY)];
+        let old_request = serde_json::to_vec(&serde_json::json!({
+            "secret": TEST_KEY, "command": "status"
+        }))
+        .unwrap();
+        client.write_all(&old_request).await.unwrap();
+        let result = authenticate_server(&mut server, Protocol::Botd, &keys).await;
+        assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::PermissionDenied));
+        let mut reply = Vec::new();
+        client.read_to_end(&mut reply).await.unwrap();
+        let reply: serde_json::Value = serde_json::from_slice(&reply).unwrap();
+        assert_eq!(reply["ok"], false);
+        assert_eq!(
+            reply["error"],
+            "incompatible local control protocol; upgrade botctl and botd together"
+        );
     }
 }

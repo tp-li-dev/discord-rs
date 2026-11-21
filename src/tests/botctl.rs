@@ -1,7 +1,10 @@
+#[path = "fixtures/control_channel.rs"]
+mod control_channel;
+
 use serde_json::{Value, json};
 use std::{
-    io::{BufRead, BufReader, Read, Write},
-    net::{TcpListener, TcpStream},
+    io::{Read, Write},
+    net::TcpListener,
     path::PathBuf,
     process::{Command, Output, Stdio},
     sync::atomic::{AtomicUsize, Ordering},
@@ -124,30 +127,8 @@ enum Reply {
         ok: bool,
     },
     Raw(Vec<u8>),
+    Wire(Vec<u8>),
     Silence(Duration),
-}
-
-fn read_request(stream: &mut TcpStream) -> Value {
-    // Accepted sockets inherit FIONBIO on Windows.
-    stream.set_nonblocking(false).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(3)))
-        .unwrap();
-    stream
-        .set_write_timeout(Some(Duration::from_secs(3)))
-        .unwrap();
-    let mut frame = Vec::new();
-    BufReader::new(stream)
-        .take(4097)
-        .read_until(b'\n', &mut frame)
-        .unwrap();
-    assert!(frame.len() <= 4096);
-    assert_eq!(frame.last(), Some(&b'\n'));
-    let request: Value = serde_json::from_slice(&frame).unwrap();
-    assert!(request["secret"] == json!(vec![7; 32]));
-    assert!(request.get("port").is_none());
-    assert!(!String::from_utf8_lossy(&frame).contains("SENTINEL_CREDENTIAL_VALUE"));
-    request
 }
 
 fn mock(replies: Vec<Reply>) -> (u16, JoinHandle<Vec<Value>>) {
@@ -158,7 +139,7 @@ fn mock(replies: Vec<Reply>) -> (u16, JoinHandle<Vec<Value>>) {
         let mut requests = Vec::new();
         for reply in replies {
             let deadline = Instant::now() + Duration::from_secs(5);
-            let mut stream = loop {
+            let stream = loop {
                 match listener.accept() {
                     Ok((stream, peer)) => {
                         assert!(peer.ip().is_loopback());
@@ -174,7 +155,10 @@ fn mock(replies: Vec<Reply>) -> (u16, JoinHandle<Vec<Value>>) {
                     Err(error) => panic!("mock accept failed: {error}"),
                 }
             };
-            let request = read_request(&mut stream);
+            let mut stream = control_channel::BlockingPeer::botd(stream, &[7; 32]).unwrap();
+            let request = stream.read();
+            assert!(request.get("port").is_none());
+            assert!(!request.to_string().contains("SENTINEL_CREDENTIAL_VALUE"));
             let bytes = match reply {
                 Reply::Json(value) => format!("{value}\n").into_bytes(),
                 Reply::Operation { command, state, ok } => format!("{}\n", json!({
@@ -187,13 +171,21 @@ fn mock(replies: Vec<Reply>) -> (u16, JoinHandle<Vec<Value>>) {
                     }
                 })).into_bytes(),
                 Reply::Raw(bytes) => bytes,
+                Reply::Wire(bytes) => {
+                    stream.raw_reply(&bytes);
+                    Vec::new()
+                }
                 Reply::Silence(duration) => {
                     thread::sleep(duration);
                     Vec::new()
                 }
             };
             if !bytes.is_empty() {
-                let _ = stream.write_all(&bytes);
+                if bytes.len() <= src::management::RESPONSE_LIMIT {
+                    stream.reply_bytes(&bytes);
+                } else {
+                    stream.raw_reply(&(bytes.len() as u32).to_be_bytes());
+                }
             }
             requests.push(request);
         }
@@ -722,7 +714,6 @@ fn absent_daemon_and_invalid_responses_fail_instead_of_showing_configured_bots()
         b"{\"ok\":true}\n".to_vec(),
         b"{}\n".to_vec(),
         b"bad\n".to_vec(),
-        b"{\"ok\":true,\"bots\":[]}".to_vec(),
         vec![b'x'; 65537],
         b"{\"ok\":true,\"offline\":true,\"bots\":[]}\n".to_vec(),
         b"{\"ok\":true,\"secret\":\"PASTED_SECRET_SENTINEL\",\"bots\":[]}\n".to_vec(),
@@ -730,6 +721,62 @@ fn absent_daemon_and_invalid_responses_fail_instead_of_showing_configured_bots()
         let (port, server) = mock(vec![Reply::Raw(bytes)]);
         result(&live(&["ps"], port), false);
         server.join().unwrap();
+    }
+    let (port, server) = mock(vec![Reply::Wire(
+        [64_u32.to_be_bytes().as_slice(), br#"{"ok":true,"bots":[]}"#].concat(),
+    )]);
+    result(&live(&["ps"], port), false);
+    server.join().unwrap();
+}
+
+#[test]
+fn botctl_sends_only_a_random_hello_to_fake_and_legacy_servers() {
+    let mut previous = None;
+    for mode in ["silent", "wrong-proof", "legacy"] {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        thread::sleep(Duration::from_millis(2))
+                    }
+                    Err(error) => panic!("fake peer accept: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut hello = [0; 40];
+            stream.read_exact(&mut hello).unwrap();
+            assert!(&hello[..8] == b"DRSBOT01");
+            assert!(hello[8..] != [7; 32]);
+            if mode == "wrong-proof" {
+                let mut proof = [0; 72];
+                proof[..8].copy_from_slice(b"DRSBOT01");
+                stream.write_all(&proof).unwrap();
+            }
+            if mode == "legacy" {
+                // An old listener cannot decode this prefix as its JSON request.
+                assert_ne!(hello[0], b'{');
+                stream.shutdown(std::net::Shutdown::Write).unwrap();
+            }
+            let mut extra = [0; 1];
+            assert_eq!(stream.read(&mut extra).unwrap(), 0, "{mode}");
+            hello
+        });
+        let value = result(&live(&["ps", "--timeout", "5s"], port), false);
+        assert_eq!(value["error"], src::management::AUTHENTICATION_FAILED);
+        let hello = server.join().unwrap();
+        assert!(previous != Some(hello));
+        previous = Some(hello);
     }
 }
 

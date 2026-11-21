@@ -33,6 +33,9 @@ impl Listener {
         match self {
             Self::Tcp(listener) => {
                 let (stream, peer) = listener.accept().await?;
+                if stream.set_nodelay(true).is_err() {
+                    return Ok(None);
+                }
                 Ok(peer.ip().is_loopback().then(|| Box::new(stream) as Stream))
             }
             #[cfg(target_os = "linux")]
@@ -48,6 +51,7 @@ impl Listener {
 
 pub async fn connect_tcp(port: u16) -> io::Result<Stream> {
     let stream = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).await?;
+    stream.set_nodelay(true)?;
     Ok(Box::new(stream))
 }
 
@@ -164,5 +168,20 @@ mod linux {
             ));
         }
         Ok(Box::new(stream))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn unix_peer_credential_must_match_expected_uid() {
+            let (one, other) = UnixStream::pair().unwrap();
+            let uid = effective_uid();
+            for stream in [one, other] {
+                assert!(peer_matches(&stream, uid));
+                assert!(!peer_matches(&stream, uid.wrapping_add(1)));
+            }
+        }
     }
 }

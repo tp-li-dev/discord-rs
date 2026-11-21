@@ -516,12 +516,9 @@ async fn serve_control<S: AsyncRead + AsyncWrite + Unpin>(
     access: &ControlAccess,
     commands: &mpsc::Sender<Envelope>,
 ) -> io::Result<()> {
-    let frame = tokio::time::timeout(
-        DEADLINE,
-        session.read_request(&mut stream, management::BOTD_REQUEST_LIMIT),
-    )
-    .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "control frame timed out"))??;
+    let frame = tokio::time::timeout(DEADLINE, session.read_request(&mut stream))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "control frame timed out"))??;
     let request: WireRequest = serde_json::from_slice(&frame)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid status request"))?;
     let (command, update) = match request {
@@ -908,8 +905,10 @@ async fn run() -> Result<(), &'static str> {
     announcement.push(b'\n');
     let mut stdout = tokio::io::stdout();
     if stdout.write_all(&announcement).await.is_err() || stdout.flush().await.is_err() {
-        server.abort();
-        let _ = server.await;
+        if !server.is_finished() {
+            server.abort();
+            let _ = server.await;
+        }
         return Err("cannot announce local daemon control");
     }
     // systemd Type=notify: the control listener is bound and announced.
@@ -989,8 +988,10 @@ async fn run() -> Result<(), &'static str> {
         }
     };
     let _ = notifier.stopping();
-    server.abort();
-    let _ = server.await;
+    if !server.is_finished() {
+        server.abort();
+        let _ = server.await;
+    }
     if options.stop_children_on_exit && signaled {
         // Graceful only, within STOP_CHILDREN_DEADLINE overall. A child that
         // does not stop in time is left running, never force-killed.
@@ -1093,8 +1094,10 @@ async fn run_raft_cluster(
     bytes.push(b'\n');
     let mut stdout = tokio::io::stdout();
     if stdout.write_all(&bytes).await.is_err() || stdout.flush().await.is_err() {
-        server.abort();
-        let _ = server.await;
+        if !server.is_finished() {
+            server.abort();
+            let _ = server.await;
+        }
         host.shutdown().await;
         return Err("cannot announce local daemon control");
     }
@@ -1122,8 +1125,10 @@ async fn run_raft_cluster(
             _ = &mut server => break Err("local daemon control stopped"),
         }
     };
-    server.abort();
-    let _ = server.await;
+    if !server.is_finished() {
+        server.abort();
+        let _ = server.await;
+    }
     host.shutdown().await;
     result
 }
@@ -1200,8 +1205,10 @@ async fn run_test_cluster(
     bytes.push(b'\n');
     let mut stdout = tokio::io::stdout();
     if stdout.write_all(&bytes).await.is_err() || stdout.flush().await.is_err() {
-        server.abort();
-        let _ = server.await;
+        if !server.is_finished() {
+            server.abort();
+            let _ = server.await;
+        }
         runtime.shutdown().await;
         return Err("cannot announce local daemon control");
     }
@@ -1254,8 +1261,10 @@ async fn run_test_cluster(
             _=&mut server=>break Err("local daemon control stopped"),
         }
     };
-    server.abort();
-    let _ = server.await;
+    if !server.is_finished() {
+        server.abort();
+        let _ = server.await;
+    }
     runtime.shutdown().await;
     // Dropping parent pipes cannot extend a guardian's last lease. Shutdown and
     // botd crash therefore use the same independently supervised expiry path.
@@ -1331,8 +1340,10 @@ async fn run_test_gateway_switch(
     announcement.push(b'\n');
     let mut stdout = tokio::io::stdout();
     if stdout.write_all(&announcement).await.is_err() || stdout.flush().await.is_err() {
-        server.abort();
-        let _ = server.await;
+        if !server.is_finished() {
+            server.abort();
+            let _ = server.await;
+        }
         return Err("cannot announce local daemon control");
     }
     let mut update_tick = tokio::time::interval(Duration::from_millis(25));
@@ -1396,8 +1407,10 @@ async fn run_test_gateway_switch(
             _ = &mut server => break Err("local daemon control stopped"),
         }
     };
-    server.abort();
-    let _ = server.await;
+    if !server.is_finished() {
+        server.abort();
+        let _ = server.await;
+    }
     result
 }
 
@@ -1779,7 +1792,11 @@ mod tests {
         }
     }
 
-    async fn status_session(request: &[u8], status: Value) -> (io::Result<()>, Vec<u8>) {
+    async fn status_session(
+        key: [u8; 32],
+        request: &[u8],
+        status: Value,
+    ) -> (io::Result<()>, Vec<u8>) {
         let (mut client, server) = duplex(128 * 1024);
         let (sender, mut receiver) = mpsc::channel::<Envelope>(1);
         let backend = tokio::spawn(async move {
@@ -1790,30 +1807,42 @@ mod tests {
             }
         });
         let task = tokio::spawn(async move { serve_status(server, &[7; 32], &sender).await });
-        client.write_all(request).await.unwrap();
-        client.shutdown().await.unwrap();
         let mut response = Vec::new();
-        client.read_to_end(&mut response).await.unwrap();
+        if let Ok(session) = client_auth(&mut client, &key).await {
+            if request.len() > management::BOTD_REQUEST_LIMIT {
+                client
+                    .write_all(&(request.len() as u32).to_be_bytes())
+                    .await
+                    .unwrap();
+            } else {
+                session.write_request(&mut client, request).await.unwrap();
+            }
+            client.shutdown().await.unwrap();
+            response = session.read_response(&mut client).await.unwrap_or_default();
+        } else {
+            drop(client);
+        }
         let result = task.await.unwrap();
         backend.await.unwrap();
         (result, response)
     }
 
-    fn request(secret: [u8; 32], command: &str) -> Vec<u8> {
-        let mut frame = serde_json::to_vec(&StatusRequest {
-            secret,
+    async fn client_auth(stream: &mut DuplexStream, key: &[u8; 32]) -> io::Result<Session> {
+        management::authenticate_client(stream, Protocol::Botd, Key::new(key)).await
+    }
+
+    fn request(command: &str) -> Vec<u8> {
+        serde_json::to_vec(&StatusRequest {
             command: command.into(),
             ..Default::default()
         })
-        .unwrap();
-        frame.push(b'\n');
-        frame
+        .unwrap()
     }
 
     #[tokio::test]
     async fn authenticated_status_returns_snapshot_without_secret() {
         let (result, response) =
-            status_session(&request([7; 32], "status"), json!({"processes": []})).await;
+            status_session([7; 32], &request("status"), json!({"processes": []})).await;
         result.unwrap();
         let response: Value = serde_json::from_slice(&response).unwrap();
         assert_eq!(response["ok"], true);
@@ -1823,9 +1852,12 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_wrong_capability_and_mutating_command_without_response() {
-        for frame in [request([8; 32], "status"), request([7; 32], "stop")] {
-            let (result, response) = status_session(&frame, json!([])).await;
-            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        for (key, command, expected) in [
+            ([8; 32], "status", io::ErrorKind::UnexpectedEof),
+            ([7; 32], "stop", io::ErrorKind::PermissionDenied),
+        ] {
+            let (result, response) = status_session(key, &request(command), json!([])).await;
+            assert_eq!(result.unwrap_err().kind(), expected);
             assert!(response.is_empty());
         }
     }
@@ -1837,10 +1869,26 @@ mod tests {
             b"{}".to_vec(),
             b"bad\n".to_vec(),
         ] {
-            let (result, response) = status_session(&frame, json!([])).await;
+            let (result, response) = status_session([7; 32], &frame, json!([])).await;
             assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
             assert!(response.is_empty());
         }
+
+        let (mut client, server) = duplex(8192);
+        let (sender, mut receiver) = mpsc::channel::<Envelope>(1);
+        let task = tokio::spawn(async move { serve_status(server, &[7; 32], &sender).await });
+        let session = client_auth(&mut client, &[7; 32]).await.unwrap();
+        client.write_all(b"\0\0\0\x05{").await.unwrap();
+        client.shutdown().await.unwrap();
+        assert_eq!(
+            session.read_response(&mut client).await.unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(
+            task.await.unwrap().unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert!(receiver.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -1851,9 +1899,8 @@ mod tests {
         })
         .unwrap();
         value["extra"] = json!(true);
-        let mut frame = serde_json::to_vec(&value).unwrap();
-        frame.push(b'\n');
-        let (result, response) = status_session(&frame, json!([])).await;
+        let frame = serde_json::to_vec(&value).unwrap();
+        let (result, response) = status_session([7; 32], &frame, json!([])).await;
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
         assert!(response.is_empty());
     }
@@ -1861,7 +1908,7 @@ mod tests {
     #[tokio::test]
     async fn core_restart_dispatches_only_valid_authenticated_requests() {
         let wire = json!({
-            "secret": vec![7; 32], "command": "core-restart", "bot": "bot",
+            "command": "core-restart", "bot": "bot",
             "shard": 1, "core": 0, "expect_total_shards": 2, "expect_bot_id": "7",
             "expect_incarnation": "fedcba9876543210", "force": true,
             "core_recovery_version": src::daemon::control::CORE_RECOVERY_VERSION,
@@ -1878,23 +1925,29 @@ mod tests {
         ] {
             let mut rejected = wire.clone();
             rejected[field] = value;
-            let (result, response) =
-                status_session(format!("{rejected}\n").as_bytes(), json!(null)).await;
+            let (result, response) = status_session(
+                [7; 32],
+                &serde_json::to_vec(&rejected).unwrap(),
+                json!(null),
+            )
+            .await;
             assert!(result.is_err(), "{field}");
             assert!(response.is_empty());
         }
 
         let mut old = wire.clone();
         old.as_object_mut().unwrap().remove("core_recovery_version");
-        let (result, response) = status_session(format!("{old}\n").as_bytes(), json!(null)).await;
+        let (result, response) =
+            status_session([7; 32], &serde_json::to_vec(&old).unwrap(), json!(null)).await;
         assert!(result.is_err());
         assert!(response.is_empty());
 
         let (mut client, server) = duplex(8192);
         let (sender, mut receiver) = mpsc::channel::<Envelope>(1);
         let task = tokio::spawn(async move { serve_status(server, &[7; 32], &sender).await });
-        client
-            .write_all(format!("{wire}\n").as_bytes())
+        let session = client_auth(&mut client, &[7; 32]).await.unwrap();
+        session
+            .write_request(&mut client, &serde_json::to_vec(&wire).unwrap())
             .await
             .unwrap();
         let envelope = receiver.recv().await.unwrap();
@@ -1916,7 +1969,7 @@ mod tests {
     #[tokio::test]
     async fn authenticated_core_admission_can_reply_after_the_frame_deadline() {
         let wire = json!({
-            "secret": vec![7; 32], "command": "core-restart", "bot": "bot",
+            "command": "core-restart", "bot": "bot",
             "shard": 1, "core": 0, "expect_total_shards": 2, "expect_bot_id": "7",
             "expect_incarnation": "fedcba9876543210", "force": true,
             "core_recovery_version": src::daemon::control::CORE_RECOVERY_VERSION,
@@ -1925,8 +1978,9 @@ mod tests {
         let (mut client, server) = duplex(8192);
         let (sender, mut receiver) = mpsc::channel::<Envelope>(1);
         let task = tokio::spawn(async move { serve_status(server, &[7; 32], &sender).await });
-        client
-            .write_all(format!("{wire}\n").as_bytes())
+        let session = client_auth(&mut client, &[7; 32]).await.unwrap();
+        session
+            .write_request(&mut client, &serde_json::to_vec(&wire).unwrap())
             .await
             .unwrap();
         let envelope = receiver.recv().await.unwrap();
@@ -1936,7 +1990,7 @@ mod tests {
             .response
             .send(json!({"ok": false, "error": "audit_timeout"}))
             .unwrap();
-        let reply = read_frame(&mut client).await.unwrap();
+        let reply = session.read_response(&mut client).await.unwrap();
         let reply: Value = serde_json::from_slice(&reply).unwrap();
         assert_eq!(reply["error"], "audit_timeout");
         task.await.unwrap().unwrap();
@@ -1945,7 +1999,8 @@ mod tests {
     #[tokio::test]
     async fn rejects_oversized_response_before_writing() {
         let (result, response) = status_session(
-            &request([7; 32], "status"),
+            [7; 32],
+            &request("status"),
             json!("x".repeat(RESPONSE_LIMIT)),
         )
         .await;
@@ -1972,12 +2027,16 @@ mod tests {
         let (sender, mut receiver) = mpsc::channel::<Envelope>(1);
         let task = tokio::spawn(async move { serve_status(server, &[7; 32], &sender).await });
         assert!(receiver.try_recv().is_err());
-        client.write_all(&request([7; 32], "status")).await.unwrap();
+        let session = client_auth(&mut client, &[7; 32]).await.unwrap();
+        assert!(receiver.try_recv().is_err());
+        session
+            .write_request(&mut client, &request("status"))
+            .await
+            .unwrap();
         let envelope = receiver.recv().await.unwrap();
         assert_eq!(envelope.request.command, "status");
         envelope.response.send(json!({"ok": true, "status": {"processes": [{"state": "Failed"}], "monitor_ok": false}})).unwrap();
-        let mut response = Vec::new();
-        client.read_to_end(&mut response).await.unwrap();
+        let response = session.read_response(&mut client).await.unwrap();
         task.await.unwrap().unwrap();
         let response: Value = serde_json::from_slice(&response).unwrap();
         assert_eq!(response["status"]["monitor_ok"], false);
