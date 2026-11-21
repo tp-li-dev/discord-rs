@@ -149,6 +149,12 @@ pub trait RecoveryHost {
     /// metadata refresh uses rest_budget separately, never as an Identify permit.
     fn try_acquire_identify(&mut self, key: ChildKey) -> IdentifyAdmission;
 
+    /// The host may resample at admission. A new sample must be no earlier
+    /// than the recovery observation that made this child eligible.
+    fn try_acquire_identify_at(&mut self, key: ChildKey, _observed: Duration) -> IdentifyAdmission {
+        self.try_acquire_identify(key)
+    }
+
     /// Cancel any pending queue request on hold/stop/authority loss. Admissions
     /// already consumed remain spent. Must be idempotent and not block.
     fn cancel_identify(&mut self, key: ChildKey);
@@ -805,7 +811,7 @@ impl<C: Clock> ChildRecovery<C> {
                     host.cancel_identify(entry.key);
                     StartMode::GatewayResume
                 }
-                ChildRole::Gateway => match host.try_acquire_identify(entry.key) {
+                ChildRole::Gateway => match host.try_acquire_identify_at(entry.key, now) {
                     IdentifyAdmission::Granted => StartMode::GatewayIdentify,
                     IdentifyAdmission::Pending => {
                         entry.defer(now, DeferralReason::IdentifyBudget, &mut events);

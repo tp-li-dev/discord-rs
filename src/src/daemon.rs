@@ -7315,6 +7315,51 @@ pub mod control {
             }
 
             #[tokio::test]
+            async fn admission_detects_regression_from_the_recovery_observation() {
+                use std::sync::atomic::{AtomicUsize, Ordering};
+
+                struct RegressingClock(AtomicUsize);
+                impl Clock for RegressingClock {
+                    fn now(&self) -> Duration {
+                        Duration::from_secs(match self.0.fetch_add(1, Ordering::Relaxed) {
+                            0..=2 => 0, // constructor and start of the recovery pass
+                            3 => 30,    // recovery has decided the child is eligible
+                            _ => 29,    // admission regressed within this same pass
+                        })
+                    }
+                    fn sleep_until(&self, _: Duration) -> crate::supervisor::Sleep<'_> {
+                        Box::pin(std::future::pending())
+                    }
+                }
+
+                let (plane, _) = fixture(1, 1, 10);
+                let specs = plane
+                    .daemon
+                    .entries
+                    .values()
+                    .map(|entry| entry.spec.clone())
+                    .collect();
+                let mut daemon = Daemon::with_clock(
+                    specs,
+                    RestartPolicy::default(),
+                    RegressingClock(AtomicUsize::new(0)),
+                )
+                .unwrap();
+                let key = key(0, 0);
+                let entry = daemon.entries.get_mut(&key).unwrap();
+                daemon.recovery.register(entry.recovery_key, 0).unwrap();
+                entry.started = true;
+                entry.snapshot.desired_running = true;
+
+                let no_spawn = |_: &str| -> Option<OsString> {
+                    panic!("regressed admission must not launch a child")
+                };
+                assert_eq!(daemon.poll(&no_spawn), Err(DaemonError::ClockRegressed));
+                assert!(!daemon.has_child(&key));
+                assert_eq!(daemon.poll(&no_spawn), Err(DaemonError::ClockRegressed));
+            }
+
+            #[tokio::test]
             async fn lifetime_restart_limit_refuses_restart_and_restart_all_before_any_stop() {
                 let (mut plane, time) = fixture(2, 1, 10);
                 let first = key(0, 0);
@@ -8425,6 +8470,10 @@ impl<S: CredentialSource> RecoveryHost for ProcessRecoveryHost<'_, S> {
         false
     }
     fn try_acquire_identify(&mut self, key: ChildKey) -> IdentifyAdmission {
+        self.try_acquire_identify_at(key, *self.last_now)
+    }
+
+    fn try_acquire_identify_at(&mut self, key: ChildKey, observed: Duration) -> IdentifyAdmission {
         use crate::local_identify::LocalAdmission;
         // A single local update owns the Bot's fallback opportunity until commit, a
         // pre-activation abort, or its recovery's Identify grant. Defer OTHER starts
@@ -8476,7 +8525,7 @@ impl<S: CredentialSource> RecoveryHost for ProcessRecoveryHost<'_, S> {
             })
         } else {
             let now = self.clock.now();
-            if *self.clock_failed || now < *self.last_now {
+            if *self.clock_failed || now < observed.max(*self.last_now) {
                 *self.clock_failed = true;
                 return IdentifyAdmission::Pending;
             }
