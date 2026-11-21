@@ -694,6 +694,37 @@ async fn stop_bot(child: &mut Option<Bot>) -> Result<(), ErrorBox> {
     }
     Ok(())
 }
+
+enum Rejection {
+    Handshake,
+    Frame(&'static str),
+    Malformed(&'static str),
+}
+
+impl Rejection {
+    fn audit_request(self) -> AuditRequest {
+        let (principal, operation) = match self {
+            Self::Handshake => (Principal::unauthenticated(), "unknown"),
+            Self::Frame(role) => (
+                Principal::authenticated("local-capability", role),
+                "invalid_request_frame",
+            ),
+            Self::Malformed(role) => (
+                Principal::authenticated("local-capability", role),
+                "malformed_request",
+            ),
+        };
+        AuditRequest {
+            principal,
+            operation: operation.into(),
+            bot_id: Some("local-bot".into()),
+            shard_id: None,
+            remote: false,
+            confirmation: Confirmation::None,
+        }
+    }
+}
+
 async fn core(binary: PathBuf) -> Result<(), ErrorBox> {
     let listener = Listener::bind_tcp(port()?).await?;
     let endpoint = Endpoint {
@@ -722,7 +753,7 @@ async fn core(binary: PathBuf) -> Result<(), ErrorBox> {
     let mut supervision = tokio::time::interval(Duration::from_secs(2));
     let (requests_tx, mut requests_rx) =
         mpsc::channel::<(Request, &'static str, Stream, Session, oneshot::Sender<()>)>(32);
-    let (rejected_tx, mut rejected_rx) = mpsc::channel::<()>(32);
+    let (rejected_tx, mut rejected_rx) = mpsc::channel::<Rejection>(32);
     write_endpoint(&endpoint, "core.json").await?;
     write_endpoint(&viewer_endpoint, "viewer.json").await?;
     println!("??????????Bot?Discord?????????????????");
@@ -736,20 +767,20 @@ async fn core(binary: PathBuf) -> Result<(), ErrorBox> {
                 let requests_tx = requests_tx.clone();
                 let rejected_tx = rejected_tx.clone();
                 async move {
-                    let frame = tokio::time::timeout(
+                    let role = if index == 0 { "admin" } else { "viewer" };
+                    let Ok(Ok(body)) = tokio::time::timeout(
                         Duration::from_secs(3),
                         session.read_request(&mut stream),
                     )
-                    .await;
-                    let input = match frame {
-                        Ok(Ok(body)) => serde_json::from_slice::<Request>(&body).ok(),
-                        _ => None,
-                    };
-                    let Some(input) = input else {
-                        let _ = rejected_tx.try_send(());
+                    .await
+                    else {
+                        let _ = rejected_tx.try_send(Rejection::Frame(role));
                         return;
                     };
-                    let role = if index == 0 { "admin" } else { "viewer" };
+                    let Ok(input) = serde_json::from_slice::<Request>(&body) else {
+                        let _ = rejected_tx.try_send(Rejection::Malformed(role));
+                        return;
+                    };
                     // Retain the authenticated slot until the owner is done replying.
                     let (done, completed) = oneshot::channel();
                     if requests_tx
@@ -762,7 +793,7 @@ async fn core(binary: PathBuf) -> Result<(), ErrorBox> {
             }
         },
         move || {
-            let _ = rejected_tx.try_send(());
+            let _ = rejected_tx.try_send(Rejection::Handshake);
         },
     ));
     loop {
@@ -772,16 +803,8 @@ async fn core(binary: PathBuf) -> Result<(), ErrorBox> {
                 return Err(failure(Diagnostic::ManagementRejected));
             }
             Some(request) = requests_rx.recv() => request,
-            Some(()) = rejected_rx.recv() => {
-                let denied = AuditRequest {
-                    principal: Principal::unauthenticated(),
-                    operation: "unknown".into(),
-                    bot_id: Some("local-bot".into()),
-                    shard_id: None,
-                    remote: false,
-                    confirmation: Confirmation::None,
-                };
-                let _ = audit.execute(&denied, || Ok(()));
+            Some(rejected) = rejected_rx.recv() => {
+                let _ = audit.execute(&rejected.audit_request(), || Ok(()));
                 continue;
             }
             _ = supervision.tick() => {
