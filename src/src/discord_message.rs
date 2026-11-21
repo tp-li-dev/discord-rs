@@ -426,7 +426,7 @@ mod tests {
         let mut attempts = 0;
         let mut blocker = None;
         let deadline = Instant::now() + Duration::from_secs(2);
-        let result = send_with_nonce(&body, deadline, |body, deadline| {
+        let send = send_with_nonce(&body, deadline, |body, deadline| {
             attempts += 1;
             let attempt = attempts;
             let request = http
@@ -449,8 +449,10 @@ mod tests {
                 }
                 result.map(|response| response.status().get())
             }
-        })
-        .await;
+        });
+        let result = timeout(Duration::from_secs(5), send)
+            .await
+            .expect("nonce retry did not stop at the total deadline");
         assert_eq!(attempts, 2, "the retry must have entered the limiter queue");
         assert_eq!(result, None);
         assert!(Instant::now() >= deadline);
