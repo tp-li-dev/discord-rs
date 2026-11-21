@@ -12,7 +12,7 @@ use tokio::time::{Instant, sleep, timeout, timeout_at};
 use twilight_http::{
     Client,
     error::ErrorType,
-    response::{Response, ResponseFuture},
+    response::{DeserializeBodyError, Response, ResponseFuture},
 };
 use twilight_model::{
     channel::message::AllowedMentions,
@@ -84,15 +84,25 @@ pub async fn single_attempt<T: Unpin>(
         return Err(AttemptError::GuardUnavailable);
     }
 
-    request.await.map_err(|error| match error.kind() {
-        // Twilight 0.18 reaches the second pre-flight only after a 429.
-        ErrorType::RequestCanceled if sent.load(Ordering::Relaxed) => AttemptError::RateLimited,
-        ErrorType::RequestCanceled => AttemptError::Deadline,
-        ErrorType::Response { status, .. } if status.get() == 429 => AttemptError::RateLimited,
-        ErrorType::Response { status, .. } => AttemptError::Http(status.get()),
-        ErrorType::RequestTimedOut => AttemptError::Timeout,
-        ErrorType::RequestError => AttemptError::Transport,
-        _ => AttemptError::Other,
+    request.await.map_err(|error| {
+        let (kind, source) = error.into_parts();
+        match kind {
+            // Twilight 0.18 reaches the second pre-flight only after a 429.
+            ErrorType::RequestCanceled if sent.load(Ordering::Relaxed) => AttemptError::RateLimited,
+            ErrorType::RequestCanceled => AttemptError::Deadline,
+            ErrorType::Response { status, .. } if status.get() == 429 => AttemptError::RateLimited,
+            ErrorType::Response { status, .. } => AttemptError::Http(status.get()),
+            ErrorType::RequestTimedOut => AttemptError::Timeout,
+            // Twilight 0.18.0 uses RequestError for both failures before response
+            // headers and failures reading a non-success response body. Only the
+            // former is retryable. The body error no longer carries the status.
+            ErrorType::RequestError
+                if source.is_some_and(|source| !source.is::<DeserializeBodyError>()) =>
+            {
+                AttemptError::Transport
+            }
+            _ => AttemptError::Other,
+        }
     })
 }
 
@@ -158,6 +168,9 @@ async fn send_with_nonce<F: Future<Output = Result<u16, AttemptError>>>(
     mut send: impl FnMut(&[u8], Instant) -> F,
 ) -> Option<u16> {
     timeout_at(deadline, async {
+        if Instant::now() >= deadline {
+            return None;
+        }
         match send(body, deadline).await {
             Ok(status) => Some(status),
             Err(AttemptError::Transport | AttemptError::Timeout) => {
@@ -180,6 +193,41 @@ mod tests {
     use super::*;
     use serde_json::{Value, json};
     use std::future::ready;
+    use tokio::{
+        io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader},
+        net::{TcpListener, TcpStream},
+    };
+
+    fn proxy_client(listener: &TcpListener) -> Client {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        Client::builder()
+            .proxy(listener.local_addr().unwrap().to_string(), true)
+            .build()
+    }
+
+    async fn accept_post(listener: &TcpListener) -> (TcpStream, Vec<u8>) {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut stream = BufReader::new(stream);
+        let mut line = String::new();
+        stream.read_line(&mut line).await.unwrap();
+        assert!(line.starts_with("POST "));
+        let mut content_length = None;
+        loop {
+            line.clear();
+            assert_ne!(stream.read_line(&mut line).await.unwrap(), 0);
+            if line == "\r\n" {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':')
+                && name.eq_ignore_ascii_case("content-length")
+            {
+                content_length = Some(value.trim().parse().unwrap());
+            }
+        }
+        let mut body = vec![0; content_length.unwrap()];
+        stream.read_exact(&mut body).await.unwrap();
+        (stream.into_inner(), body)
+    }
 
     #[tokio::test]
     async fn nonce_retry_resends_the_full_identical_body_after_backoff() {
@@ -297,12 +345,153 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nonce_retry_cancels_twilight_global_429_resend() {
-        use tokio::{
-            io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader},
-            net::TcpListener,
-        };
+    async fn nonce_retry_does_not_resend_after_a_truncated_http_error_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http = proxy_client(&listener);
+        let channel = Id::new(1);
+        let server = tokio::spawn(async move {
+            // Exercise the unwrapped Twilight error first, then the production sender.
+            for _ in 0..2 {
+                let (mut stream, _) = accept_post(&listener).await;
+                stream
+                    .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 32\r\nConnection: close\r\n\r\n{}")
+                    .await
+                    .unwrap();
+                stream.shutdown().await.unwrap();
+            }
+            // If the production sender retries, let it succeed so None cannot
+            // be explained by another transport failure or by a timeout.
+            if let Ok((mut stream, _)) =
+                timeout(Duration::from_secs(2), accept_post(&listener)).await
+            {
+                stream
+                    .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+                return true;
+            }
+            false
+        });
+        let body = create_payload("probe", "test-nonce").unwrap();
+        let error = timeout(
+            Duration::from_secs(2),
+            http.create_message(channel)
+                .payload_json(&body)
+                .into_future(),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(matches!(error.kind(), ErrorType::RequestError));
+        assert!(error.into_source().unwrap().is::<DeserializeBodyError>());
+        let result = timeout(
+            Duration::from_secs(3),
+            send_text_message(
+                &http,
+                channel,
+                TextMessageKind::TrackedPrefixReply,
+                "probe",
+                true,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, None);
+        assert!(!server.await.unwrap());
+    }
 
+    #[tokio::test]
+    async fn nonce_retry_limiter_wait_cannot_send_a_late_second_post() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http = proxy_client(&listener);
+        let channel = Id::new(1);
+        let body = create_payload("probe", "test-nonce").unwrap();
+        let follow_up = create_payload("follow-up", "different-nonce").unwrap();
+        let expected = (body.clone(), follow_up.clone());
+        let server = tokio::spawn(async move {
+            let (mut stream, first) = accept_post(&listener).await;
+            assert_eq!(first, expected.0);
+            // The POST arrived. Close without returning any response headers.
+            stream.shutdown().await.unwrap();
+            drop(stream);
+
+            let (mut stream, next) = accept_post(&listener).await;
+            assert_eq!(next, expected.1, "an expired retry reached the wire");
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+        });
+
+        let mut attempts = 0;
+        let mut blocker = None;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let result = send_with_nonce(&body, deadline, |body, deadline| {
+            attempts += 1;
+            let attempt = attempts;
+            let request = http
+                .create_message(channel)
+                .payload_json(body)
+                .into_future();
+            if attempt == 1 {
+                // Twilight queues permits on creation. Keep this request unpolled
+                // so it holds the same route behind the first POST and ahead of the retry.
+                blocker = Some(
+                    http.create_message(channel)
+                        .payload_json(body)
+                        .into_future(),
+                );
+            }
+            async move {
+                let result = single_attempt(request, deadline).await;
+                if attempt == 1 {
+                    assert!(matches!(&result, Err(AttemptError::Transport)));
+                }
+                result.map(|response| response.status().get())
+            }
+        })
+        .await;
+        assert_eq!(attempts, 2, "the retry must have entered the limiter queue");
+        assert_eq!(result, None);
+        assert!(Instant::now() >= deadline);
+        drop(blocker);
+
+        // Release the limiter and send a distinct request through the same route.
+        // This proves the expired retry did not slip through when the queue drained.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let request = http
+            .create_message(channel)
+            .payload_json(&follow_up)
+            .into_future();
+        let result = timeout_at(deadline, single_attempt(request, deadline)).await;
+        assert!(matches!(result, Ok(Ok(response)) if response.status().get() == 204));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn nonce_retry_pre_flight_rejects_an_expired_attempt() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http = proxy_client(&listener);
+        let body = create_payload("probe", "test-nonce").unwrap();
+        let request = http
+            .create_message(Id::new(1))
+            .payload_json(&body)
+            .into_future();
+        let result = timeout(
+            Duration::from_secs(2),
+            single_attempt(request, Instant::now()),
+        )
+        .await;
+        assert!(matches!(result, Ok(Err(AttemptError::Deadline))));
+        assert!(
+            timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn nonce_retry_cancels_twilight_global_429_resend() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy = listener.local_addr().unwrap().to_string();
         let server = tokio::spawn(async move {
