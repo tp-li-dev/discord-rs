@@ -78,7 +78,7 @@ NotifyAccess=main
 WatchdogSec=10s
 TimeoutStartSec=30s
 ExecStart=
-ExecStart=/opt/discord-rs/bin/botd --file /etc/discord-rs/bots.toml --runtime-root /var/lib/discord-rs/runtime --gateway-program /opt/discord-rs/bin/src --secret-file /etc/discord-rs/botd.secret --control-port $PORT --stop-children-on-exit --mock-discord 127.0.0.1:$COLLECTOR_PORT
+ExecStart=/opt/discord-rs/bin/botd --file /etc/discord-rs/bots.toml --runtime-root /var/lib/discord-rs/runtime --gateway-program /opt/discord-rs/bin/src --secret-file /etc/discord-rs/botd.secret --token-file %d/botd.env --control-port $PORT --stop-children-on-exit --mock-discord 127.0.0.1:$COLLECTOR_PORT
 CONF
 systemctl daemon-reload
 
@@ -145,7 +145,7 @@ echo "--- 6. --core-mode separate (Core is botd's child, not the Gateway's) ---"
 cat > /etc/systemd/system/botd.service.d/zz-separate.conf <<CONF
 [Service]
 ExecStart=
-ExecStart=/opt/discord-rs/bin/botd --file /etc/discord-rs/bots.toml --runtime-root /var/lib/discord-rs/runtime --gateway-program /opt/discord-rs/bin/src --secret-file /etc/discord-rs/botd.secret --control-port $PORT --stop-children-on-exit --core-mode separate --mock-discord 127.0.0.1:$COLLECTOR_PORT
+ExecStart=/opt/discord-rs/bin/botd --file /etc/discord-rs/bots.toml --runtime-root /var/lib/discord-rs/runtime --gateway-program /opt/discord-rs/bin/src --secret-file /etc/discord-rs/botd.secret --token-file %d/botd.env --control-port $PORT --stop-children-on-exit --core-mode separate --mock-discord 127.0.0.1:$COLLECTOR_PORT
 CONF
 systemctl daemon-reload
 rm -rf /var/lib/discord-rs/runtime

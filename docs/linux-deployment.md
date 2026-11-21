@@ -108,15 +108,21 @@ sudo install -o root -g discord-rs -m 0640 deploy/botd.env.example /etc/discord-
 sudo -e /etc/discord-rs/botd.env     # 変数名は bots.toml の token_env に合わせ、値を入れる
 ```
 
+同梱 unit は `LoadCredential=` でファイルを読み取り専用で渡し、`ExecStartPre` と botd の
+`--token-file` が全行を検査します。空行とコメント、`NAME=VALUE` を扱います。名前は
+`bots.toml` の `token_env` と同じ規則です。値は引用符なしの ASCII 英数字・`.`・`_`・`-` で、
+空欄はプレースホルダーです。重複や不正な行があれば、値を出力せず起動に失敗します。
+既存の drop-in を移行する場合は `EnvironmentFile=` を外し、`ExecStart` の上書きにも
+`--token-file %d/botd.env` を入れてください。
+
 値をコマンドラインに書いたり、`echo >>` で履歴に残したりしないでください。リポジトリ内のファイルに token を
-書かないでください。botd は `token_env` の環境変数から token を読み、そのBot用 Gateway にだけ渡します。Core
+書かないでください。botd は `token_env` で指定された token を、その Bot 用の Gateway にだけ渡します。Core
 （Worker）へ token は渡りません。
 
 ### 管理 secret
 
 `botctl` が接続するための管理 secret（32 byte。64 文字の 16 進 1 行）をファイルで渡します。この unit は
-`ExecStart` で `--secret-file /etc/discord-rs/botd.secret --control-port 47321` を指定します（`LoadCredential=` は使わない
-方式に統一。コードは root 所有 0400 の `$CREDENTIALS_DIRECTORY` 配下も受理しますが、その構成は本手順の対象外で未検証です）。
+`ExecStart` で `--secret-file /etc/discord-rs/botd.secret --control-port 47321` を指定します。
 
 作成と配置（初回のみ。secret の値は表示されません）:
 
@@ -168,7 +174,7 @@ unit の要点（`deploy/systemd/botd.service` 内のコメントも参照）:
 - 起動引数は `--file`、`--runtime-root`、`--gateway-program`、`--secret-file`、`--control-port`（`src/src/bin/botd.rs` の USAGE）。
   `--runtime-root` は `/var/lib/discord-rs/runtime`（`StateDirectory=` で作成）。
 - `User=discord-rs`、`NoNewPrivileges=yes`、`ProtectSystem=strict`、`ProtectHome=yes`、`PrivateTmp=yes`、
-  `ReadWritePaths=/var/lib/discord-rs`、`EnvironmentFile=/etc/discord-rs/botd.env`、
+  `ReadWritePaths=/var/lib/discord-rs`、`LoadCredential=botd.env:/etc/discord-rs/botd.env`、
   `Restart=on-failure`、`RestartSec=5s`、`LimitNOFILE=65536`、ログは journald。
 - **`--stop-children-on-exit`（ExecStart）と `KillSignal=SIGTERM`**: このフラグ有効時、botd は SIGINT と SIGTERM の
   どちらでも、起動した全 Shard の Gateway 子へ graceful な停止を要求し、最大 30 秒待ってから終了します。止まった子の

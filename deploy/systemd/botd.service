@@ -5,11 +5,11 @@
 #   /opt/discord-rs/bin/botd, botctl, src(Gateway)   root:root 0755
 #   /etc/discord-rs/bots.toml     配置設定（秘密値なし）            root:discord-rs 0640
 #   /etc/discord-rs/botd.secret   管理用 secret（16進 64 文字）     discord-rs:discord-rs 0600
-#   /etc/discord-rs/botd.env      token 等（EnvironmentFile）        root:discord-rs 0640 または 0600
+#   /etc/discord-rs/botd.env      token ファイル（LoadCredential）  root:discord-rs 0640 または 0600
 #   /var/lib/discord-rs           状態（StateDirectory が 0700 で作成）
 #
 # token はこのファイルに書かない。token_env に対応する環境変数は botd.env にだけ置く。
-# （botd は環境変数から token を読み、そのBot用Gatewayにだけ渡す。Core には渡さない。）
+# （botd はファイルから token を読み、そのBot用Gatewayにだけ渡す。Core には渡さない。）
 
 [Unit]
 Description=discord-rs botd (Gateway/Core shard supervisor)
@@ -42,11 +42,13 @@ ExecStart=/opt/discord-rs/bin/botd \
     --runtime-root /var/lib/discord-rs/runtime \
     --gateway-program /opt/discord-rs/bin/src \
     --secret-file /etc/discord-rs/botd.secret \
+    --token-file %d/botd.env \
     --control-port 47321 \
     --stop-children-on-exit
 
-# 秘密は別ファイル。先頭 "-" は付けない（ファイルが無ければ起動失敗にする）。
-EnvironmentFile=/etc/discord-rs/botd.env
+# systemd はファイルをデータとしてコピーする。検査前に環境へ展開されない。
+LoadCredential=botd.env:/etc/discord-rs/botd.env
+ExecStartPre=/opt/discord-rs/bin/botd --check-env-file %d/botd.env
 
 # 状態は /var/lib/discord-rs（0700, discord-rs 所有）。runtime-root はその配下。
 StateDirectory=discord-rs discord-rs/runtime

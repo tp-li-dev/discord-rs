@@ -35,12 +35,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Plan, &'static str>
                 .ok_or("argument_invalid")?
                 .into_string()
                 .map_err(|_| "argument_encoding")?;
-            if name.is_empty()
-                || name.len() > 128
-                || !name.bytes().enumerate().all(|(i, c)| {
-                    c == b'_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit())
-                })
-            {
+            if !src::placement::valid_token_env(&name) {
                 return Err("token_env_invalid");
             }
             plan.token_env = name;
@@ -51,6 +46,25 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Plan, &'static str>
         }
     }
     Ok(plan)
+}
+
+#[cfg(test)]
+#[test]
+fn custom_token_name_uses_the_placement_rule() {
+    for name in [
+        "DISCORD_TEST_BOT_TOKEN",
+        "TOKEN_ALPHA",
+        "LD_PRELOAD",
+        "LD_TOKEN",
+        "BASH_ENV",
+        "DISCORD_RS_GATEWAY_TOKEN",
+    ] {
+        assert_eq!(
+            parse(["--token-env".into(), name.into()]).is_ok(),
+            src::placement::valid_token_env(name),
+            "{name}"
+        );
+    }
 }
 
 fn token_state(value: &Option<Secret<OsString>>) -> &'static str {
