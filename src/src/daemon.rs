@@ -7511,6 +7511,7 @@ pub enum DaemonError {
     InvalidPolicy,
     InvalidSpec,
     InvalidProgram,
+    UnknownBot,
     UnknownShard,
     InvalidState,
     NoRuntime,
@@ -8124,15 +8125,30 @@ impl<C: Clock> Daemon<C> {
         Ok(())
     }
 
-    /// Explicit startup opt-in. Only Gateway launch specs receive the flag.
-    pub fn enable_create_message_nonce_retry(&mut self) -> Result<(), DaemonError> {
+    /// Resolve an exact Bot ID allowlist before any launch attempt. Normal and
+    /// recovery launches and standby launches all use these same Gateway args.
+    pub fn configure_create_message_nonce_retry(
+        &mut self,
+        config: &Config,
+        bot_ids: &HashSet<String>,
+    ) -> Result<(), DaemonError> {
         use crate::discord_message::NONCE_RETRY_FLAG;
         if self.entries.values().any(|entry| entry.started) {
             return Err(DaemonError::InvalidState);
         }
+        // Validate against the full deployment, including Bots that have no local shard.
+        if bot_ids
+            .iter()
+            .any(|id| !config.bots.iter().any(|bot| &bot.bot_id == id))
+        {
+            return Err(DaemonError::UnknownBot);
+        }
         for entry in self.entries.values_mut() {
-            let args = &mut entry.spec.gateway.args;
-            if !args.iter().any(|arg| arg == NONCE_RETRY_FLAG) {
+            if bot_ids.contains(&entry.spec.bot_id) {
+                let args = &mut entry.spec.gateway.args;
+                if args.iter().any(|arg| arg == NONCE_RETRY_FLAG) {
+                    continue;
+                }
                 args.push(NONCE_RETRY_FLAG.into());
             }
         }
