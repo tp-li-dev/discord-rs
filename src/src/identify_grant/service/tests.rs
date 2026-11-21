@@ -350,13 +350,16 @@ fn torn_tail_is_discarded_but_a_corrupt_complete_record_fails_closed() {
     use std::os::unix::fs::PermissionsExt;
 
     let root = Root::new();
-    {
+    // A duplicate shares the flock just like a descriptor inherited across fork.
+    // Keep it open to make the reopen independent of process spawn timing.
+    let _inherited = {
         let mut budget = root.budget(BOOT, 0, 1).unwrap();
         assert_eq!(
             budget.launch(gateway(0, 1), secs(0), 1),
             LocalAdmission::Granted
         );
-    }
+        budget.journal.file.try_clone().unwrap()
+    };
     let original = std::fs::read(root.path()).unwrap();
     assert_eq!(
         std::fs::metadata(root.path()).unwrap().permissions().mode() & 0o777,
@@ -372,7 +375,9 @@ fn torn_tail_is_discarded_but_a_corrupt_complete_record_fails_closed() {
     };
     append(b"{\"version\":1");
     {
-        let mut budget = root.budget(BOOT, 1, 1).unwrap();
+        let mut budget = root
+            .budget(BOOT, 1, 1)
+            .expect("reopen and repair torn tail");
         assert_eq!(std::fs::read(root.path()).unwrap(), original);
         assert!(matches!(
             budget.check("42", secs(1), 1),
@@ -384,7 +389,11 @@ fn torn_tail_is_discarded_but_a_corrupt_complete_record_fails_closed() {
         );
     }
     append(b"{\"version\":1\n");
-    assert!(root.budget(BOOT, 3601, 1).is_err());
+    let error = root
+        .budget(BOOT, 3601, 1)
+        .err()
+        .expect("reject corrupt complete record");
+    assert_eq!(error.to_string(), invalid_journal().to_string());
 }
 
 #[test]
