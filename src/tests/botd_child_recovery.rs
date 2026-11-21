@@ -10,6 +10,7 @@ use std::{
     collections::BTreeSet,
     future::Future,
     io::Write,
+    os::unix::ffi::OsStrExt as _,
     path::{Path, PathBuf},
     process::Stdio,
     sync::atomic::{AtomicU64, Ordering},
@@ -463,8 +464,23 @@ async fn kill_observed(pid: u32, expected_executable: &'static str) {
         #[cfg(unix)]
         {
             #[cfg(target_os = "linux")]
-            assert_eq!(std::fs::read_link(format!("/proc/{pid}/exe")).unwrap(),
-                std::fs::canonicalize(expected_executable).unwrap());
+            {
+                // Credential-bearing processes are not dumpable, so their /proc/PID/exe is
+                // unreadable even to the same user; /proc/PID/cmdline stays readable.
+                let expected = std::fs::canonicalize(expected_executable).unwrap();
+                match std::fs::read_link(format!("/proc/{pid}/exe")) {
+                    Ok(actual) => assert_eq!(actual, expected),
+                    Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                        let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap();
+                        let argv0 = cmdline.split(|byte| *byte == 0).next().unwrap();
+                        let argv0 = std::path::PathBuf::from(
+                            std::ffi::OsStr::from_bytes(argv0),
+                        );
+                        assert_eq!(std::fs::canonicalize(argv0).unwrap(), expected);
+                    }
+                    Err(error) => panic!("cannot identify the fixture executable: {error}"),
+                }
+            }
             #[cfg(not(target_os = "linux"))]
             let _ = expected_executable;
             assert!(std::process::Command::new("kill")

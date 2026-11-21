@@ -7766,7 +7766,7 @@ pub mod control {
                 time.send_replace(Duration::from_secs(31));
                 assert_eq!(
                     plane.request(&restart_all(1))["error"],
-                    "IdentifyJournalCapacity"
+                    "IdentifyUnavailable"
                 );
                 plane.tick(&credentials).await;
                 assert_eq!(

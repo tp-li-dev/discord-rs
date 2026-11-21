@@ -265,8 +265,8 @@ impl Budget {
             if budget.len == MAX_JOURNAL {
                 return Err(invalid_journal());
             }
-            budget.journal.write_all(b"\n")?;
-            budget.journal.sync_all()?;
+            (&budget.journal.file).write_all(b"\n")?;
+            budget.journal.file.sync_all()?;
             budget.len += 1;
         }
         if !same_boot {
