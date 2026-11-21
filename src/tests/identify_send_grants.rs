@@ -15,7 +15,7 @@ mod linux {
     use futures_util::{SinkExt, StreamExt};
     use serde_json::{Value, json};
     use src::{
-        daemon::{Daemon, DaemonError, ShardKey},
+        daemon::{Daemon, DaemonError, LaunchGeneration, ShardKey, UpdateProgress},
         identify_grant::{GATEWAY_FD_FLAG, GrantQueue},
         local_identify::LocalIdentifyPolicy,
         placement::LocalShardIntent,
@@ -31,7 +31,7 @@ mod linux {
             Arc,
             atomic::{AtomicUsize, Ordering},
         },
-        time::Duration,
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
     use tokio::{
         net::{TcpListener, TcpStream},
@@ -69,6 +69,8 @@ mod linux {
             );
             runtime.block_on(send_grants_follow_discord_opcodes());
             println!("test send_grants_follow_discord_opcodes ... ok");
+            runtime.block_on(promoted_gateway_keeps_the_launch_identity_from_its_journal());
+            println!("test promoted_gateway_keeps_the_launch_identity_from_its_journal ... ok");
         }
     }
 
@@ -364,6 +366,78 @@ mod linux {
                 Some(1)
             );
         }
+    }
+
+    async fn promoted_gateway_keeps_the_launch_identity_from_its_journal() {
+        let root = Root::new();
+        let discord = Discord::new().await;
+        let running = Running::start(daemon(&root, &discord.url()));
+        let mut active = discord.connect().await;
+        active.hello().await;
+        active.expect_auth(2).await;
+        active.ready(&discord).await;
+        let old = running.daemon.lock().await.snapshots()[0]
+            .identity
+            .clone()
+            .unwrap();
+
+        let unix_ms = || {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        };
+        let before_spawn = unix_ms();
+        running.begin_gateway_update().await;
+        let after_spawn = unix_ms();
+        let mut standby = discord.connect().await;
+        standby.hello().await;
+        standby.expect_auth(2).await;
+        standby.ready(&discord).await;
+
+        let state = root.0.join("bot-3432/shard-0/gateway-state");
+        std::fs::create_dir_all(&state).unwrap();
+        // Drive the real daemon transition using the fixture's Core attach
+        // acknowledgements. This fixture exercises opcodes, not Core authority.
+        {
+            let mut daemon = running.daemon.lock().await;
+            std::fs::write(state.join("standby-ready"), []).unwrap();
+            assert!(matches!(
+                daemon.gateway_update_progress(&key()),
+                UpdateProgress::Ready
+            ));
+            daemon.send_gateway_activation(&key()).await.unwrap();
+            std::fs::write(state.join("standby-active"), []).unwrap();
+            assert!(matches!(
+                daemon.gateway_activation_progress(&key()),
+                UpdateProgress::Ready
+            ));
+            daemon.commit_gateway_update(&key()).await.unwrap();
+            let snapshot = &daemon.snapshots()[0];
+            let active = snapshot.identity.as_ref().unwrap();
+            let journal = root.journal();
+            let mut launches = journal
+                .iter()
+                .filter(|record| record["action"]["kind"] == "launch");
+            assert!(launches.next().is_some());
+            let launch = launches.next().unwrap();
+            let expected: LaunchGeneration =
+                serde_json::from_value(launch["action"]["gateway"]["generation"].clone()).unwrap();
+            let grant = journal.last().unwrap();
+            assert_eq!(grant["action"]["kind"], "grant");
+            assert_eq!(
+                grant["action"]["gateway"]["generation"],
+                launch["action"]["gateway"]["generation"]
+            );
+            assert_ne!(active.pid, old.pid);
+            assert_eq!(active.generation, expected);
+            assert!(active.launch_observed_unix_ms > old.launch_observed_unix_ms);
+            assert!((before_spawn..=after_spawn).contains(&active.launch_observed_unix_ms));
+            let grant_status = snapshot.identify_send_grant.as_ref().unwrap();
+            assert_eq!(grant_status["active"], "granted");
+            assert_eq!(grant_status["standby"], Value::Null);
+        }
+        running.lose_daemon().await;
     }
 
     async fn send_grants_follow_discord_opcodes() {

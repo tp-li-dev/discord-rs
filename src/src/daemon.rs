@@ -8199,8 +8199,7 @@ struct Entry {
 #[cfg(unix)]
 struct Candidate {
     child: Child,
-    #[cfg(target_os = "linux")]
-    launch_sequence: u64,
+    identity: ProcessIdentity,
     started: std::time::Instant,
     ready_marker: PathBuf,
     /// Written by the standby once it has attached to every Core (it is then the Gateway
@@ -9107,10 +9106,22 @@ impl<C: Clock> Daemon<C> {
             .local_identify
             .send_grants
             .as_mut()
-            .map(|service| service.attach(&mut command, key, generation, true))
+            .map(|service| service.attach(&mut command, key, generation.clone(), true))
             .transpose()
             .map_err(|_| DaemonError::SpawnFailed)?;
+        let launch_observed_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| DaemonError::TimeOverflow)?
+            .as_millis();
         let child = command.spawn().map_err(|_| DaemonError::SpawnFailed)?;
+        let identity = ProcessIdentity {
+            key: key.clone(),
+            pid: child
+                .id()
+                .expect("newly spawned candidate has a process id"),
+            generation,
+            launch_observed_unix_ms,
+        };
         #[cfg(target_os = "linux")]
         drop(grant_fd);
         if entry.mock_discord.is_none() {
@@ -9119,8 +9130,7 @@ impl<C: Clock> Daemon<C> {
         self.sequence = sequence;
         entry.candidate = Some(Candidate {
             child,
-            #[cfg(target_os = "linux")]
-            launch_sequence: sequence,
+            identity,
             started: std::time::Instant::now(),
             ready_marker: marker,
             active_marker,
@@ -9277,10 +9287,6 @@ impl<C: Clock> Daemon<C> {
     /// (killed after a grace period).
     #[cfg(unix)]
     pub async fn commit_gateway_update(&mut self, key: &ShardKey) -> Result<(), DaemonError> {
-        let sequence = self
-            .sequence
-            .checked_add(1)
-            .ok_or(DaemonError::GenerationExhausted)?;
         let entry = self.entries.get_mut(key).ok_or(DaemonError::UnknownShard)?;
         let Some(candidate) = entry.candidate.take() else {
             return Err(DaemonError::InvalidState);
@@ -9294,7 +9300,6 @@ impl<C: Clock> Daemon<C> {
             }
         };
         let _ = std::fs::remove_file(&candidate.active_marker);
-        let pid = candidate.child.id();
         match self.recovery.replace_ready(
             entry.recovery_key,
             expected,
@@ -9304,13 +9309,7 @@ impl<C: Clock> Daemon<C> {
             Ok(mut old) => {
                 #[cfg(target_os = "linux")]
                 if let Some(service) = &mut self.local_identify.send_grants {
-                    service.promote(
-                        key,
-                        &LaunchGeneration {
-                            daemon_instance: self.instance,
-                            sequence: candidate.launch_sequence,
-                        },
-                    );
+                    service.promote(key, &candidate.identity.generation);
                 }
                 if let Some(pipe) = old.stdin.as_mut() {
                     let _ = tokio::time::timeout(Duration::from_millis(500), async {
@@ -9324,14 +9323,7 @@ impl<C: Clock> Daemon<C> {
                     child: old,
                     since: std::time::Instant::now(),
                 });
-                self.sequence = sequence;
-                if let (Some(pid), Some(identity)) = (pid, entry.snapshot.identity.as_mut()) {
-                    identity.pid = pid;
-                    identity.generation = LaunchGeneration {
-                        daemon_instance: self.instance,
-                        sequence,
-                    };
-                }
+                entry.snapshot.identity = Some(candidate.identity);
                 entry.graceful_stop = None;
                 entry.update_fallback_reserved = false;
                 Ok(())
