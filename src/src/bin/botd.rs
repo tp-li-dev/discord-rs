@@ -13,7 +13,7 @@ use std::{
     ffi::OsString,
     io,
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::Duration,
 };
 use tokio::{
@@ -25,10 +25,11 @@ const REQUEST_LIMIT: u64 = 4096;
 const RESPONSE_LIMIT: usize = management::RESPONSE_LIMIT;
 const DEADLINE: Duration = Duration::from_secs(3);
 const NONCE_RETRY_FOR: &str = "--enable-create-message-nonce-retry-for";
-const USAGE: &str = "usage: botd --file F --runtime-root ABS --gateway-program ABS (--bootstrap-stdin | --secret-file ABS [--control-port PORT | --control-socket ABS]) [--no-autostart] [--stop-children-on-exit] [--core-mode embedded|separate] [--identify-send-grants] [--enable-create-message-nonce-retry-for BOT_ID ...] [--mock-discord LOOPBACK_IP:PORT] [--allow-test-quorum] [--allow-raft-quorum --raft-store ABS --raft-rpc-listen LOOPBACK_IP:PORT --raft-rpc-peer ID=LOOPBACK_IP:PORT ... [--raft-create] [--raft-bootstrap]] [--allow-test-gateway-switch --mock-identify-budget F]";
+const USAGE: &str = "usage: botd --file F [--token-stdin] --runtime-root ABS --gateway-program ABS (--bootstrap-stdin | --secret-file ABS [--control-port PORT | --control-socket ABS]) [--no-autostart] [--stop-children-on-exit] [--core-mode embedded|separate] [--identify-send-grants] [--enable-create-message-nonce-retry-for BOT_ID ...] [--mock-discord LOOPBACK_IP:PORT] [--allow-test-quorum] [--allow-raft-quorum --raft-store ABS --raft-rpc-listen LOOPBACK_IP:PORT --raft-rpc-peer ID=LOOPBACK_IP:PORT ... [--raft-create] [--raft-bootstrap]] [--allow-test-gateway-switch --mock-identify-budget F]";
 
 struct Options {
     file: PathBuf,
+    token_stdin: bool,
     runtime_root: PathBuf,
     gateway_program: PathBuf,
     no_autostart: bool,
@@ -54,6 +55,7 @@ struct Options {
 fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'static str> {
     let mut args = args.into_iter();
     let mut file = None;
+    let mut token_stdin = false;
     let mut runtime_root = None;
     let mut gateway_program = None;
     let mut bootstrap = false;
@@ -122,6 +124,10 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
                 continue;
             }
             Some("--file") if file.is_none() => &mut file,
+            Some("--token-stdin") if cfg!(unix) && !token_stdin => {
+                token_stdin = true;
+                continue;
+            }
             Some("--runtime-root") if runtime_root.is_none() => &mut runtime_root,
             Some("--gateway-program") if gateway_program.is_none() => &mut gateway_program,
             Some("--raft-store") if raft_store.is_none() => &mut raft_store,
@@ -290,6 +296,7 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
     };
     let options = Options {
         file: file.ok_or(USAGE)?,
+        token_stdin,
         runtime_root: runtime_root.ok_or(USAGE)?,
         gateway_program: gateway_program.ok_or(USAGE)?,
         no_autostart,
@@ -348,6 +355,9 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
     }
     let test_or_raft =
         options.raft.is_some() || options.allow_test_quorum || options.allow_test_gateway_switch;
+    if options.token_stdin && (test_or_raft || options.secret_file.is_none()) {
+        return Err("--token-stdin requires standalone mode with --secret-file");
+    }
     if options.identify_send_grants && (test_or_raft || options.mock_discord.is_some()) {
         return Err("--identify-send-grants requires standalone live Discord");
     }
@@ -782,12 +792,79 @@ impl RecoveryAudit {
     }
 }
 
+type TokenFile = BTreeMap<String, src::redact::Secret<OsString>>;
+
+fn parse_token_file(contents: &str) -> Result<TokenFile, &'static str> {
+    let mut tokens = BTreeMap::new();
+    for line in contents.lines() {
+        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+            continue;
+        }
+        let (name, value) = line
+            .split_once('=')
+            .ok_or("invalid token file assignment")?;
+        if !src::placement::valid_token_env(name) {
+            return Err("invalid token file variable name");
+        }
+        if !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+        {
+            return Err("invalid token file value format");
+        }
+        if tokens
+            .insert(name.to_owned(), src::redact::Secret::new(value.into()))
+            .is_some()
+        {
+            return Err("duplicate token file variable name");
+        }
+    }
+    Ok(tokens)
+}
+
+fn read_token_input(reader: impl io::Read) -> Result<TokenFile, &'static str> {
+    use std::io::Read;
+
+    const MAX_FILE: u64 = 1024 * 1024;
+    let mut contents = String::new();
+    reader
+        .take(MAX_FILE + 1)
+        .read_to_string(&mut contents)
+        .map_err(|_| "cannot read token file")?;
+    if contents.len() as u64 > MAX_FILE {
+        return Err("token file too large");
+    }
+    parse_token_file(&contents)
+}
+
+fn read_token_file(path: &Path) -> Result<TokenFile, &'static str> {
+    read_token_input(std::fs::File::open(path).map_err(|_| "cannot open token file")?)
+}
+
+#[cfg(unix)]
+fn read_token_stdin() -> Result<TokenFile, &'static str> {
+    use std::os::fd::AsRawFd;
+
+    let tokens = read_token_input(io::stdin().lock())?;
+    let null = std::fs::File::open("/dev/null").map_err(|_| "cannot detach token input")?;
+    // SAFETY: null owns an open descriptor, stdin is open, and no child has
+    // been launched. Replacing fd 0 closes the credential file for this process.
+    if unsafe { libc::dup2(null.as_raw_fd(), libc::STDIN_FILENO) } < 0 {
+        return Err("cannot detach token input");
+    }
+    Ok(tokens)
+}
+
 async fn run() -> Result<(), &'static str> {
     use src::{
-        daemon::{Daemon, DaemonError, EnvironmentCredentials},
+        daemon::{CredentialSource, Daemon, DaemonError, EnvironmentCredentials},
         supervisor::RestartPolicy,
     };
     let options = parse_options(std::env::args_os().skip(1))?;
+    #[cfg(unix)]
+    let token_file = options.token_stdin.then(read_token_stdin).transpose()?;
+    #[cfg(not(unix))]
+    let token_file: Option<TokenFile> = None;
     let loaded = src::cluster_runtime::LoadedClusterConfig::load(&options.file)
         .map_err(|_| "cannot load daemon configuration")?;
     if options.raft.is_some() {
@@ -827,7 +904,12 @@ async fn run() -> Result<(), &'static str> {
     if options.identify_send_grants {
         daemon
             .enable_identify_send_grants(&options.runtime_root)
-            .map_err(|_| "Identify send grant journal unavailable")?;
+            .map_err(|error| match error {
+                DaemonError::IdentifyBootIdUnavailable => {
+                    "Identify send grants require the kernel boot ID (/proc/sys/kernel/random/boot_id or systemd identify-boot-id credential)"
+                }
+                _ => "Identify send grant journal unavailable",
+            })?;
     }
     daemon
         .configure_create_message_nonce_retry(&config, &options.nonce_retry_bots)
@@ -861,7 +943,10 @@ async fn run() -> Result<(), &'static str> {
         .port()
         .map_err(|_| "cannot inspect local daemon control")?;
     let audit = RecoveryAudit::open(options.runtime_root.join("recovery-audit.jsonl")).await?;
-    let credentials = EnvironmentCredentials;
+    let credentials = |name: &str| match &token_file {
+        Some(tokens) => tokens.get(name).map(|token| token.expose_secret().clone()),
+        None => EnvironmentCredentials.read(name),
+    };
     // Partial startup failures remain visible through snapshots. Dropping this
     // daemon, including any error below, deliberately does not force-kill children.
     let startup_ok = options.no_autostart || daemon.start_all(&credentials).is_ok();
@@ -1414,10 +1499,81 @@ async fn run_test_gateway_switch(
     result
 }
 
+#[cfg(unix)]
+fn exec_with_token(args: &[OsString]) -> Result<(), &'static str> {
+    use std::os::unix::process::CommandExt;
+
+    let [file, name, program, rest @ ..] = args else {
+        return Err("usage: botd --with-token FILE|- NAME /absolute/program [ARG ...]");
+    };
+    let name = name
+        .to_str()
+        .filter(|name| src::placement::valid_token_env(name))
+        .ok_or("invalid token variable name")?;
+    if !Path::new(program).is_absolute() {
+        return Err("token command must be an absolute path");
+    }
+    let tokens = if file == "-" {
+        read_token_stdin()?
+    } else {
+        read_token_file(Path::new(file))?
+    };
+    let token = tokens
+        .get(name)
+        .filter(|token| !token.expose_secret().is_empty())
+        .ok_or("selected token missing or empty")?;
+    let _ = std::process::Command::new(program)
+        .args(rest)
+        .env_clear()
+        .env(name, token.expose_secret())
+        .exec();
+    Err("cannot execute token command")
+}
+
+fn main() {
+    #[cfg(target_os = "linux")]
+    if src::redact::disable_process_dumps().is_err() {
+        eprintln!("botd: cannot disable process dumps");
+        std::process::exit(1);
+    }
+    daemon_main();
+}
+
 #[tokio::main(worker_threads = 2)]
-async fn main() {
+async fn daemon_main() {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
-    let result = if args.first().is_some_and(|arg| arg == "--shard-core") {
+    // exec replaces the current process and gives the command a fresh environment.
+    #[cfg(unix)]
+    if let [flag, rest @ ..] = args.as_slice()
+        && flag == "--with-token"
+    {
+        if let Err(error) = exec_with_token(rest) {
+            eprintln!("botd: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    #[cfg(unix)]
+    if matches!(args.as_slice(), [flag] if flag == "--check-env-stdin") {
+        if let Err(error) = read_token_stdin() {
+            eprintln!("botd: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    let result = if let [flag, path] = args.as_slice()
+        && flag == "--check-env-file"
+    {
+        read_token_file(Path::new(path)).map(|_| ())
+    } else if let [flag, name] = args.as_slice()
+        && flag == "--validate-token-name"
+    {
+        if name.to_str().is_some_and(src::placement::valid_token_env) {
+            Ok(())
+        } else {
+            Err("invalid token variable name")
+        }
+    } else if args.first().is_some_and(|arg| arg == "--shard-core") {
         src::worker::run_shard_core(args)
             .await
             .map_err(|_| "invalid or failed Shard Core process")
@@ -1443,6 +1599,30 @@ async fn main() {
 mod tests {
     use super::*;
     use tokio::io::{DuplexStream, duplex};
+
+    #[test]
+    fn token_file_checks_every_assignment_without_evaluating_it() {
+        let valid = "# credentials\r\nDISCORD_TEST_BOT_TOKEN=example.token\r\nTOKEN_ALPHA=\n";
+        let tokens = parse_token_file(valid).unwrap();
+        assert_eq!(
+            tokens["DISCORD_TEST_BOT_TOKEN"].expose_secret(),
+            "example.token"
+        );
+        for invalid in [
+            "LD_PRELOAD=example.token",
+            "RUST_BACKTRACE_TOKEN=example.token",
+            "DISCORD_RS_GATEWAY_TOKEN=example.token",
+            "export TOKEN_BETA=example.token",
+            "TOKEN_BETA=\"example.token\"",
+            "TOKEN_BETA=example.token\\",
+            "TOKEN_ALPHA=example.token",
+        ] {
+            assert!(
+                parse_token_file(&format!("{valid}{invalid}\n")).is_err(),
+                "{invalid}"
+            );
+        }
+    }
 
     fn options(extra: &[&str]) -> Vec<OsString> {
         let root = std::env::current_dir().unwrap();

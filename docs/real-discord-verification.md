@@ -27,7 +27,7 @@
   ```
 
   raw token のみ（`Bot ` の接頭辞・引用符・改行を含めない）。シェルを閉じれば消える。
-  systemd で動かす場合は `/etc/discord-rs/botd.env`（root:root 0600 または root:discord-rs 0640、`KEY=VALUE` 形式・`export` なし）に
+  systemd で動かす場合は `/etc/discord-rs/botd.env`（root:root 0600、`KEY=VALUE` 形式・`export` なし）に
   `sudo -e` で書く（[linux-deployment.md](linux-deployment.md)）。手動起動で env ファイルを使う場合も 0600 にする。
 - **Developer Portal の設定**（テスト用 Application のみ）:
   1. Application を作成し、Bot タブで Bot を作る。「Reset Token」で token を再生成し、表示された値をその場で上記の
@@ -109,7 +109,7 @@ read -rs DISCORD_TOKEN && export DISCORD_TOKEN
 ### 4. botd の起動（1 Shard）
 
 > **botd が読む token の環境変数名は、`bots.toml` の `token_env` と同じ名前でなければならない**（この手順書の例では `DISCORD_TEST_BOT_TOKEN`）。
-> **botd を起動する端末（systemd なら EnvironmentFile）で、その名前に token を設定してから起動する**。別の端末で設定した変数は、botd には渡らない。
+> **botd を起動する端末（systemd なら `StandardInput=file:` が開く token ファイル）で、その名前に token を設定してから起動する**。別の端末で設定した変数は、botd には渡らない。
 > 設定が無いと、子の起動前に失敗する: `botctl status --json` の `error` が `MissingCredential`、`state` が `Failed`、`restart_exhausted` が true、`gateway.log` はできない。
 > 名前は `grep token_env <bots.toml>` で確認できる。値は表示せず、設定の有無だけ確認する: `[ -n "${DISCORD_TEST_BOT_TOKEN:-}" ] && echo 設定済み`。
 > 起動に成功すると、Shard ごとの状態ディレクトリ（例 `<runtime-root>/bot-313031/shard-0/`）に `gateway.log`（0600）ができ、`--- gateway generation 1 ---` と `ログイン成功: …` が入る（2026-11-14 の実機で確認）。

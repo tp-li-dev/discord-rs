@@ -82,7 +82,7 @@ sudo install -o root -g discord-rs -m 0640 src/examples/placement.toml /etc/disc
 | `/opt/discord-rs/bin/*` | root:root | 0755 | 実行ファイルを `discord-rs` ユーザーが書換えられないようにする（任意バイナリ実行の回避） |
 | `/etc/discord-rs/` | root:discord-rs | 0750 | |
 | `/etc/discord-rs/bots.toml` | root:discord-rs | 0640 | 秘密値は書かない |
-| `/etc/discord-rs/botd.env` | root:discord-rs | 0640 または root:root 0600 | token を含む。systemd が root で読むため 0600 でも読める |
+| `/etc/discord-rs/botd.env` | root:root | 0600 | systemd が root で開き、botd の標準入力に接続する |
 | `/etc/discord-rs/botd.secret` | discord-rs:discord-rs | 0600（0400 も可） | 管理用 secret。botd/botctl が所有者・モードを検査する（下記「管理 secret」） |
 | `/var/lib/discord-rs`（状態） | discord-rs:discord-rs | 0700 | unit の `StateDirectory=` が作成・維持する |
 
@@ -94,7 +94,7 @@ sudo install -o root -g discord-rs -m 0640 src/examples/placement.toml /etc/disc
 `/etc/discord-rs/bots.toml` の書式は [運用ガイド](operator-guide.md) の例と
 `src/examples/placement.toml` を参照してください。`node.id` に一致する primary の Shard だけがそのホストで
 起動します。`bot_id` は u64 の正規 10 進文字列（Discord の ID。先頭ゼロや符号は不可）、`token_env` は Bot ごとに別名にします。
-同梱の Gateway（`src`）は、`--bot-id` が正規の数値でないと `invalid gateway launch arguments [launch_invalid]` で即座に終了します。botd はこれを事前に検出せず（`--gateway-program` は差し替え可能なため）、子が起動のたびに落ちて再起動を繰り返します。`status` の `processes` に `startup_failures` が増え続け、`state` が `Failed`（`ChildExited`、`code` 1）になっていたら、まず `bot_id` を確認してください。子の標準エラーは botd が破棄するので journald には出ません。
+同梱の Gateway（`src`）は、`--bot-id` が正規の数値でないと `invalid gateway launch arguments [launch_invalid]` で即座に終了します。botd はこれを事前に検出せず（`--gateway-program` は差し替え可能なため）、子が起動のたびに落ちて再起動を繰り返します。`status` の `processes` に `startup_failures` が増え続け、`state` が `Failed`（`ChildExited`、`code` 1）になっていたら、まず `bot_id` を確認してください。子の標準エラーは Shard の `gateway.log` で確認できます。ログを開けない場合のみ出力は破棄されます。
 編集後にオフライン検査します（daemon へ接続せず、token や Discord 接続は確認しません）。
 
 ```sh
@@ -104,19 +104,34 @@ sudo install -o root -g discord-rs -m 0640 src/examples/placement.toml /etc/disc
 ### token の置き場所
 
 ```sh
-sudo install -o root -g discord-rs -m 0640 deploy/botd.env.example /etc/discord-rs/botd.env
+sudo install -o root -g root -m 0600 deploy/botd.env.example /etc/discord-rs/botd.env
 sudo -e /etc/discord-rs/botd.env     # 変数名は bots.toml の token_env に合わせ、値を入れる
 ```
 
+同梱 unit の `StandardInput=file:` は token ファイルを読み取り専用で開きます。`ExecStartPre` と
+botd の `--token-stdin` が全行を検査し、botd は子を起動する前にその FD を閉じます。空行とコメント、`NAME=VALUE` を扱います。名前は
+`bots.toml` の `token_env` と同じ規則です。値は引用符なしの ASCII 英数字・`.`・`_`・`-` で、
+空欄はプレースホルダーです。重複や不正な行があれば、値を出力せず起動に失敗します。
+既存の drop-in を移行する場合は `EnvironmentFile=` を外し、`ExecStart` の上書きにも
+`--token-stdin` を入れてください。既存のファイルは `root:root 0600` に変更してください。
+
 値をコマンドラインに書いたり、`echo >>` で履歴に残したりしないでください。リポジトリ内のファイルに token を
-書かないでください。botd は `token_env` の環境変数から token を読み、そのBot用 Gateway にだけ渡します。Core
+書かないでください。botd は `token_env` で指定された token を、その Bot 用の Gateway にだけ渡します。Core
 （Worker）へ token は渡りません。
+
+単独の REST smoke を実行する場合は、選択した token だけを 1 プロセスの環境へ渡せます。
+次の例では root がファイルを開き、コマンドは `discord-rs` ユーザーで実行します。
+`--apply` を付けると Discord に接続します。
+
+```sh
+sudo sh -c 'exec runuser -u discord-rs -- /opt/discord-rs/bin/botd --with-token - \
+    DISCORD_TEST_BOT_TOKEN /absolute/path/to/discord_smoke --apply </etc/discord-rs/botd.env'
+```
 
 ### 管理 secret
 
 `botctl` が接続するための管理 secret（32 byte。64 文字の 16 進 1 行）をファイルで渡します。この unit は
-`ExecStart` で `--secret-file /etc/discord-rs/botd.secret --control-port 47321` を指定します（`LoadCredential=` は使わない
-方式に統一。コードは root 所有 0400 の `$CREDENTIALS_DIRECTORY` 配下も受理しますが、その構成は本手順の対象外で未検証です）。
+`ExecStart` で `--secret-file /etc/discord-rs/botd.secret --control-port 47321` を指定します。
 
 作成と配置（初回のみ。secret の値は表示されません）:
 
@@ -168,8 +183,13 @@ unit の要点（`deploy/systemd/botd.service` 内のコメントも参照）:
 - 起動引数は `--file`、`--runtime-root`、`--gateway-program`、`--secret-file`、`--control-port`（`src/src/bin/botd.rs` の USAGE）。
   `--runtime-root` は `/var/lib/discord-rs/runtime`（`StateDirectory=` で作成）。
 - `User=discord-rs`、`NoNewPrivileges=yes`、`ProtectSystem=strict`、`ProtectHome=yes`、`PrivateTmp=yes`、
-  `ReadWritePaths=/var/lib/discord-rs`、`EnvironmentFile=/etc/discord-rs/botd.env`、
+  `ReadWritePaths=/var/lib/discord-rs`、`StandardInput=file:/etc/discord-rs/botd.env`、
   `Restart=on-failure`、`RestartSec=5s`、`LimitNOFILE=65536`、ログは journald。
+- `--identify-send-grants` はカーネルの boot ID が必要です。`ProcSubset=pid` は維持し、
+  systemd が `LoadCredential=identify-boot-id:/proc/sys/kernel/random/boot_id` でその値だけを
+  読み取り専用で渡します。unit 以外の通常起動では procfs から読みます。
+  [Ubuntu 24.04 systemd.exec(5)](https://manpages.ubuntu.com/manpages/noble/man5/systemd.exec.5.html)
+  · [Linux procfs](https://docs.kernel.org/filesystems/proc.html#mount-options)
 - **`--stop-children-on-exit`（ExecStart）と `KillSignal=SIGTERM`**: このフラグ有効時、botd は SIGINT と SIGTERM の
   どちらでも、起動した全 Shard の Gateway 子へ graceful な停止を要求し、最大 30 秒待ってから終了します。止まった子の
   起動予約は解放されます。期限内に止まらない子は botd が強制終了せず、標準エラー（journald）に出して終了します。
@@ -179,8 +199,15 @@ unit の要点（`deploy/systemd/botd.service` 内のコメントも参照）:
   `KillSignal=SIGINT` に戻してください。この停止シーケンスは実機の systemd では未検証です。
 - **起動予約の整理**: botd の再起動時、前回の予約ファイルが残っていても、Linux では `/proc/*/cmdline` を調べてその
   Shard の Gateway（`--management-path` が一致）が生きていないと確認できた場合だけ、予約を削除して起動します。
-  生きている、または判定できない場合は従来どおり拒否します。`ProtectProc=invisible` でも同一ユーザー（`discord-rs`）の
-  Gateway は見えます。孤児の再採用（生きている子を新しい botd が引き継ぐ）は未実装のままです。
+  生きている、または判定できない場合は従来どおり拒否します。dumpable を無効にした Gateway の
+  `cmdline` を照合できるように、unit は `ProtectProc=default` と `ProcSubset=pid` を使います。
+  PID を隠す procfs では予約を自動回収しません。孤児の再採用は未実装です。
+- **クラッシュ時の保護**: unit の `LimitCORE=0` に加え、Linux の botd と Gateway は起動時に
+  `PR_SET_DUMPABLE=0` を設定します。カーネルによるクラッシュダンプとコアダンプハンドラーへの引き渡しを
+  抑止します。root の `CAP_SYS_PTRACE` による読み取りは可能です。Gateway の fd 一覧を含む soak 採取は
+  手順どおり root で実行します。P1 は Core の tmpfs 上の状態ファイルと Core の PID を使います。
+  [Linux の procfs アクセス判定](https://github.com/torvalds/linux/blob/v6.8/fs/proc/base.c)
+  · [Linux PR_SET_DUMPABLE](https://man7.org/linux/man-pages/man2/pr_set_dumpable.2const.html)
 - 同じ runtime root に対して複数の botd を同時に動かす構成は非対応です（一方が予約を作ってから Gateway を起動するまでの
   短い間、他方が予約を古いと誤判定する可能性があります）。
 - ローカルでは未ビルドで、動作は CI の結果待ちです。
@@ -294,7 +321,7 @@ journalctl --disk-usage                             # 容量確認
 | 直後に失敗して再起動を繰り返す | `StartLimitBurst` 超過で停止する。原因を直し `sudo systemctl reset-failed botd` の後に起動 |
 | env ファイル関連 | `/etc/discord-rs/botd.env` の存在・権限・変数名が `token_env` と一致するか。値が空でないか |
 | `Permission denied` | `/var/lib/discord-rs` の所有者 `discord-rs`・0700、`/opt` の実行権、`ProtectSystem=strict` で書込が必要な別パスがないか |
-| Gateway 子（`src`）が起動しない | `--gateway-program` が絶対パスの実行ファイルか。`ps -C src`。Gateway のログは保存されない（制約 3） |
+| Gateway 子（`src`）が起動しない | `--gateway-program` が絶対パスの実行ファイルか。`ps -C src`。Shard の `gateway.log` を確認する（制約 3） |
 | 再起動後に Bot が起動しない／重複起動拒否 | 予約が残り、その Shard の Gateway が `/proc` 上で生きている（または判定できない）場合に拒否される。生きていなければ botd が予約を自動削除して起動する（stderr に Shard キーと世代を 1 行出力）。孤児の再採用は未実装なので、`ps -C src` で孤児（Bot がオンラインのまま残った子）を確認し、運用者が整理する（運用ガイド「daemon終了時」）。unit の `--stop-children-on-exit` を使えば停止時に子も止まる |
 | Discord に接続できない | ネットワーク/DNS、token 失効、Intent 設定、Identify 制限。READY は botd では観測できないため、Discord 側の状態で確認する |
 | ファイル数不足 | `systemctl show botd -p LimitNOFILE`、`ls /proc/PID/fd | wc -l` |

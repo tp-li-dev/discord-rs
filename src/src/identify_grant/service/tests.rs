@@ -41,6 +41,24 @@ impl Drop for Root {
     }
 }
 
+#[test]
+fn boot_id_uses_the_systemd_copy_when_proc_is_hidden() {
+    let root = Root::new();
+    let proc = root.0.join("proc-boot-id");
+    let credential = root.0.join(BOOT_ID_CREDENTIAL);
+    std::fs::write(&credential, format!("{BOOT}\n")).unwrap();
+    assert_eq!(read_boot_id(&proc, Some(&root.0)).unwrap(), BOOT);
+    assert!(read_boot_id(&proc, None).is_err());
+    std::fs::write(&proc, ANOTHER_BOOT).unwrap();
+    assert_eq!(read_boot_id(&proc, Some(&root.0)).unwrap(), ANOTHER_BOOT);
+    std::fs::remove_file(&proc).unwrap();
+    std::fs::write(&credential, "invalid").unwrap();
+    assert_eq!(
+        read_boot_id(&proc, Some(&root.0)).unwrap_err().kind(),
+        io::ErrorKind::InvalidData
+    );
+}
+
 fn secs(n: u64) -> Duration {
     Duration::from_secs(n)
 }
@@ -91,6 +109,10 @@ async fn cancelling_an_in_flight_launch_keeps_its_charge_and_releases_the_writer
             .is_err()
     );
     timeout(secs(3), entered_sync).await.unwrap().unwrap();
+    assert_eq!(
+        service.check_restart_writer(),
+        Err(DaemonError::IdentifyJournalBusy)
+    );
     assert!(
         service
             .launch(&first.key, first.generation.clone(), false, false)
@@ -104,6 +126,11 @@ async fn cancelling_an_in_flight_launch_keeps_its_charge_and_releases_the_writer
             .is_err()
     );
     release.send(()).unwrap();
+    assert!(service.wait_for_write());
+    assert_eq!(
+        service.check_restart_writer(),
+        Err(DaemonError::IdentifyJournalBusy)
+    );
 
     timeout(secs(3), async {
         loop {
@@ -249,8 +276,20 @@ fn other_records_cannot_consume_restart_launch_and_first_grant_space() {
     let replacement = gateway(0, 1);
     let mut unrelated = gateway(0, 2);
     unrelated.key.bot_id = "43".into();
-    budget.limit = budget.len + 2 * RECORD_SPACE;
-    assert!(budget.reserve_restart_space(std::slice::from_ref(&replacement.key)));
+    let instance = replacement.generation.daemon_instance;
+    let space = RestartSpace::for_target(&replacement.key, instance).unwrap();
+    let target = std::slice::from_ref(&replacement.key);
+    // One byte below the conservative bound refuses without reserving anything.
+    budget.limit = budget.len + space.total() - 1;
+    assert_eq!(
+        budget.reserve_restart_space(target, instance),
+        Err(DaemonError::IdentifyJournalCapacity)
+    );
+    assert!(budget.restart_space.is_empty());
+    // The exact bound also fits comfortably below the old 8,194-byte cutoff.
+    assert!(space.total() < 8193);
+    budget.limit += 1;
+    assert_eq!(budget.reserve_restart_space(target, instance), Ok(()));
     assert_eq!(
         budget.launch(unrelated.clone(), secs(0), 1),
         LocalAdmission::Pending {
@@ -262,12 +301,15 @@ fn other_records_cannot_consume_restart_launch_and_first_grant_space() {
         LocalAdmission::Granted
     );
     assert_eq!(
-        budget.first_grant_space.get(&replacement.key),
+        budget
+            .first_grant_space
+            .get(&replacement.key)
+            .map(|grant| &grant.generation),
         Some(&replacement.generation)
     );
 
     // Use the rest of the unreserved space. The first grant must still fit.
-    budget.limit = budget.len + RECORD_SPACE;
+    budget.limit = budget.len + space.first_grant;
     assert_eq!(
         budget.identify(&unrelated, secs(0), false, false, false).0,
         State::Waiting
@@ -277,6 +319,7 @@ fn other_records_cannot_consume_restart_launch_and_first_grant_space() {
         State::Granted
     );
     assert!(budget.first_grant_space.is_empty());
+    budget.limit = budget.len + space.first_grant;
     assert_eq!(
         budget.identify(&unrelated, secs(0), false, false, false).0,
         State::Granted
@@ -346,7 +389,7 @@ fn a_lost_grant_counts_after_same_boot_restart_and_the_window_uses_expiry() {
 }
 
 #[test]
-fn torn_tail_is_discarded_but_a_corrupt_complete_record_fails_closed() {
+fn torn_tail_and_corrupt_complete_record_both_fail_closed() {
     use std::os::unix::fs::PermissionsExt;
 
     let root = Root::new();
@@ -374,6 +417,10 @@ fn torn_tail_is_discarded_but_a_corrupt_complete_record_fails_closed() {
             .unwrap();
     };
     append(b"{\"version\":1");
+    let torn = std::fs::read(root.path()).unwrap();
+    assert!(root.budget(BOOT, 1, 1).is_err());
+    assert_eq!(std::fs::read(root.path()).unwrap(), torn);
+    std::fs::write(root.path(), &original).unwrap();
     {
         let mut budget = root
             .budget(BOOT, 1, 1)
@@ -394,6 +441,83 @@ fn torn_tail_is_discarded_but_a_corrupt_complete_record_fails_closed() {
         .err()
         .expect("reject corrupt complete record");
     assert_eq!(error.to_string(), invalid_journal().to_string());
+}
+
+#[tokio::test]
+async fn missing_final_delimiter_preserves_an_acknowledged_reidentify_charge() {
+    let root = Root::new();
+    let active = gateway(0, 1);
+    let policy = LocalIdentifyPolicy {
+        min_interval: Duration::ZERO,
+        max_per_window: 2,
+        ..Default::default()
+    };
+    let budget = Budget::open(&root.0, BOOT, boot_now().unwrap(), policy).unwrap();
+    let mut service = Service::with_writer(budget, || {}).unwrap();
+    let launch = |service: &mut Service| {
+        service.launch(&active.key, active.generation.clone(), false, false)
+    };
+    assert!(launch(&mut service).is_err());
+    assert!(service.wait_for_write());
+    assert_eq!(launch(&mut service).unwrap(), LocalAdmission::Granted);
+    let mut gateway_socket = service
+        .attach(
+            &mut Command::new("/bin/true"),
+            &active.key,
+            active.generation,
+            false,
+        )
+        .unwrap();
+    gateway_socket.set_read_timeout(Some(secs(1))).unwrap();
+    let mut request = || {
+        gateway_socket.write_all(&[VERSION]).unwrap();
+        service.poll(|_| (false, false));
+        assert!(
+            service.wait_for_write(),
+            "request did not submit a durable grant"
+        );
+        let mut bytes = [0; 10];
+        gateway_socket.read_exact(&mut bytes).unwrap();
+        let Reply::Permit(expires) = Reply::decode(bytes) else {
+            panic!("expected a permit after the writer acknowledged the grant");
+        };
+        Duration::from_nanos(expires)
+    };
+    let first_expiry = request();
+    while let Some(remaining) = first_expiry.checked_sub(boot_now().unwrap()) {
+        tokio::time::sleep(remaining + Duration::from_millis(1)).await;
+    }
+    request();
+    drop(service);
+    let original = std::fs::read(root.path()).unwrap();
+    let without_delimiter = original.strip_suffix(b"\n").unwrap();
+    let last = without_delimiter.rsplit(|&b| b == b'\n').next().unwrap();
+    assert!(matches!(
+        serde_json::from_slice::<Record>(last).unwrap().action,
+        Action::Grant {
+            converts_launch: false,
+            ..
+        }
+    ));
+    std::fs::write(root.path(), without_delimiter).unwrap();
+    let mut budget = tokio::time::timeout(secs(2), async {
+        loop {
+            match Budget::open(&root.0, BOOT, boot_now().unwrap(), policy) {
+                // The detached writer can still be releasing its cloned file lock.
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                result => break result.unwrap(),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(std::fs::read(root.path()).unwrap(), original);
+    assert!(matches!(
+        budget.check("42", boot_now().unwrap(), 1),
+        LocalAdmission::Exhausted { .. }
+    ));
 }
 
 #[test]

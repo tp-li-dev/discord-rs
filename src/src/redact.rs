@@ -3,6 +3,16 @@ use std::fmt;
 
 pub const MASK: &str = "[REDACTED]";
 
+/// Protect credential-bearing process memory and crash metadata on Linux.
+#[cfg(target_os = "linux")]
+pub fn disable_process_dumps() -> std::io::Result<()> {
+    // SAFETY: PR_SET_DUMPABLE takes an integer, and no argument is a pointer.
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Install before parsing input or starting an async runtime. Never delegate to
 /// the previous hook: payloads, thread names and source paths may contain secrets.
 /// Unwinding/abort behavior and the resulting process exit status are unchanged.
@@ -295,6 +305,28 @@ pub fn redact(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn disables_dumpability_in_an_isolated_process() {
+        const CHILD: &str = "DISCORD_RS_TEST_DUMPABILITY_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            disable_process_dumps().unwrap();
+            // SAFETY: PR_GET_DUMPABLE reads the flag and takes no pointers.
+            assert_eq!(unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) }, 0);
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "redact::tests::disables_dumpability_in_an_isolated_process",
+            ])
+            .env(CHILD, "yes")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    }
 
     #[test]
     fn private_keys_and_structured_credentials_are_masked() {

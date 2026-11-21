@@ -35,12 +35,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Plan, &'static str>
                 .ok_or("argument_invalid")?
                 .into_string()
                 .map_err(|_| "argument_encoding")?;
-            if name.is_empty()
-                || name.len() > 128
-                || !name.bytes().enumerate().all(|(i, c)| {
-                    c == b'_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit())
-                })
-            {
+            if !src::placement::valid_token_env(&name) {
                 return Err("token_env_invalid");
             }
             plan.token_env = name;

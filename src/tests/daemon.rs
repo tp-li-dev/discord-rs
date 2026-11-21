@@ -279,6 +279,7 @@ fn nonce_retry_placement() -> String {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn nonce_retry_allowlist_is_used_for_normal_recovery_and_standby() {
+    use src::discord_message::NONCE_RETRY_FLAG;
     use std::{collections::HashSet, os::unix::fs::PermissionsExt};
 
     let root = Root::under(std::env::temp_dir().join("discord-rs-daemon-tests"));
@@ -292,13 +293,20 @@ if [ "$1" = '--core-listen' ]; then
 fi
 kind=active
 count=0
-for arg in "$@"; do
-    case "$arg" in
+operand=0
+while [ "$#" -gt 0 ]; do
+    case "$1" in
         --standby) kind=standby ;;
         --enable-create-message-nonce-retry) count=$((count + 1)) ;;
+        --custom)
+            [ "$#" -ge 2 ] && [ "$2" = '--enable-create-message-nonce-retry' ] || exit 91
+            operand=1
+            shift
+            ;;
     esac
+    shift
 done
-printf '%s\n' "$count" >> "$NONCE_TEST_DIR/$BOT_ID.$kind"
+printf '%s:%s\n' "$count" "$operand" >> "$NONCE_TEST_DIR/$BOT_ID.$kind"
 IFS= read -r ignored
 "##,
     )
@@ -309,6 +317,10 @@ IFS= read -r ignored
     let intents = config.local_primary_intents(&HashMap::new()).unwrap();
     let mut plan = shard_runtime::plan(&intents, &root.0).unwrap();
     for shard in &mut plan {
+        shard
+            .gateway
+            .args
+            .extend(["--custom".into(), NONCE_RETRY_FLAG.into()]);
         shard
             .gateway
             .environment
@@ -331,7 +343,7 @@ IFS= read -r ignored
         .configure_create_message_nonce_retry(&config, &allowlist)
         .unwrap();
 
-    // The fixture does not connect to Discord. Audit files contain flag counts only.
+    // The fixture records the daemon flag count and whether the custom operand survived.
     let fixture_credentials = |_: &str| Some(OsString::from("fixture"));
     let launches_match = |kind: &str, listed: &str, unlisted: &str| {
         [("101", listed), ("202", unlisted)]
@@ -342,7 +354,7 @@ IFS= read -r ignored
             })
     };
     daemon.0.start_all(&fixture_credentials).unwrap();
-    eventually(|| launches_match("active", "1\n", "0\n")).await;
+    eventually(|| launches_match("active", "1:1\n", "0:1\n")).await;
     assert_eq!(
         daemon
             .0
@@ -357,7 +369,7 @@ IFS= read -r ignored
     terminal(&mut daemon.0).await;
     clock.set(1);
     daemon.0.poll(&fixture_credentials).unwrap();
-    eventually(|| launches_match("active", "1\n1\n", "0\n0\n")).await;
+    eventually(|| launches_match("active", "1:1\n1:1\n", "0:1\n0:1\n")).await;
 
     for bot in ["101", "202"] {
         assert!(
@@ -367,7 +379,7 @@ IFS= read -r ignored
                 .unwrap()
         );
     }
-    eventually(|| launches_match("standby", "1\n", "0\n")).await;
+    eventually(|| launches_match("standby", "1:1\n", "0:1\n")).await;
     for bot in ["101", "202"] {
         let key = key(bot, 0);
         daemon.0.cancel_gateway_update(&key);

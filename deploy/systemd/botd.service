@@ -5,11 +5,11 @@
 #   /opt/discord-rs/bin/botd, botctl, src(Gateway)   root:root 0755
 #   /etc/discord-rs/bots.toml     配置設定（秘密値なし）            root:discord-rs 0640
 #   /etc/discord-rs/botd.secret   管理用 secret（16進 64 文字）     discord-rs:discord-rs 0600
-#   /etc/discord-rs/botd.env      token 等（EnvironmentFile）        root:discord-rs 0640 または 0600
+#   /etc/discord-rs/botd.env      token ファイル（標準入力）       root:root 0600
 #   /var/lib/discord-rs           状態（StateDirectory が 0700 で作成）
 #
 # token はこのファイルに書かない。token_env に対応する環境変数は botd.env にだけ置く。
-# （botd は環境変数から token を読み、そのBot用Gatewayにだけ渡す。Core には渡さない。）
+# （botd はファイルから token を読み、そのBot用Gatewayにだけ渡す。Core には渡さない。）
 
 [Unit]
 Description=discord-rs botd (Gateway/Core shard supervisor)
@@ -43,11 +43,13 @@ ExecStart=/opt/discord-rs/bin/botd \
     --runtime-root /var/lib/discord-rs/runtime \
     --gateway-program /opt/discord-rs/bin/src \
     --secret-file /etc/discord-rs/botd.secret \
+    --token-stdin \
     --control-port 47321 \
     --stop-children-on-exit
 
-# 秘密は別ファイル。先頭 "-" は付けない（ファイルが無ければ起動失敗にする）。
-EnvironmentFile=/etc/discord-rs/botd.env
+# systemd が root で開く。botd は検査後にこの FD を閉じてから子を起動する。
+StandardInput=file:/etc/discord-rs/botd.env
+ExecStartPre=/opt/discord-rs/bin/botd --check-env-stdin
 
 # 状態は /var/lib/discord-rs（0700, discord-rs 所有）。runtime-root はその配下。
 StateDirectory=discord-rs discord-rs/runtime
@@ -76,6 +78,7 @@ RestartSec=5s
 
 # --- 資源 ---
 LimitNOFILE=65536
+LimitCORE=0
 
 # --- ログは journald（stdout/stderr をそのまま渡す）---
 StandardOutput=journal
@@ -105,8 +108,12 @@ RemoveIPC=yes
 ProtectClock=yes
 ProtectKernelLogs=yes
 ProtectHostname=yes
-ProtectProc=invisible
+# hidepid would hide a non-dumpable Gateway from the stale-reservation scan.
+ProtectProc=default
 ProcSubset=pid
+# ProcSubset=pid hides /proc/sys. The manager reads just the boot ID for
+# --identify-send-grants and provides a read-only service credential.
+LoadCredential=identify-boot-id:/proc/sys/kernel/random/boot_id
 RestrictRealtime=yes
 SystemCallArchitectures=native
 # システムコールは @system-service のみ許可（通常のサーバ処理に必要な範囲）。@privileged と

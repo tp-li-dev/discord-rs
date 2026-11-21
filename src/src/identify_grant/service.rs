@@ -1,11 +1,11 @@
 use super::{PERMIT_TTL, Reply, VERSION, boot_now, nanos};
 use crate::{
-    daemon::{LaunchGeneration, ShardKey},
+    daemon::{DaemonError, LaunchGeneration, ShardKey},
     local_identify::{LocalAdmission, LocalIdentifyAdmission, LocalIdentifyPolicy},
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fs::File,
     io::{self, Read, Write},
     os::{fd::AsRawFd, unix::net::UnixStream},
@@ -21,10 +21,11 @@ use tokio::process::Command;
 #[cfg(test)]
 mod tests;
 
+const BOOT_ID_PATH: &str = "/proc/sys/kernel/random/boot_id";
+const BOOT_ID_CREDENTIAL: &str = "identify-boot-id";
 const JOURNAL_NAME: &str = "identify-send-grants.jsonl";
 const MAX_JOURNAL: u64 = 16 * 1024 * 1024;
 const MAX_LINE: usize = 4096;
-const RECORD_SPACE: u64 = MAX_LINE as u64 + 1;
 const JOURNAL_VERSION: u8 = 2;
 const RETRY_JOURNAL_SPACE: Duration = Duration::from_millis(100);
 const UNAVAILABLE: LocalAdmission = LocalAdmission::Exhausted {
@@ -92,6 +93,56 @@ enum Action {
     },
 }
 
+struct RestartSpace {
+    launch: u64,
+    first_grant: u64,
+}
+
+impl RestartSpace {
+    fn for_target(key: &ShardKey, instance: [u8; 16]) -> io::Result<Self> {
+        let gateway = Gateway {
+            key: key.clone(),
+            generation: LaunchGeneration {
+                daemon_instance: instance,
+                sequence: u64::MAX,
+            },
+        };
+        let size = |action| -> io::Result<u64> {
+            // Same JSON schema, with maximum-width dynamic fields and a
+            // fixed-width digest. Serializing also counts escaped Bot IDs.
+            let bytes = serde_json::to_vec(&Record {
+                version: JOURNAL_VERSION,
+                at_ns: u64::MAX,
+                action,
+                sha256: "0".repeat(64),
+            })?;
+            if bytes.len() > MAX_LINE {
+                return Err(io::Error::other("Identify grant record too large"));
+            }
+            Ok(bytes.len() as u64 + 1)
+        };
+        Ok(Self {
+            launch: size(Action::Launch {
+                gateway: gateway.clone(),
+            })?,
+            first_grant: size(Action::Grant {
+                gateway,
+                expires_ns: u64::MAX,
+                converts_launch: false, // Also covers a reservation that expires before use.
+            })?,
+        })
+    }
+
+    fn total(&self) -> u64 {
+        self.launch + self.first_grant
+    }
+}
+
+struct ReservedGrant {
+    generation: LaunchGeneration,
+    bytes: u64,
+}
+
 struct WriteRequest {
     bytes: Vec<u8>,
     ack: SyncSender<io::Result<()>>,
@@ -143,8 +194,8 @@ struct Budget {
     write_ack: Option<Receiver<io::Result<()>>>,
     len: u64,
     limit: u64,
-    restart_space: HashSet<ShardKey>,
-    first_grant_space: HashMap<ShardKey, LaunchGeneration>,
+    restart_space: HashMap<ShardKey, RestartSpace>,
+    first_grant_space: HashMap<ShardKey, ReservedGrant>,
     policy: LocalIdentifyPolicy,
     history: HashMap<String, LocalIdentifyAdmission>,
     boot: Option<String>,
@@ -175,14 +226,14 @@ impl Budget {
         if bytes.len() as u64 > MAX_JOURNAL {
             return Err(invalid_journal());
         }
-        let complete = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+        let needs_delimiter = !bytes.is_empty() && !bytes.ends_with(b"\n");
         let mut budget = Self {
             journal,
             writer: None,
             write_ack: None,
-            len: complete as u64,
+            len: bytes.len() as u64,
             limit: MAX_JOURNAL,
-            restart_space: HashSet::new(),
+            restart_space: HashMap::new(),
             first_grant_space: HashMap::new(),
             policy,
             history: HashMap::new(),
@@ -191,8 +242,8 @@ impl Budget {
             hold_until: Duration::ZERO,
             failed: false,
         };
-        for terminated in bytes[..complete].split_inclusive(|&b| b == b'\n') {
-            let line = &terminated[..terminated.len() - 1];
+        for entry in bytes.split_inclusive(|&b| b == b'\n') {
+            let line = entry.strip_suffix(b"\n").unwrap_or(entry);
             if line.len() > MAX_LINE {
                 return Err(invalid_journal());
             }
@@ -202,16 +253,23 @@ impl Budget {
             }
             budget.replay(record)?;
         }
-        if complete < bytes.len() {
-            budget.journal.file.set_len(budget.len)?;
-            budget.journal.file.sync_all()?;
-        }
-        if budget.boot.as_deref() == Some(boot) {
+        let same_boot = budget.boot.as_deref() == Some(boot);
+        if same_boot {
             budget.observe(now)?;
-        } else {
-            if !valid_boot_id(boot) {
+        } else if !valid_boot_id(boot) {
+            return Err(invalid_journal());
+        }
+        if needs_delimiter {
+            // A missing delimiter can follow an already acknowledged grant.
+            // Only repair after verifying the entire file, including that record.
+            if budget.len == MAX_JOURNAL {
                 return Err(invalid_journal());
             }
+            budget.journal.write_all(b"\n")?;
+            budget.journal.sync_all()?;
+            budget.len += 1;
+        }
+        if !same_boot {
             let hold_until_ns = nanos(budget.boot_hold_until(now));
             budget.append(
                 now,
@@ -270,20 +328,42 @@ impl Budget {
     }
 
     fn unreserved_bytes(&self) -> u64 {
-        let records = 2 * self.restart_space.len() + self.first_grant_space.len();
-        self.limit
-            .saturating_sub(self.len + RECORD_SPACE * records as u64)
+        let restart: u64 = self.restart_space.values().map(RestartSpace::total).sum();
+        let first_grants: u64 = self
+            .first_grant_space
+            .values()
+            .map(|grant| grant.bytes)
+            .sum();
+        self.limit.saturating_sub(self.len + restart + first_grants)
     }
 
-    fn reserve_restart_space(&mut self, targets: &[ShardKey]) -> bool {
-        if self.failed
-            || self.unreserved_bytes() < 2 * RECORD_SPACE * targets.len() as u64
-            || targets.iter().any(|key| self.restart_space.contains(key))
-        {
-            return false;
+    fn reserve_restart_space(
+        &mut self,
+        targets: &[ShardKey],
+        instance: [u8; 16],
+    ) -> Result<(), DaemonError> {
+        if self.failed {
+            return Err(DaemonError::IdentifyUnavailable);
         }
-        self.restart_space.extend(targets.iter().cloned());
-        true
+        if targets
+            .iter()
+            .any(|key| self.restart_space.contains_key(key))
+        {
+            return Err(DaemonError::IdentifyJournalBusy);
+        }
+        let reservations: HashMap<_, _> = targets
+            .iter()
+            .map(|key| {
+                RestartSpace::for_target(key, instance)
+                    .map(|space| (key.clone(), space))
+                    .map_err(|_| DaemonError::IdentifyJournalCapacity)
+            })
+            .collect::<Result<_, _>>()?;
+        if self.unreserved_bytes() < reservations.values().map(RestartSpace::total).sum::<u64>() {
+            return Err(DaemonError::IdentifyJournalCapacity);
+        }
+        self.restart_space.extend(reservations);
+        Ok(())
     }
 
     #[cfg(test)]
@@ -302,9 +382,14 @@ impl Budget {
         if admission != LocalAdmission::Granted {
             return admission;
         }
-        if reserved_restart && !self.restart_space.remove(&gateway.key) {
-            return UNAVAILABLE;
-        }
+        let reserved = if reserved_restart {
+            let Some(space) = self.restart_space.remove(&gateway.key) else {
+                return UNAVAILABLE;
+            };
+            Some(space)
+        } else {
+            None
+        };
         match self.append(
             now,
             Action::Launch {
@@ -319,9 +404,14 @@ impl Budget {
             }
             Err(_) => return UNAVAILABLE,
         }
-        if reserved_restart {
-            self.first_grant_space
-                .insert(gateway.key, gateway.generation);
+        if let Some(space) = reserved {
+            self.first_grant_space.insert(
+                gateway.key,
+                ReservedGrant {
+                    generation: gateway.generation,
+                    bytes: space.first_grant,
+                },
+            );
         }
         LocalAdmission::Granted
     }
@@ -371,7 +461,11 @@ impl Budget {
     }
 
     fn release_first_grant_space(&mut self, key: &ShardKey, generation: &LaunchGeneration) {
-        if self.first_grant_space.get(key) == Some(generation) {
+        if self
+            .first_grant_space
+            .get(key)
+            .is_some_and(|grant| &grant.generation == generation)
+        {
             self.first_grant_space.remove(key);
         }
     }
@@ -465,6 +559,24 @@ impl Budget {
     }
 }
 
+fn read_boot_id(proc_path: &Path, credentials: Option<&Path>) -> io::Result<String> {
+    let contents = match std::fs::read_to_string(proc_path) {
+        Ok(contents) => contents,
+        Err(error) => match credentials {
+            Some(dir) => std::fs::read_to_string(dir.join(BOOT_ID_CREDENTIAL))?,
+            None => return Err(error),
+        },
+    };
+    let boot = contents.trim();
+    if !valid_boot_id(boot) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid kernel boot ID",
+        ));
+    }
+    Ok(boot.to_owned())
+}
+
 fn valid_boot_id(id: &str) -> bool {
     id.len() == 36
         && id.bytes().enumerate().all(|(i, b)| match i {
@@ -546,9 +658,38 @@ pub(crate) struct Service {
 }
 
 impl Service {
-    pub(crate) fn open(root: &Path, policy: LocalIdentifyPolicy) -> io::Result<Self> {
-        let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
-        Self::with_writer(Budget::open(root, boot.trim(), boot_now()?, policy)?, || {})
+    pub(crate) fn open(root: &Path, policy: LocalIdentifyPolicy) -> Result<Self, DaemonError> {
+        let credentials = std::env::var_os("CREDENTIALS_DIRECTORY").map(std::path::PathBuf::from);
+        let boot = read_boot_id(Path::new(BOOT_ID_PATH), credentials.as_deref())
+            .map_err(|_| DaemonError::IdentifyBootIdUnavailable)?;
+        let now = boot_now().map_err(|_| DaemonError::IdentifyUnavailable)?;
+        let budget =
+            Budget::open(root, &boot, now, policy).map_err(|_| DaemonError::IdentifyUnavailable)?;
+        Self::with_writer(budget, || {}).map_err(|_| DaemonError::IdentifyUnavailable)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_with_sync_hook(
+        root: &Path,
+        policy: LocalIdentifyPolicy,
+        before_sync: impl FnMut() + Send + 'static,
+    ) -> io::Result<Self> {
+        let boot = read_boot_id(Path::new(BOOT_ID_PATH), None)?;
+        Self::with_writer(
+            Budget::open(root, boot.trim(), boot_now()?, policy)?,
+            before_sync,
+        )
+    }
+
+    pub(crate) fn check_restart_writer(&mut self) -> Result<(), DaemonError> {
+        self.settle_write(false);
+        if self.budget.failed {
+            Err(DaemonError::IdentifyUnavailable)
+        } else if self.write.is_some() || self.launch.is_some() || self.launch_waiting {
+            Err(DaemonError::IdentifyJournalBusy)
+        } else {
+            Ok(())
+        }
     }
 
     fn with_writer(
@@ -711,8 +852,12 @@ impl Service {
         }
     }
 
-    pub(crate) fn reserve_restart_space(&mut self, targets: &[ShardKey]) -> bool {
-        self.budget.reserve_restart_space(targets)
+    pub(crate) fn reserve_restart_space(
+        &mut self,
+        targets: &[ShardKey],
+        instance: [u8; 16],
+    ) -> Result<(), DaemonError> {
+        self.budget.reserve_restart_space(targets, instance)
     }
 
     pub(crate) fn release_restart_space(&mut self, targets: &[ShardKey]) {
@@ -730,8 +875,13 @@ impl Service {
     }
 
     #[cfg(test)]
-    pub(crate) fn limit_journal_remaining(&mut self, records: u64) {
-        self.budget.limit = self.budget.len + RECORD_SPACE * records;
+    pub(crate) fn limit_journal_remaining_to_one_restart(
+        &mut self,
+        key: &ShardKey,
+        instance: [u8; 16],
+    ) {
+        let required = RestartSpace::for_target(key, instance).unwrap().total();
+        self.budget.limit = self.budget.len + required;
     }
 
     fn observe_clock(&mut self) -> Option<Duration> {
@@ -875,6 +1025,7 @@ impl Service {
         serde_json::json!({
             "version": VERSION,
             "journal": if self.budget.failed { "unavailable" } else { "ready" },
+            "journal_unreserved_bytes": self.budget.unreserved_bytes(),
             "active": state(false),
             "standby": state(true),
         })
