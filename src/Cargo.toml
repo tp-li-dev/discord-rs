@@ -22,7 +22,11 @@ openraft = { version = "=0.9.26", features = ["serde", "storage-v2", "generic-sn
 
 [workspace]
 members = ["framework", "framework-macros"]
+exclude = ["vendor/twilight-gateway"]
 resolver = "3"
+
+[patch.crates-io]
+twilight-gateway = { path = "vendor/twilight-gateway" }
 
 [dev-dependencies]
 rcgen = "0.13"
