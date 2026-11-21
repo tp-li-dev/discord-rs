@@ -1647,14 +1647,26 @@ pub mod control {
             path: PathBuf,
             read: impl FnOnce(&Path) -> std::io::Result<CoreAuditReplay> + Send + 'static,
         ) -> std::io::Result<()> {
+            self.start_core_recovery_audit_with_clock(path, read, || {
+                (Self::boot_id(), crate::core_status::try_boot_ms())
+            })
+        }
+
+        #[cfg(unix)]
+        fn start_core_recovery_audit_with_clock(
+            &mut self,
+            path: PathBuf,
+            read: impl FnOnce(&Path) -> std::io::Result<CoreAuditReplay> + Send + 'static,
+            clock: impl FnOnce() -> (Option<String>, Option<u64>) + Send + 'static,
+        ) -> std::io::Result<()> {
             let (replay, receive) = tokio::sync::oneshot::channel();
             self.core_audit_ready = false;
             self.core_audit_worker = Some(self.start_audit_worker(
                 path,
                 move |path| {
                     let startup = read(path).map(|replay| {
-                        let boot_id = Self::boot_id();
-                        let clock = boot_id.as_deref().zip(crate::core_status::try_boot_ms());
+                        let (boot_id, boot_ms) = clock();
+                        let clock = boot_id.as_deref().zip(boot_ms);
                         let budget =
                             Self::replayed_core_restart_budget(&replay, Instant::now(), clock);
                         CoreAuditStartup {
@@ -1703,9 +1715,9 @@ pub mod control {
 
         #[cfg(unix)]
         fn boot_id() -> Option<String> {
-            let id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
-            let id = id.trim();
-            CoreAuditRow::valid_boot_id(id).then(|| id.to_owned())
+            crate::boot_id::read()
+                .ok()
+                .map(|id| id.to_ascii_lowercase())
         }
 
         #[cfg(unix)]
@@ -5531,6 +5543,67 @@ pub mod control {
                 );
                 let clock = Some((stamp.boot_id.as_str(), stamp.boot_ms + 900_000));
                 assert!(ControlPlane::replayed_core_restart_budget(&replay, now, clock).is_empty());
+            }
+
+            #[tokio::test]
+            async fn core_audit_replay_ages_charges_with_a_systemd_boot_id() {
+                const BOOT_ID: &str = "00000000-0000-4000-8000-000000000001";
+                let mut original = Fixture::new(false, None);
+                original.plane.core_audit_boot_id = Some(BOOT_ID.into());
+                let request = original.request(1, 0, true);
+                assert_eq!(original.submit(&request, Duration::ZERO)["ok"], true);
+                assert_eq!(original.complete(1, Duration::ZERO)["ok"], true);
+                let path = original.dir.join("core-recovery-audit.jsonl");
+                let replay = ControlPlane::read_core_recovery_audit(&path).unwrap();
+                let clock = replay
+                    .archived
+                    .values()
+                    .next()
+                    .unwrap()
+                    .terminal
+                    .as_ref()
+                    .unwrap()
+                    .charge_clock
+                    .as_ref()
+                    .unwrap();
+                assert_eq!(clock.boot_id, BOOT_ID);
+                let now = clock.boot_ms + CORE_RESTART_WINDOW.as_millis() as u64;
+
+                let credentials = original.dir.join("credentials");
+                std::fs::create_dir(&credentials).unwrap();
+                std::fs::write(credentials.join(crate::boot_id::CREDENTIAL), BOOT_ID).unwrap();
+                let hidden_proc = original.dir.join("hidden-proc");
+                let mut restarted = Fixture::new(false, None);
+                restarted
+                    .plane
+                    .start_core_recovery_audit_with_clock(
+                        path,
+                        ControlPlane::read_core_recovery_audit,
+                        move || {
+                            let id = crate::boot_id::read_from(&hidden_proc, Some(&credentials))
+                                .unwrap();
+                            (Some(id), Some(now))
+                        },
+                    )
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while restarted.plane.core_audit_replay.is_some() {
+                        restarted.plane.poll_core_audit_replay();
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert!(restarted.plane.core_audit_ready);
+                assert_eq!(restarted.plane.core_audit_boot_id.as_deref(), Some(BOOT_ID));
+                assert_eq!(restarted.plane.archived_core_restarts.len(), 1);
+                assert!(restarted.plane.core_restart_history.is_empty());
+                assert!(
+                    restarted
+                        .plane
+                        .shutdown_control_audits_with_timeout(Duration::from_secs(2))
+                        .await
+                );
             }
 
             #[test]

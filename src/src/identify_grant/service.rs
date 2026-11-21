@@ -21,8 +21,9 @@ use tokio::process::Command;
 #[cfg(test)]
 mod tests;
 
-const BOOT_ID_PATH: &str = "/proc/sys/kernel/random/boot_id";
-const BOOT_ID_CREDENTIAL: &str = "identify-boot-id";
+use crate::boot_id::{self, valid as valid_boot_id};
+#[cfg(test)]
+use crate::boot_id::{CREDENTIAL as BOOT_ID_CREDENTIAL, read_from as read_boot_id};
 const JOURNAL_NAME: &str = "identify-send-grants.jsonl";
 const MAX_JOURNAL: u64 = 16 * 1024 * 1024;
 const MAX_LINE: usize = 4096;
@@ -559,32 +560,6 @@ impl Budget {
     }
 }
 
-fn read_boot_id(proc_path: &Path, credentials: Option<&Path>) -> io::Result<String> {
-    let contents = match std::fs::read_to_string(proc_path) {
-        Ok(contents) => contents,
-        Err(error) => match credentials {
-            Some(dir) => std::fs::read_to_string(dir.join(BOOT_ID_CREDENTIAL))?,
-            None => return Err(error),
-        },
-    };
-    let boot = contents.trim();
-    if !valid_boot_id(boot) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid kernel boot ID",
-        ));
-    }
-    Ok(boot.to_owned())
-}
-
-fn valid_boot_id(id: &str) -> bool {
-    id.len() == 36
-        && id.bytes().enumerate().all(|(i, b)| match i {
-            8 | 13 | 18 | 23 => b == b'-',
-            _ => b.is_ascii_hexdigit(),
-        })
-}
-
 fn invalid_journal() -> io::Error {
     io::Error::other("invalid Identify grant journal")
 }
@@ -659,9 +634,7 @@ pub(crate) struct Service {
 
 impl Service {
     pub(crate) fn open(root: &Path, policy: LocalIdentifyPolicy) -> Result<Self, DaemonError> {
-        let credentials = std::env::var_os("CREDENTIALS_DIRECTORY").map(std::path::PathBuf::from);
-        let boot = read_boot_id(Path::new(BOOT_ID_PATH), credentials.as_deref())
-            .map_err(|_| DaemonError::IdentifyBootIdUnavailable)?;
+        let boot = boot_id::read().map_err(|_| DaemonError::IdentifyBootIdUnavailable)?;
         let now = boot_now().map_err(|_| DaemonError::IdentifyUnavailable)?;
         let budget =
             Budget::open(root, &boot, now, policy).map_err(|_| DaemonError::IdentifyUnavailable)?;
@@ -674,7 +647,7 @@ impl Service {
         policy: LocalIdentifyPolicy,
         before_sync: impl FnMut() + Send + 'static,
     ) -> io::Result<Self> {
-        let boot = read_boot_id(Path::new(BOOT_ID_PATH), None)?;
+        let boot = boot_id::read()?;
         Self::with_writer(
             Budget::open(root, boot.trim(), boot_now()?, policy)?,
             before_sync,

@@ -1,3 +1,5 @@
+#[cfg(unix)]
+mod boot_id;
 pub mod botref;
 pub mod build_env;
 pub mod cert_policy;
