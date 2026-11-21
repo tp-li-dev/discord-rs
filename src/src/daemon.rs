@@ -7576,17 +7576,25 @@ pub mod control {
                 plane.daemon.start(&first, &credentials).unwrap();
                 plane.daemon.start(&second, &credentials).unwrap();
                 let pids = [running_pid(&plane, &first), running_pid(&plane, &second)];
+                let instance = plane.daemon.instance;
                 plane
                     .daemon
                     .local_identify
                     .send_grants
                     .as_mut()
                     .unwrap()
-                    .limit_journal_remaining(2);
+                    .limit_journal_remaining_to_one_restart(&first, instance);
+                let available = plane.daemon.snapshots()[0]
+                    .identify_send_grant
+                    .as_ref()
+                    .unwrap()["journal_unreserved_bytes"]
+                    .as_u64()
+                    .unwrap();
+                assert!(available < 8193);
 
                 assert_eq!(
                     plane.request(&restart_all(1))["error"],
-                    "IdentifyUnavailable"
+                    "IdentifyJournalCapacity"
                 );
                 plane.tick(&credentials).await;
                 assert!(plane.operations.is_empty());
@@ -7758,7 +7766,7 @@ pub mod control {
                 time.send_replace(Duration::from_secs(31));
                 assert_eq!(
                     plane.request(&restart_all(1))["error"],
-                    "IdentifyUnavailable"
+                    "IdentifyJournalCapacity"
                 );
                 plane.tick(&credentials).await;
                 assert_eq!(
@@ -8317,6 +8325,7 @@ pub enum DaemonError {
     IdentifyUnavailable,
     IdentifyJournalPending,
     IdentifyJournalBusy,
+    IdentifyJournalCapacity,
     RestartBudget,
     RestartDeferred,
     NoRuntime,
@@ -9198,12 +9207,12 @@ impl<C: Clock> Daemon<C> {
         }
         #[cfg(target_os = "linux")]
         if let Some(service) = &mut self.local_identify.send_grants
-            && !service.reserve_restart_space(targets)
+            && let Err(error) = service.reserve_restart_space(targets, self.instance)
         {
             for bot in reserved {
                 self.local_identify.release_restart(bot);
             }
-            return Err(DaemonError::IdentifyUnavailable);
+            return Err(error);
         }
         Ok(())
     }

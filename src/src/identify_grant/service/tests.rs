@@ -258,8 +258,20 @@ fn other_records_cannot_consume_restart_launch_and_first_grant_space() {
     let replacement = gateway(0, 1);
     let mut unrelated = gateway(0, 2);
     unrelated.key.bot_id = "43".into();
-    budget.limit = budget.len + 2 * RECORD_SPACE;
-    assert!(budget.reserve_restart_space(std::slice::from_ref(&replacement.key)));
+    let instance = replacement.generation.daemon_instance;
+    let space = RestartSpace::for_target(&replacement.key, instance).unwrap();
+    let target = std::slice::from_ref(&replacement.key);
+    // One byte below the conservative bound refuses without reserving anything.
+    budget.limit = budget.len + space.total() - 1;
+    assert_eq!(
+        budget.reserve_restart_space(target, instance),
+        Err(DaemonError::IdentifyJournalCapacity)
+    );
+    assert!(budget.restart_space.is_empty());
+    // The exact bound also fits comfortably below the old 8,194-byte cutoff.
+    assert!(space.total() < 8193);
+    budget.limit += 1;
+    assert_eq!(budget.reserve_restart_space(target, instance), Ok(()));
     assert_eq!(
         budget.launch(unrelated.clone(), secs(0), 1),
         LocalAdmission::Pending {
@@ -271,12 +283,15 @@ fn other_records_cannot_consume_restart_launch_and_first_grant_space() {
         LocalAdmission::Granted
     );
     assert_eq!(
-        budget.first_grant_space.get(&replacement.key),
+        budget
+            .first_grant_space
+            .get(&replacement.key)
+            .map(|grant| &grant.generation),
         Some(&replacement.generation)
     );
 
     // Use the rest of the unreserved space. The first grant must still fit.
-    budget.limit = budget.len + RECORD_SPACE;
+    budget.limit = budget.len + space.first_grant;
     assert_eq!(
         budget.identify(&unrelated, secs(0), false, false, false).0,
         State::Waiting
@@ -286,6 +301,7 @@ fn other_records_cannot_consume_restart_launch_and_first_grant_space() {
         State::Granted
     );
     assert!(budget.first_grant_space.is_empty());
+    budget.limit = budget.len + space.first_grant;
     assert_eq!(
         budget.identify(&unrelated, secs(0), false, false, false).0,
         State::Granted
