@@ -11,9 +11,17 @@
 
 `botd` の更新操作はサーバー側 capability を principal・role・shard scope に結び付け、監査と操作 ID を使う。遠隔管理全体や再起動を跨ぐ冪等性は未完成。
 
-2026-11-12 調査・適用。基準は architecture.md §4.3 / §13.1。今回の担当範囲の現状は次節、従来の調査と検証履歴は後段に記載する。担当外の logger 等が残るため、リポジトリ全体の秘密保護完了は主張しない。progress.md / handoff.md は今回の指示に従い変更していない。
+### 従来の manage / reload のビルド環境
+
+`manage start` の初回ビルド、常駐管理プロセスの `manage update`、`reload general` の Cargo 子プロセスは、`env_clear` の後に[運用ガイドの許可リスト](operator-guide.md#ビルド子プロセスの環境)にある親の環境変数だけを設定する。名前に `TOKEN` を含む変数は ASCII の大文字小文字を問わず除外するため、`LC_*` に該当する名前や将来の許可リスト追加でも、配置の Bot 資格情報参照名と内部名 `DISCORD_RS_GATEWAY_TOKEN` は渡らない。`reload` の `DISCORD_BUILD_ID` は更新時に生成する。
+
+この境界は管理 CLI が起動する Cargo に適用する。シェルから直接起動する Cargo は、Bot の資格情報を設定する前に実行する。同じ OS ユーザーのファイルやプロセスへアクセスできるビルドコードから資格情報を隔離するには、資格情報を持たない別ユーザーでビルドする。
+
+`botd` の配置から起動する Gateway は、通常起動と standby の両方で親環境を消去し、対象 Bot の資格情報だけを内部名で設定する。配置プランの追加環境は空で、模擬 Discord 起動では資格情報を渡さない。
 
 ## 残課題6：今回の出力境界の修正
+
+2026-11-12 調査・適用。基準は architecture.md §4.3 / §13.1。今回の担当範囲の現状は本節、従来の調査と検証履歴は後段に記載する。担当外の logger 等が残るため、リポジトリ全体の秘密保護完了は主張しない。progress.md / handoff.md は今回の指示に従い変更していない。
 
 対象は `redact.rs`、`main.rs`、`bin/doctor.rs`、`bin/register.rs`、`bin/reload.rs`、`bin/manage.rs` と `worker.rs` のログ・エラー出力箇所。daemon.rs、botd.rs、botctl.rs、cogs、framework は変更していない。以下が後段の過去の「未対応」記述より優先する現状である。
 
@@ -79,7 +87,7 @@ Worker の stdout は JSON IPC 専用で、通常の content/state や設定を�
 | `src/src/bin/manage.rs` | reload の stdout / stderr をそのまま表示し、管理の message / 起動エラーをログや last_failure に保存・応答する。Endpoint / Request の secret は String だが Debug derive はない。 | 子プロセス出力と管理応答の入口・表示・保存に保護を適用。secret の型を Secret にし、専用 wire 型で意図的にシリアライズする。シリアライズ内容自体はログに出さない。 |
 | `src/src/bin/register.rs`, `doctor.rs`, `reload.rs` | main の Result / `?` 経由で外部エラーが表示されうる。register の schema 表示、reload の build 名表示にも汎用マスクはない。 | CLI 最上位で固定分類・マスク済み説明へ変換。利用者が秘密を schema や build 名に混入させない設計・検証。 |
 | `src/src/placement.rs`, `gateway_metadata.rs` | 配置検証は不正 ID を本文へ含めず、メタデータの取得失敗は main 側で固定エラーに変換。配置には token 値でなく環境変数名を持つ。 | 既存対策あり。設定構造体の Debug 等を将来ログへ出す場合にも未信頼文字列の混入に注意。 |
-| `src/src/shard_runtime.rs`, `worker.rs`, `bin/manage.rs`, `bin/reload.rs` | Shard 起動仕様は token 環境参照を Gateway 側へ限定。Worker やビルドでは DISCORD_TOKEN を env_remove する箇所がある。 | 実プロセス分離への配線と全環境変数の継承許可リストを別途検証。別名の Bot token 環境変数まで除去される保証はない。今回 Core へ token を渡す変更はない。 |
+| `src/src/shard_runtime.rs`, `worker.rs`, `bin/manage.rs`, `bin/reload.rs` | Shard 起動仕様は token 環境参照を Gateway 側へ限定。当時のビルド経路は `DISCORD_TOKEN` だけを除外していた。 | 現在のビルド境界は「従来の manage / reload のビルド環境」を参照。環境を継承する従来の Worker 起動では `DISCORD_TOKEN` だけを除外する。 |
 | `src/src/local_control.rs` | ListRequest / Bootstrap は Debug を持たず、認証失敗・不正 JSON は固定エラー。認証秘密は定数時間比較し匿名パイプ bootstrap を使用。 | 秘密配列を JSON や Debug 可能な汎用コンテナに変換した後のログは別途禁止。今回の文字列マスクはバイト配列形式の秘密全体を保証しない。 |
 | 管理経路全体 | ローカル制御の認証は存在するが、遠隔 mTLS / RBAC、永続監査、Windows ACL はこのマスク機能では実装・検証していない。 | §4.3 の認証・権限・監査要件を独立して実装・確認する。マスクを認証の代替にしない。 |
 

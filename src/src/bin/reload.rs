@@ -1,10 +1,11 @@
+use src::build_env::cargo_command;
 use src::redact::{MASK, error_diagnostic};
 use std::{
     env,
     error::Error,
     fs,
     path::PathBuf,
-    process::{Command, ExitStatus, Stdio},
+    process::{ExitStatus, Stdio},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -89,10 +90,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     let id = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let build = format!("build-{id}");
     println!("Workerをビルドしています");
-    let status = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+    let status = cargo_command()
         .current_dir(&root)
         .env("DISCORD_BUILD_ID", &build)
-        .env_remove("DISCORD_TOKEN")
         .args([
             "build",
             "--offline",
@@ -160,6 +160,7 @@ fn run() -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     #[test]
     #[ignore = "subprocess fixture"]
