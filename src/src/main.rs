@@ -1533,8 +1533,8 @@ async fn live_events(
                 });
             }
             Ok(Event::GatewayClose(frame)) => {
-                // Only the numeric close code: it is not a secret and tells the operator
-                // why Discord closed the connection (4004, 4014, 4000-series, ...).
+                // Log only the numeric status. Twilight can also synthesize 1006 for an
+                // abnormal closure; the optional frame does not necessarily come from Discord.
                 match frame {
                     Some(frame) => {
                         eprintln!("Gateway 切断: close code {} ({})", frame.code, utc_stamp())
