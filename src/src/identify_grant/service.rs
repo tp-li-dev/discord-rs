@@ -715,8 +715,8 @@ impl Service {
     ) -> Result<LocalAdmission, crate::local_identify::JournalPending> {
         use crate::local_identify::JournalPending;
         self.settle_write(false);
-        if !self.restart_writer.is_empty()
-            && !(reserved_restart && self.restart_writer.contains(key))
+        if !(self.restart_writer.is_empty()
+            || reserved_restart && self.restart_writer.contains(key))
         {
             return Err(JournalPending);
         }
