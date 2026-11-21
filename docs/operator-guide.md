@@ -379,28 +379,27 @@ cargo run --offline --bin register -- 123456789012345678 234567890123456789 gree
 
 ## ローカル起動・状態・停止：manage
 
-秘密をソース・ログ・コマンド履歴に記録しない方法で `DISCORD_TOKEN` を設定します。prefix処理には Message Content Intent が必要です。実行バイナリはGateway情報を取得し、設定総Shard数がDiscord推奨値未満の場合は起動を拒否します。manageの既定は1Shardです。取得失敗・timeoutでも起動しません。IdentifyキューはGatewayプロセス内だけで、別プロセス・ホスト・再起動を跨ぐBot単位の予算共有は未接続です。
-
-内部のCargo呼び出しもofflineにする場合、管理プロセス起動前に環境を設定します。
+`src/` で、Bot の資格情報を設定する前に管理 CLI をビルドします。
 
 ```sh
-# Linux shell（サポート対象）
-export CARGO_NET_OFFLINE=true
+cargo build --offline --bin manage --bin reload
 ```
 
-（過去のWindows開発機での実行には PowerShell で `$env:CARGO_NET_OFFLINE = 'true'` を使用した記録がありますが、Windowsはサポート外です。）
+秘密をソース・ログ・コマンド履歴に記録しない方法で `DISCORD_TOKEN` を設定します。prefix処理には Message Content Intent が必要です。実行バイナリはGateway情報を取得し、設定総Shard数がDiscord推奨値未満の場合は起動を拒否します。manageの既定は1Shardです。取得失敗・timeoutでも起動しません。IdentifyキューはGatewayプロセス内だけで、別プロセス・ホスト・再起動を跨ぐBot単位の予算共有は未接続です。
+
+以下は既定のビルド出力先を使う例です。`CARGO_TARGET_DIR` などで変更した場合は、その出力先の実行ファイルを使います。
 
 ```sh
-cargo run --offline --bin manage -- start
-cargo run --offline --bin manage -- status
-cargo run --offline --bin manage -- logs
-cargo run --offline --bin manage -- list-unknown
-cargo run --offline --bin manage -- metrics-json
-cargo run --offline --bin manage -- metrics-prometheus
-cargo run --offline --bin manage -- stop
-cargo run --offline --bin manage -- start
-cargo run --offline --bin manage -- restart
-cargo run --offline --bin manage -- shutdown
+./target/debug/manage start
+./target/debug/manage status
+./target/debug/manage logs
+./target/debug/manage list-unknown
+./target/debug/manage metrics-json
+./target/debug/manage metrics-prometheus
+./target/debug/manage stop
+./target/debug/manage start
+./target/debug/manage restart
+./target/debug/manage shutdown
 ```
 
 | 操作 | 現在の挙動 |
@@ -421,9 +420,9 @@ cargo run --offline --bin manage -- shutdown
 ## Worker更新：update / reload
 
 ```sh
-cargo run --offline --bin manage -- update
+./target/debug/manage update
 # 同じWorker更新を、管理CLIを経由せず依頼する場合
-cargo run --offline --bin reload -- general
+./target/debug/reload general
 ```
 
 `general` だけを受け付け、実際は全Workerを1個ずつ更新します。Rustコードの動的ロードやGateway更新ではありません。親/Gateway/HTTP部分の変更は親の再起動が必要です。
@@ -437,6 +436,22 @@ reloadはreleaseビルド → `src/workers/` への成果物コピー → `src/w
 実Gatewayで使う成果物にはWorkerのReady/Helloで `api-result-v1`、`command-dispatch-v1`、`slash-arguments-v1`、`ready-event-v1` を確認できることが必要です。初回起動・更新・復旧で不足する候補は採用前に拒否し、更新時の旧Workerの状態・受付を維持します。汎用Manager APIの旧v5互換は残りますが、それだけを実Gateway用成果物の適合性確認とは扱わないでください。
 
 引き継ぎ対象は `!count` のカウンターと `!job` の計算状態です。`!job start` はチャンネルごとに1個の計算を開始し、Workerの約1秒周期で進みます。`!job status`、更新、再度statusで明示的checkpointの継続を確認できます。任意のFutureや外部APIの実行途中を移動しません。StateMap/Cogの状態はsnapshot対象外です。
+
+### ビルド子プロセスの環境
+
+`manage start`、`manage update`、`reload general` が内部で起動する Cargo は常に `--offline` で動きます。次の環境変数を、設定されているものだけ、表記どおりの大文字小文字で引き継ぎます。
+
+| 環境変数 | 用途 |
+|---|---|
+| `PATH` | Rust ツールチェーン、リンカーなどの検索 |
+| `HOME`、`CARGO_HOME`、`RUSTUP_HOME`、`RUSTUP_TOOLCHAIN` | Cargo の設定とオフラインキャッシュ、rustup の格納先とツールチェーン選択 |
+| `LANG`、`LC_*`、`TERM`、`TMPDIR` | ロケール、端末設定、一時ファイルの保存先 |
+| `CARGO_TARGET_DIR` | `manage update` で `reload` をビルドする際の出力先。Bot と Worker の release ビルドは明示した `target/reload-build` を使う |
+| `CARGO_NET_OFFLINE`、`CARGO_TERM_COLOR`、`CARGO_INCREMENTAL`、`CARGO_PROFILE_DEV_DEBUG` | 従来のオフライン設定と CI の色・増分ビルド・デバッグ情報設定 |
+
+`CARGO` で使用する実行ファイルを指定できます。`manage update` の Cargo は、`reload` に中継するために `CARGO` と `DISCORD_WORKER_FILE` も受け取ります。中継する値は常駐管理プロセスの起動時の設定です。名前に `TOKEN` を含む変数は ASCII の大文字小文字を問わず除外します。依存取得用のプロキシ設定や CA 設定は、資格情報を設定する前の `cargo fetch --locked` で使います。
+
+従来シェルの `CARGO_BUILD_JOBS` や `RUSTFLAGS` で指定していた設定が必要な場合は、信頼できる `.cargo/config.toml` の `[build]` で `jobs = 2` や `rustflags = ["..."]` を明示します。`PKG_CONFIG_PATH` など、ビルドツールが環境変数として必要とする非機密の設定は、同じファイルの `[env]` に名前と値を個別に記載できます。Cargo 設定に Bot の資格情報を記載しないでください。
 
 ### 確認済みスナップショットの永続化（Gateway／botd 再起動後の `!count`）
 
