@@ -714,3 +714,11 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 ## 2026-11-21 静的セキュリティスキャンの結果を受領
 - ユーザーが提供した Codex Security のスキャン結果（リビジョン `5b60670` 対象、6 件：高 1、中 4、低 1）を、`docs/security-scan-2026-11-21.md` に要約した。**最優先は高の #2（管理用の秘密を、サーバーの確認前に、固定ポートへ送る）。** `work/ctl`（相互の challenge-response、認証前の枠の分離）と `work/buildenv`（旧式ビルドの環境の遮断）を Sol に依頼した。#4（結果不明の解消操作）と #5（REST 予算の統合）は、管理経路の変更が入ってから着手する。#3（実験用の Raft）は既知の制約。
 - 同日の Astra の大規模監査（12 件）の指摘のうち、token がログに出得る問題（環境変数名 `LD_PRELOAD` など）は `work/fixa` で修正済み（main に統合）。確認の監査を実行中。
+
+## 2026-11-21 監査・スキャンの指摘の修正を統合（main = 4079e95）
+- **統合（すべて Rust CI と systemd smoke が成功）：** `work/vendor`（Twilight の取り込みの一致検査と、fixture への patch の引き継ぎ）、`work/fixa`・`work/fixb`（大規模監査 12 件）、`work/buildenv`（スキャン #6）、`work/ctl`（スキャン #2・#1：相互認証、認証前の枠の分離、Unix ソケットの選択肢）、`work/fixc`（確認監査 10 件：token の保存、systemd の boot ID、再起動の事前確認、ジャーナルの整合性、ダンプ禁止ほか）。
+- **Astra の確認監査（`aece6e2` 対象）：** 12 件のうち 11 件が修正済みと確認、1 件（token の保存経路）が未修正で、新しい指摘 10 件。10 件は `work/fixc` で対応。**この `fixc` の修正に対する再確認の監査は、まだ行っていない。**
+- **統合で見つかった問題と対応：** (1) `Candidate` の構造変更に既存の P3 試験が追従していなかった（試験を修正）。(2) `work/ctl` が古い形式で botd と話す fixture（`update_load`、`e2e_cluster_processes`）を壊していた（共通の認証クライアントに移行）。(3) `work/ctl` の `fork` と `flock` の競合（ジャーナルのロックを明示的に解放）。(4) `work/fixc` が、既存の試験 `restart_all_releases_earlier_bot_reservations...` の期待値を、実行せずに書き換えていた（元に戻した）。(5) `work/fixc` のダンプ禁止で、ダンプ不可のプロセスの `/proc/PID/exe` が読めなくなり、試験の確認が失敗した（試験は `cmdline` で確認。本番のコードは `exe` を読んでいない）。
+- **未検証：** Oracle への導入（P3、nonce、Identify の統一、送信時の許可、管理経路の相互認証、systemd unit の変更はいずれも未導入）。実 Discord での送信時の許可の動作。Ubuntu の本番相当の環境での、管理経路の Unix ソケットの運用。ダンプ禁止下での実クラッシュの挙動。
+- **運用上の注意（Oracle に入れるとき）：** `botctl` と `botd` は同じリリースを一緒に入れ替える（新しい botd は古い形式の要求を拒否する）。以前の経路（固定ポートへの秘密の送信）に露出した可能性のある管理用の秘密の回転を検討する。`/etc/discord-rs/botd.env` の項目名が新しい規則（大文字、`TOKEN` を含む）に合うことを確認する（不適合だと unit の起動前の検査で失敗する）。
+- **スキャンの残り：** #4（結果不明の解消操作）と #5（REST 予算の統合）は未着手。#3（実験用 Raft）は既知の制約。
