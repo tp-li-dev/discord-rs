@@ -359,6 +359,7 @@ async fn standby_and_failed_activation_recovery_share_the_launch_budget() {
     )
     .unwrap();
     let clock = ManualClock::default();
+    let marker = plan[0].gateway.state_path.join("standby-ready");
     let mut daemon = Managed(Daemon::with_clock(plan, policy(), clock.clone()).unwrap());
     daemon.0.set_gateway_program(&program).unwrap();
     daemon.0.enable_separate_cores().unwrap();
@@ -370,15 +371,21 @@ async fn standby_and_failed_activation_recovery_share_the_launch_budget() {
     daemon.0.start_all(&credentials).unwrap();
     assert!(daemon.0.has_child(&wanted));
     let original = daemon.0.snapshots()[0].identity.clone();
+    std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+    std::fs::write(&marker, b"stale fixture marker").unwrap();
     assert_eq!(
         daemon.0.begin_gateway_update(&wanted, &credentials),
         Ok(false)
     );
+    assert!(daemon.0.has_child(&wanted));
+    assert_eq!(daemon.0.snapshots()[0].identity, original);
+    assert!(marker.is_file());
     clock.set(30);
     assert_eq!(
         daemon.0.begin_gateway_update(&wanted, &credentials),
         Ok(true)
     );
+    assert!(!marker.exists());
     daemon.0.send_gateway_activation(&wanted).await.unwrap();
     daemon.0.fail_gateway_activation(&wanted);
     eventually(|| {
@@ -402,11 +409,13 @@ async fn standby_and_failed_activation_recovery_share_the_launch_budget() {
     assert!(daemon.0.has_child(&wanted));
     assert_ne!(daemon.0.snapshots()[0].identity, original);
     clock.set(90);
+    let replacement = daemon.0.snapshots()[0].identity.clone();
     assert_eq!(
         daemon.0.begin_gateway_update(&wanted, &credentials),
         Err(DaemonError::IdentifyUnavailable)
     );
     assert!(daemon.0.has_child(&wanted));
+    assert_eq!(daemon.0.snapshots()[0].identity, replacement);
 
     daemon.0.stop(&wanted, StopMode::Force).unwrap();
     terminal(&mut daemon.0).await;

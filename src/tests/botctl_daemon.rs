@@ -503,6 +503,35 @@ async fn force_stop_requires_confirmation_in_cli_and_authenticated_server() {
 }
 
 #[tokio::test]
+async fn restart_all_uses_one_queryable_operation_for_all_local_shards() {
+    let fixture = DaemonFixture::new().await;
+    for bot in [ALPHA, BETA] {
+        succeeded(&fixture.json(&["start", bot], true).await);
+    }
+    let before = fixture.status().await;
+    fixture.ready(&before).await;
+    let batch = fixture.json(&["restart", "--all", "--yes"], true).await;
+    succeeded(&batch);
+    assert_eq!(batch["all"], true);
+    assert_eq!(batch["operation"]["command"], "restart-all");
+    assert_eq!(batch["operation"]["shards"].as_array().unwrap().len(), 3);
+    succeeded(
+        &fixture
+            .json(&["operation", operation_id(&batch)], true)
+            .await,
+    );
+    let after = fixture.status().await;
+    fixture.ready(&after).await;
+    for (bot, shard) in [(ALPHA, 0), (ALPHA, 1), (BETA, 0)] {
+        assert_ne!(
+            process(&before, bot, shard)["identity"]["generation"],
+            process(&after, bot, shard)["identity"]["generation"]
+        );
+    }
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
 async fn client_timeout_keeps_operation_queryable_and_other_bot_control_available() {
     let fixture = DaemonFixture::new().await;
     succeeded(&fixture.json(&["start", ALPHA], true).await);

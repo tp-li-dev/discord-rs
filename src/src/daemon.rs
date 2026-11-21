@@ -7139,6 +7139,21 @@ pub mod control {
                 live
             }
 
+            async fn complete(plane: &mut ControlPlane, id: usize) -> Value {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        plane.tick(&credentials).await;
+                        let result = plane.request(&query(id));
+                        if result["operation"]["state"] != "running" {
+                            return result;
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .unwrap()
+            }
+
             async fn cleanup(plane: &mut ControlPlane) {
                 assert!(
                     plane
@@ -7146,6 +7161,14 @@ pub mod control {
                         .await
                         .is_empty()
                 );
+            }
+
+            fn restart_all(id: usize) -> CommandRequest {
+                CommandRequest {
+                    bot: None,
+                    yes: true,
+                    ..request("restart-all", 0, id)
+                }
             }
 
             #[tokio::test]
@@ -7163,6 +7186,197 @@ pub mod control {
                 assert!(plane.operations.is_empty());
                 assert!(!plane.daemon.entries[&key].restart_held);
                 assert_eq!(running_pid(&plane, &key), pid);
+                cleanup(&mut plane).await;
+            }
+
+            #[tokio::test]
+            async fn spacing_is_refused_before_stop_and_a_new_request_can_restart_at_the_boundary()
+            {
+                let (mut plane, time) = fixture(1, 1, 10);
+                let key = key(0, 0);
+                plane.daemon.start(&key, &credentials).unwrap();
+                let pid = running_pid(&plane, &key);
+                time.send_replace(Duration::from_millis(29_999));
+                assert_eq!(
+                    plane.request(&request("restart", 0, 1))["error"],
+                    "IdentifyDeferred"
+                );
+                plane.tick(&credentials).await;
+                assert_eq!(running_pid(&plane, &key), pid);
+                assert!(plane.operations.is_empty());
+
+                time.send_replace(Duration::from_secs(30));
+                assert_eq!(plane.request(&request("restart", 0, 2))["ok"], true);
+                assert_eq!(
+                    complete(&mut plane, 2).await["operation"]["state"],
+                    "succeeded"
+                );
+                assert_ne!(running_pid(&plane, &key), pid);
+                assert_eq!(
+                    plane.request(&request("restart", 0, 3))["error"],
+                    "IdentifyDeferred"
+                );
+                cleanup(&mut plane).await;
+            }
+
+            #[tokio::test]
+            async fn failed_stop_releases_the_unused_slot_without_charging_it() {
+                let (mut plane, time) = fixture(1, 2, 2);
+                let old = key(0, 0);
+                let other = key(0, 1);
+                plane.daemon.start(&old, &credentials).unwrap();
+                let recovery_key = plane.daemon.entries[&old].recovery_key;
+                let pipe = plane
+                    .daemon
+                    .recovery
+                    .child_mut(recovery_key)
+                    .unwrap()
+                    .unwrap()
+                    .stdin
+                    .take()
+                    .unwrap();
+                time.send_replace(Duration::from_secs(30));
+                let mut restart = request("restart", 0, 1);
+                restart.shards = Some(vec![0]);
+                assert_eq!(plane.request(&restart)["ok"], true);
+                let result = complete(&mut plane, 1).await;
+                assert_eq!(result["operation"]["state"], "failed");
+                assert_eq!(result["operation"]["shards"][0]["error"], "StopFailed");
+                assert!(plane.daemon.has_child(&old));
+                assert!(!plane.daemon.entries[&old].restart_held);
+                plane.daemon.start(&other, &credentials).unwrap();
+                running_pid(&plane, &other);
+                plane
+                    .daemon
+                    .recovery
+                    .child_mut(recovery_key)
+                    .unwrap()
+                    .unwrap()
+                    .stdin = Some(pipe);
+                // The first request failed before writing. Force is for fixture cleanup.
+                plane.daemon.stop(&old, StopMode::Force).unwrap();
+                cleanup(&mut plane).await;
+            }
+
+            #[tokio::test]
+            async fn restart_shard_list_requires_budget_and_spacing_for_every_replacement() {
+                let (mut plane, time) = fixture(1, 2, 3);
+                let first = key(0, 0);
+                let second = key(0, 1);
+                plane.daemon.start(&first, &credentials).unwrap();
+                time.send_replace(Duration::from_secs(30));
+                plane.daemon.start(&second, &credentials).unwrap();
+                let pids = [running_pid(&plane, &first), running_pid(&plane, &second)];
+
+                let mut restart = request("restart", 0, 1);
+                restart.shards = Some(vec![1, 0]);
+                for (at, denied) in [(60, "IdentifyUnavailable"), (3630, "IdentifyDeferred")] {
+                    time.send_replace(Duration::from_secs(at));
+                    assert_eq!(plane.request(&restart)["error"], denied);
+                    plane.tick(&credentials).await;
+                    assert_eq!(
+                        [running_pid(&plane, &first), running_pid(&plane, &second)],
+                        pids
+                    );
+                    assert!(plane.operations.is_empty());
+                }
+                cleanup(&mut plane).await;
+            }
+
+            #[tokio::test]
+            async fn restart_all_releases_earlier_bot_reservations_if_any_bot_is_denied() {
+                let (mut plane, time) = fixture(2, 1, 2);
+                let first = key(0, 0);
+                let second = key(1, 0);
+                plane.daemon.start(&first, &credentials).unwrap();
+                time.send_replace(Duration::from_secs(1));
+                plane.daemon.start(&second, &credentials).unwrap();
+                let pids = [running_pid(&plane, &first), running_pid(&plane, &second)];
+
+                time.send_replace(Duration::from_secs(30));
+                assert_eq!(plane.request(&restart_all(1))["error"], "IdentifyDeferred");
+                plane.tick(&credentials).await;
+                assert_eq!(
+                    [running_pid(&plane, &first), running_pid(&plane, &second)],
+                    pids
+                );
+                assert!(plane.operations.is_empty());
+
+                // The first Bot could reserve at t=30. Its reservation must
+                // have rolled back when the second Bot was denied.
+                plane
+                    .daemon
+                    .local_identify
+                    .record("id-1", Duration::from_secs(1));
+                time.send_replace(Duration::from_secs(31));
+                assert_eq!(
+                    plane.request(&restart_all(1))["error"],
+                    "IdentifyUnavailable"
+                );
+                plane.tick(&credentials).await;
+                assert_eq!(
+                    [running_pid(&plane, &first), running_pid(&plane, &second)],
+                    pids
+                );
+
+                time.send_replace(Duration::from_secs(3601));
+                let access = super::super::super::update_control::ControlAccess {
+                    subject: "restart-test".into(),
+                    role: "admin".into(),
+                    scope: Some(vec![first.clone(), second.clone()]),
+                };
+                assert_eq!(
+                    plane.request_as(&restart_all(2), &access)["error"],
+                    "control permission or scope denied"
+                );
+                let access = super::super::super::update_control::ControlAccess {
+                    scope: None,
+                    ..access
+                };
+                assert_eq!(plane.request_as(&restart_all(2), &access)["ok"], true);
+                let done = complete(&mut plane, 2).await;
+                assert_eq!(done["operation"]["state"], "succeeded");
+                assert_ne!(running_pid(&plane, &first), pids[0]);
+                assert_ne!(running_pid(&plane, &second), pids[1]);
+                cleanup(&mut plane).await;
+            }
+
+            #[tokio::test]
+            async fn pending_restart_reserves_its_bot_only_and_cannot_be_preempted_by_a_start() {
+                let (mut plane, time) = fixture(2, 2, 2);
+                let target = key(0, 0);
+                let competitor = key(0, 1);
+                let independent = key(1, 0);
+                plane.daemon.start(&target, &credentials).unwrap();
+                plane.daemon.start(&independent, &credentials).unwrap();
+                let original = running_pid(&plane, &target);
+                let other_pid = running_pid(&plane, &independent);
+                time.send_replace(Duration::from_secs(30));
+                let mut first = request("restart", 0, 1);
+                first.shards = Some(vec![0]);
+                assert_eq!(plane.request(&first)["ok"], true);
+
+                // Issue another start while the accepted restart still owns
+                // its slot and before its first stop has been sent.
+                assert_eq!(
+                    plane.daemon.start(&competitor, &credentials),
+                    Err(DaemonError::IdentifyDeferred)
+                );
+                assert!(!plane.daemon.has_child(&competitor));
+                assert_eq!(running_pid(&plane, &target), original);
+                let mut other = request("restart", 1, 2);
+                other.shards = Some(vec![0]);
+                assert_eq!(plane.request(&other)["ok"], true);
+                assert_eq!(
+                    complete(&mut plane, 1).await["operation"]["state"],
+                    "succeeded"
+                );
+                assert_eq!(
+                    complete(&mut plane, 2).await["operation"]["state"],
+                    "succeeded"
+                );
+                assert_ne!(running_pid(&plane, &target), original);
+                assert_ne!(running_pid(&plane, &independent), other_pid);
                 cleanup(&mut plane).await;
             }
         }
