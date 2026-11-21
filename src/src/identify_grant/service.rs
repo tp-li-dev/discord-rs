@@ -157,12 +157,12 @@ impl Budget {
         if bytes.len() as u64 > MAX_JOURNAL {
             return Err(invalid_journal());
         }
-        let complete = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+        let needs_delimiter = !bytes.is_empty() && !bytes.ends_with(b"\n");
         let mut budget = Self {
             journal,
             writer: None,
             write_ack: None,
-            len: complete as u64,
+            len: bytes.len() as u64,
             limit: MAX_JOURNAL,
             restart_space: HashSet::new(),
             first_grant_space: HashMap::new(),
@@ -173,8 +173,8 @@ impl Budget {
             hold_until: Duration::ZERO,
             failed: false,
         };
-        for terminated in bytes[..complete].split_inclusive(|&b| b == b'\n') {
-            let line = &terminated[..terminated.len() - 1];
+        for entry in bytes.split_inclusive(|&b| b == b'\n') {
+            let line = entry.strip_suffix(b"\n").unwrap_or(entry);
             if line.len() > MAX_LINE {
                 return Err(invalid_journal());
             }
@@ -184,9 +184,15 @@ impl Budget {
             }
             budget.replay(record)?;
         }
-        if complete < bytes.len() {
-            budget.journal.set_len(budget.len)?;
+        if needs_delimiter {
+            // A missing delimiter can follow an already acknowledged grant.
+            // Only repair after verifying the entire file, including that record.
+            if budget.len == MAX_JOURNAL {
+                return Err(invalid_journal());
+            }
+            budget.journal.write_all(b"\n")?;
             budget.journal.sync_all()?;
+            budget.len += 1;
         }
         if budget.boot.as_deref() == Some(boot) {
             budget.observe(now)?;

@@ -346,7 +346,7 @@ fn a_lost_grant_counts_after_same_boot_restart_and_the_window_uses_expiry() {
 }
 
 #[test]
-fn torn_tail_is_discarded_but_a_corrupt_complete_record_fails_closed() {
+fn torn_tail_and_corrupt_complete_record_both_fail_closed() {
     use std::os::unix::fs::PermissionsExt;
 
     let root = Root::new();
@@ -371,6 +371,10 @@ fn torn_tail_is_discarded_but_a_corrupt_complete_record_fails_closed() {
             .unwrap();
     };
     append(b"{\"version\":1");
+    let torn = std::fs::read(root.path()).unwrap();
+    assert!(root.budget(BOOT, 1, 1).is_err());
+    assert_eq!(std::fs::read(root.path()).unwrap(), torn);
+    std::fs::write(root.path(), &original).unwrap();
     {
         let mut budget = root.budget(BOOT, 1, 1).unwrap();
         assert_eq!(std::fs::read(root.path()).unwrap(), original);
@@ -385,6 +389,45 @@ fn torn_tail_is_discarded_but_a_corrupt_complete_record_fails_closed() {
     }
     append(b"{\"version\":1\n");
     assert!(root.budget(BOOT, 3601, 1).is_err());
+}
+
+#[test]
+fn missing_final_delimiter_preserves_an_acknowledged_reidentify_charge() {
+    let root = Root::new();
+    let active = gateway(0, 1);
+    {
+        // Budget without an async writer returns the permit only after sync_all.
+        let mut budget = root.budget(BOOT, 0, 2).unwrap();
+        assert_eq!(
+            budget.launch(active.clone(), secs(0), 1),
+            LocalAdmission::Granted
+        );
+        assert!(matches!(
+            budget.identify(&active, secs(0), true, false, false),
+            (State::Granted, Reply::Permit(_))
+        ));
+        assert!(matches!(
+            budget.identify(&active, secs(32), false, false, false),
+            (State::Granted, Reply::Permit(_))
+        ));
+    }
+    let original = std::fs::read(root.path()).unwrap();
+    let without_delimiter = original.strip_suffix(b"\n").unwrap();
+    let last = without_delimiter.rsplit(|&b| b == b'\n').next().unwrap();
+    assert!(matches!(
+        serde_json::from_slice::<Record>(last).unwrap().action,
+        Action::Grant {
+            converts_launch: false,
+            ..
+        }
+    ));
+    std::fs::write(root.path(), without_delimiter).unwrap();
+    let mut budget = root.budget(BOOT, 33, 2).unwrap();
+    assert_eq!(std::fs::read(root.path()).unwrap(), original);
+    assert!(matches!(
+        budget.check("42", secs(33), 1),
+        LocalAdmission::Exhausted { .. }
+    ));
 }
 
 #[test]
