@@ -1,27 +1,28 @@
 //! Authenticated local daemon client, with offline configuration/update planning.
 //! Bootstrap capabilities are supplied through anonymous stdin, or (for a systemd-resident
-//! botd) a permission-checked secret file via `--secret-file` with the daemon's fixed
-//! `--port`. Never argv values, environment variables or an endpoint file.
+//! botd) a permission-checked secret file with the daemon's fixed port or Unix socket.
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use src::daemon::control::{
     CORE_RECOVERY_VERSION, core_recovery_failure_reason, core_recovery_incarnation,
 };
-use src::local_control::DaemonControlEnvelope;
+use src::management::{self, AUTHENTICATION_FAILED, Key, Protocol};
 use src::update_rollback::{self, Action, Component, UpdateControlRequest};
 use src::{botref, placement::Config};
 use std::{collections::HashMap, ffi::OsString, io::IsTerminal, path::PathBuf, time::Duration};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
-    net::TcpStream,
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader},
     time::{Instant, timeout_at},
 };
 
+#[cfg(test)]
+#[path = "../../tests/fixtures/control_channel.rs"]
+mod control_channel;
+
 const REQUEST_LIMIT: usize = 4096;
-const RESPONSE_LIMIT: usize = 64 * 1024;
-const CORE_USAGE: &str = "usage: botctl core status BOT --shard N | botctl core restart BOT --shard N --core K [--expect-incarnation ID] [--force] [--yes]; both require (--bootstrap-stdin | --secret-file ABS --port PORT) and accept [--json] [--timeout 30s]";
+const CORE_USAGE: &str = "usage: botctl core status BOT --shard N | botctl core restart BOT --shard N --core K [--expect-incarnation ID] [--force] [--yes]; both require (--bootstrap-stdin | --secret-file ABS (--port PORT | --socket ABS)) and accept [--json] [--timeout 30s]";
 const CORE_RESTART_NOTE: &str = "succeeded means the old Core, if present, was reaped and a replacement was launched and given its IPC capability. In-flight work and events are not guaranteed to be recovered.";
-const USAGE: &str = "usage: botctl ps|status [BOT]|inspect BOT|shards BOT|start BOT|stop BOT|restart BOT|operation ID (--bootstrap-stdin | --secret-file ABS --port PORT) [--json] [--timeout 30s]; botctl start|stop|restart|gateway-update BOT [--shard N]... [--guild ID]...; botctl start|stop|restart|gateway-update --all (--yes | --dry-run); botctl core status|restart BOT --shard N; botctl config validate --file F [--json]; botctl secret generate --out ABS [--json]; botctl update|rollback BOT --plan manifest.json [--component core|gateway|all] [--rolling] [--dry-run | --yes (--bootstrap-stdin | --secret-file ABS --port PORT)] [--json]";
+const USAGE: &str = "usage: botctl ps|status [BOT]|inspect BOT|shards BOT|start BOT|stop BOT|restart BOT|operation ID (--bootstrap-stdin | --secret-file ABS (--port PORT | --socket ABS)) [--json] [--timeout 30s]; botctl start|stop|restart|gateway-update BOT [--shard N]... [--guild ID]...; botctl start|stop|restart|gateway-update --all (--yes | --dry-run); botctl core status|restart BOT --shard N; botctl config validate --file F [--json]; botctl secret generate --out ABS [--json]; botctl update|rollback BOT --plan manifest.json [--component core|gateway|all] [--rolling] [--dry-run | --yes (--bootstrap-stdin | --secret-file ABS (--port PORT | --socket ABS))] [--json]";
 const OFFLINE_NOTE: &str =
     "オフライン設定検証のみ。daemon・実稼働状態・認証・quorum/leaseは検証していません。";
 
@@ -38,6 +39,7 @@ struct Options {
     component: Component,
     secret_file: Option<PathBuf>,
     port: Option<u16>,
+    socket: Option<PathBuf>,
     out: Option<PathBuf>,
     /// `--shard N` (repeatable): act on these local Shards of the Bot only.
     shards: Vec<u32>,
@@ -103,6 +105,7 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
     let mut rolling = false;
     let mut secret_file = None;
     let mut port = None;
+    let mut socket = None;
     let mut out = None;
     let mut core = None;
     let mut expect_incarnation = None;
@@ -132,6 +135,14 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
                 } else {
                     out = Some(value);
                 }
+            }
+            Some("--socket") if cfg!(target_os = "linux") && socket.is_none() => {
+                let path = args
+                    .next()
+                    .map(PathBuf::from)
+                    .filter(|path| path.is_absolute())
+                    .ok_or("--socket requires an absolute path")?;
+                socket = Some(path);
             }
             Some("--port") if port.is_none() => {
                 let value = args
@@ -281,8 +292,11 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
     if bootstrap && secret_file.is_some() {
         return Err("--bootstrap-stdin and --secret-file are mutually exclusive");
     }
-    if secret_file.is_some() != port.is_some() {
-        return Err("--secret-file and --port must be specified together");
+    if port.is_some() && socket.is_some() {
+        return Err("--port and --socket are mutually exclusive");
+    }
+    if secret_file.is_some() != (port.is_some() || socket.is_some()) {
+        return Err("--secret-file requires either --port or --socket and vice versa");
     }
     let core_restart = command == "core-restart";
     let core_command = core_restart || command == "core-preview";
@@ -328,6 +342,7 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
             component: Component::default(),
             secret_file,
             port,
+            socket,
             out,
             shards: Vec::new(),
             guilds: Vec::new(),
@@ -447,6 +462,7 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
         component: component.unwrap_or_default(),
         secret_file,
         port,
+        socket,
         out,
         shards,
         guilds,
@@ -463,12 +479,13 @@ fn parse_options(args: &[OsString]) -> Result<Options, &'static str> {
 #[serde(deny_unknown_fields)]
 struct Bootstrap {
     port: u16,
+    #[serde(skip)]
+    socket: Option<PathBuf>,
     secret: [u8; 32],
 }
 
 #[derive(Serialize)]
 struct Request<'a> {
-    secret: &'a [u8; 32],
     command: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     bot: Option<&'a str>,
@@ -515,8 +532,9 @@ async fn read_bootstrap() -> Result<Bootstrap, &'static str> {
 async fn load_bootstrap(
     secret_file: Option<&std::path::Path>,
     port: Option<u16>,
+    socket: Option<&std::path::Path>,
 ) -> Result<Bootstrap, &'static str> {
-    let (Some(path), Some(port)) = (secret_file, port) else {
+    let Some(path) = secret_file else {
         return read_bootstrap().await;
     };
     let path = path.to_path_buf();
@@ -525,7 +543,8 @@ async fn load_bootstrap(
         .map_err(|_| "secret file task failed")?
         .map_err(|error| error.as_str())?;
     Ok(Bootstrap {
-        port,
+        port: port.unwrap_or(0),
+        socket: socket.map(std::path::Path::to_path_buf),
         secret: *secret.expose_secret(),
     })
 }
@@ -599,21 +618,32 @@ async fn exchange_once(
     request: &impl Serialize,
 ) -> Result<Value, &'static str> {
     let frame = encode_request(request)?;
-    // No hostname, endpoint file or arbitrary remote address is accepted.
-    let mut stream = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, bootstrap.port))
-        .await
-        .map_err(|_| "local daemon unavailable")?;
-    stream
-        .write_all(&frame)
+    let mut stream = match bootstrap.socket.as_deref() {
+        #[cfg(target_os = "linux")]
+        Some(path) => management::connect_unix(path).await.map_err(
+            |_| "local control socket unavailable; check path, ownership, mode and peer UID",
+        )?,
+        _ => management::connect_tcp(bootstrap.port)
+            .await
+            .map_err(|_| "local daemon unavailable")?,
+    };
+    let session =
+        management::authenticate_client(&mut stream, Protocol::Botd, Key::new(&bootstrap.secret))
+            .await
+            .map_err(|_| AUTHENTICATION_FAILED)?;
+    session
+        .write_request(&mut stream, &frame)
         .await
         .map_err(|_| "cannot send daemon request; outcome may be unknown")?;
-    let frame = read_frame(&mut stream, RESPONSE_LIMIT).await?;
+    let frame = session
+        .read_response(&mut stream)
+        .await
+        .map_err(|_| "invalid or unavailable authenticated daemon response")?;
     let value: Value = serde_json::from_slice(&frame).map_err(|_| "invalid daemon response")?;
     if !value["ok"].is_boolean() || value["offline"] == true {
         return Err("invalid daemon response");
     }
-    // A wrong or malicious local listener must not make the client echo its
-    // request capability through an error string, array or unknown field.
+    // Keep credentials out of output even if the authenticated peer includes them.
     if contains_control_secret(&value, &bootstrap.secret) {
         return Err("daemon response contains control credentials");
     }
@@ -621,9 +651,8 @@ async fn exchange_once(
 }
 
 fn encode_request(request: &impl Serialize) -> Result<Vec<u8>, &'static str> {
-    let mut frame = serde_json::to_vec(request).map_err(|_| "cannot encode control request")?;
-    frame.push(b'\n');
-    if frame.len() > REQUEST_LIMIT {
+    let frame = serde_json::to_vec(request).map_err(|_| "cannot encode control request")?;
+    if frame.len() > management::BOTD_REQUEST_LIMIT {
         return Err("control request exceeds limit");
     }
     Ok(frame)
@@ -933,7 +962,11 @@ async fn run_core(options: Options, mut deadline: Instant) -> Value {
     }
     let bootstrap = match timeout_at(
         deadline,
-        load_bootstrap(options.secret_file.as_deref(), options.port),
+        load_bootstrap(
+            options.secret_file.as_deref(),
+            options.port,
+            options.socket.as_deref(),
+        ),
     )
     .await
     {
@@ -944,7 +977,7 @@ async fn run_core(options: Options, mut deadline: Instant) -> Value {
     let shard = options.shards[0];
     let selector = options.bot.as_deref().expect("validated Bot selector");
     let request = json!({
-        "secret": bootstrap.secret, "command": "core-preview", "bot": selector, "shard": shard,
+        "command": "core-preview", "bot": selector, "shard": shard,
     });
     let unsupported =
         "core-preview unavailable; verify authentication and use a Core recovery v2 daemon";
@@ -965,6 +998,7 @@ async fn run_core(options: Options, mut deadline: Instant) -> Value {
             };
             return preview_error("rejected", error);
         }
+        Ok(Err(AUTHENTICATION_FAILED)) => return preview_error("rejected", AUTHENTICATION_FAILED),
         Ok(Err(_)) => return preview_error("rejected", unsupported),
         Err(_) => {
             return preview_error(
@@ -1044,7 +1078,7 @@ async fn restart_core(
     };
     let slot = &preview.cores[core as usize];
     let mut request = json!({
-        "secret": bootstrap.secret, "command": "core-restart", "bot": selector,
+        "command": "core-restart", "bot": selector,
         "shard": preview.shard, "core": core, "expect_bot_id": preview.bot_id,
         "expect_total_shards": preview.total_shards, "operation_id": id,
         "force": force, "core_recovery_version": CORE_RECOVERY_VERSION,
@@ -1054,7 +1088,7 @@ async fn restart_core(
     } else {
         request["expect_incarnation"] = json!(slot.incarnation);
     }
-    let query = json!({"secret": bootstrap.secret, "command": "operation", "operation_id": id});
+    let query = json!({"command": "operation", "operation_id": id});
     let mut sending = true;
     eprintln!("Core restart operation ID {id}");
     loop {
@@ -1065,6 +1099,9 @@ async fn restart_core(
         .await
         {
             Ok(Ok(response)) => response,
+            Ok(Err(AUTHENTICATION_FAILED)) if sending => {
+                return core_outcome("rejected", Some(AUTHENTICATION_FAILED), Some(&id));
+            }
             Ok(Err(_)) if sending => {
                 // The daemon might have admitted the request before the reply was lost.
                 sending = false;
@@ -1322,7 +1359,11 @@ async fn run_all(options: Options) -> Value {
     let list_deadline = Instant::now() + Duration::from_secs(30);
     let bootstrap = match timeout_at(
         list_deadline,
-        load_bootstrap(options.secret_file.as_deref(), options.port),
+        load_bootstrap(
+            options.secret_file.as_deref(),
+            options.port,
+            options.socket.as_deref(),
+        ),
     )
     .await
     {
@@ -1352,7 +1393,6 @@ async fn run_all_loaded(
         return result;
     }
     let listing = Request {
-        secret: &bootstrap.secret,
         command: "ps",
         bot: None,
         operation_id: None,
@@ -1462,7 +1502,11 @@ async fn run_live_inner(
         None => {
             loaded = match timeout_at(
                 deadline,
-                load_bootstrap(options.secret_file.as_deref(), options.port),
+                load_bootstrap(
+                    options.secret_file.as_deref(),
+                    options.port,
+                    options.socket.as_deref(),
+                ),
             )
             .await
             {
@@ -1477,7 +1521,6 @@ async fn run_live_inner(
     if !options.guilds.is_empty() {
         // Resolve guilds to Shards from the daemon's own total before anything is mutated.
         let inspect = Request {
-            secret: &bootstrap.secret,
             command: "inspect",
             bot: options.bot.as_deref(),
             operation_id: None,
@@ -1518,14 +1561,10 @@ async fn run_live_inner(
     let id = options.operation_id.as_deref();
     if let Some(update) = &update {
         // Check the entire authenticated payload before even a read-only query.
-        if let Err(error) = encode_request(&DaemonControlEnvelope {
-            secret: bootstrap.secret,
-            request: update,
-        }) {
+        if let Err(error) = encode_request(update) {
             return failure(error, id, None);
         }
         let inspect = Request {
-            secret: &bootstrap.secret,
             command: "inspect",
             bot: options.bot.as_deref(),
             operation_id: None,
@@ -1565,7 +1604,6 @@ async fn run_live_inner(
         }
     }
     let mut request = Request {
-        secret: &bootstrap.secret,
         command: options.command,
         bot: options.bot.as_deref(),
         operation_id: id,
@@ -1580,14 +1618,7 @@ async fn run_live_inner(
     loop {
         let exchange_result = timeout_at(deadline, async {
             if send_update {
-                exchange(
-                    bootstrap,
-                    &DaemonControlEnvelope {
-                        secret: bootstrap.secret,
-                        request: update.as_ref().expect("update payload"),
-                    },
-                )
-                .await
+                exchange(bootstrap, update.as_ref().expect("update payload")).await
             } else {
                 exchange(bootstrap, &request).await
             }
@@ -1602,6 +1633,8 @@ async fn run_live_inner(
                         "cannot encode control request"
                             | "control request exceeds limit"
                             | "local daemon unavailable"
+                            | "local control socket unavailable; check path, ownership, mode and peer UID"
+                            | AUTHENTICATION_FAILED
                     ),
                 ),
                 Err(_) => (
@@ -1918,6 +1951,7 @@ mod default_wait_tests {
                 .unwrap();
             let bootstrap = Bootstrap {
                 port: listener.local_addr().unwrap().port(),
+                socket: None,
                 secret: [7; 32],
             };
             let preview = validate_core_preview(
@@ -1930,8 +1964,8 @@ mod default_wait_tests {
             .unwrap();
             let server = tokio::spawn(async move {
                 let (mut mutation, _) = listener.accept().await.unwrap();
-                let frame = read_frame(&mut mutation, REQUEST_LIMIT).await.unwrap();
-                let request: Value = serde_json::from_slice(&frame).unwrap();
+                let (session, request) =
+                    crate::control_channel::botd_request(&mut mutation, &[7; 32]).await;
                 assert_eq!(request["command"], "core-restart");
                 assert_eq!(request["bot"], "alpha");
                 assert_eq!(request["expect_bot_id"], "101");
@@ -1944,15 +1978,18 @@ mod default_wait_tests {
                 let id = request["operation_id"].as_str().unwrap();
                 assert!(valid_operation_id(id));
                 if state == "failed" {
-                    mutation
-                        .write_all(b"{\"ok\":false,\"error\":\"shard_not_running\"}\n")
+                    session
+                        .write_response(
+                            &mut mutation,
+                            br#"{"ok":false,"error":"shard_not_running"}"#,
+                        )
                         .await
                         .unwrap();
                 }
                 drop(mutation); // The other cases lose the reply after the request arrives.
                 let (mut query, _) = listener.accept().await.unwrap();
-                let frame = read_frame(&mut query, REQUEST_LIMIT).await.unwrap();
-                let request: Value = serde_json::from_slice(&frame).unwrap();
+                let (session, request) =
+                    crate::control_channel::botd_request(&mut query, &[7; 32]).await;
                 assert_eq!(request["command"], "operation");
                 assert_eq!(request["operation_id"], id);
                 assert!(request.get("expect_empty").is_none());
@@ -1971,8 +2008,8 @@ mod default_wait_tests {
                     "shard": 1, "core": 0, "state": state, "terminal_audit": audit,
                     "incarnation": null, "reason": reason
                 }});
-                query
-                    .write_all(format!("{reply}\n").as_bytes())
+                session
+                    .write_response(&mut query, &serde_json::to_vec(&reply).unwrap())
                     .await
                     .unwrap();
             });
@@ -2307,6 +2344,7 @@ mod default_wait_tests {
                 .unwrap();
             let bootstrap = Bootstrap {
                 port: listener.local_addr().unwrap().port(),
+                socket: None,
                 secret: [7; 32],
             };
             let deadline = Instant::now() + Duration::from_secs(3);
@@ -2314,9 +2352,9 @@ mod default_wait_tests {
                 let mut ids = Vec::new();
                 for index in 0..5 {
                     let (mut stream, _) = listener.accept().await.unwrap();
-                    let frame = read_frame(&mut stream, REQUEST_LIMIT).await.unwrap();
-                    let request: Value = serde_json::from_slice(&frame).unwrap();
-                    assert_eq!(request["secret"], json!(vec![7_u8; 32]));
+                    let (session, request) =
+                        crate::control_channel::botd_request(&mut stream, &[7; 32]).await;
+                    assert!(request.get("secret").is_none());
                     let reply = if index == 0 {
                         assert_eq!(request["command"], "ps");
                         assert!(request.get("expect_bot_id").is_none());
@@ -2349,9 +2387,10 @@ mod default_wait_tests {
                             "state": state, "elapsed_ms": 0, "shards": [], "failed_shards": []
                         }})
                     };
-                    let mut frame = serde_json::to_vec(&reply).unwrap();
-                    frame.push(b'\n');
-                    stream.write_all(&frame).await.unwrap();
+                    session
+                        .write_response(&mut stream, &serde_json::to_vec(&reply).unwrap())
+                        .await
+                        .unwrap();
                 }
                 assert_ne!(ids[0], ids[1]);
             });
@@ -2395,6 +2434,7 @@ mod default_wait_tests {
             .unwrap();
         let bootstrap = Bootstrap {
             port: listener.local_addr().unwrap().port(),
+            socket: None,
             secret: [8; 32],
         };
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -2402,8 +2442,8 @@ mod default_wait_tests {
             let mut operation_id = String::new();
             for command in ["inspect", "restart", "operation"] {
                 let (mut stream, _) = listener.accept().await.unwrap();
-                let frame = read_frame(&mut stream, REQUEST_LIMIT).await.unwrap();
-                let request: Value = serde_json::from_slice(&frame).unwrap();
+                let (session, request) =
+                    crate::control_channel::botd_request(&mut stream, &[8; 32]).await;
                 assert_eq!(request["command"], command);
                 let reply = if command == "inspect" {
                     assert!(request.get("expect_total_shards").is_none());
@@ -2424,9 +2464,10 @@ mod default_wait_tests {
                         "elapsed_ms": 0, "shards": [], "failed_shards": []
                     }})
                 };
-                let mut frame = serde_json::to_vec(&reply).unwrap();
-                frame.push(b'\n');
-                stream.write_all(&frame).await.unwrap();
+                session
+                    .write_response(&mut stream, &serde_json::to_vec(&reply).unwrap())
+                    .await
+                    .unwrap();
             }
         });
         let result = timeout_at(
@@ -2479,18 +2520,19 @@ mod default_wait_tests {
                 .unwrap();
             let bootstrap = Bootstrap {
                 port: listener.local_addr().unwrap().port(),
+                socket: None,
                 secret: [8; 32],
             };
             let deadline = Instant::now() + Duration::from_secs(3);
             let server = tokio::spawn(async move {
                 let (mut stream, _) = listener.accept().await.unwrap();
-                let frame = read_frame(&mut stream, REQUEST_LIMIT).await.unwrap();
-                let request: Value = serde_json::from_slice(&frame).unwrap();
+                let (session, request) =
+                    crate::control_channel::botd_request(&mut stream, &[8; 32]).await;
                 assert_eq!(request["command"], "gateway-update");
                 if let Some(error) = rejection {
                     let reply = json!({"ok": false, "error": error});
-                    stream
-                        .write_all(format!("{reply}\n").as_bytes())
+                    session
+                        .write_response(&mut stream, &serde_json::to_vec(&reply).unwrap())
                         .await
                         .unwrap();
                 }

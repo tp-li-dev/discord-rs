@@ -1,6 +1,6 @@
 """Bounded, open-loop process load probe. Standard library only; no credentials logged.
 
-Invoked by update_load.rs, or directly with --botd/--gateway/--relay/--output.
+Invoked by update_load.rs, which connects to botd on the fixture's behalf.
 The legacy Worker pool and the dedicated Shard Core are explicitly distinguished.
 """
 import argparse
@@ -53,8 +53,8 @@ primary = "local"
 '''
 
 
-def emit(value):
-    print(json.dumps(value, separators=(",", ":")), flush=True)
+def emit(value, stream=None):
+    print(json.dumps(value, separators=(",", ":")), file=stream, flush=True)
 
 
 def http_fixture(gate=None):
@@ -333,7 +333,7 @@ def print_failure_diagnostics(root, result, sent, observations, replies):
             break
         output.append(line + "\n")
         size += len(encoded)
-    print("".join(output), end="", flush=True)
+    print("".join(output), end="", file=sys.stderr, flush=True)
 
 
 class Gateway:
@@ -411,7 +411,6 @@ class Run:
         self.options = options
         self.root = options.output.resolve()
         self.root.mkdir(parents=True, exist_ok=False)
-        self.secret = list(os.urandom(32))  # anonymous pipe/socket only; never saved
         self.sent, self.observations, self.replies = {}, [], []
         self.pids, self.processes, self.gateways = set(), [], []
         self.active_samples = self.double_active = self.send_errors = self.background_errors = 0
@@ -437,9 +436,13 @@ class Run:
         self.collector.settimeout(15)
 
     def request(self, command, **kwargs):
-        with socket.create_connection(("127.0.0.1", self.port), timeout=3) as sock:
-            sock.sendall(json.dumps({"secret": self.secret, "command": command, **kwargs}).encode() + b"\n")
-            return read_json(sock.makefile("rb"))
+        # Send the endpoint and command to the Rust parent over stdout, and
+        # receive the authenticated daemon reply over stdin.
+        emit({"port": self.port, "request": {"command": command, **kwargs}})
+        response = read_json(sys.stdin.buffer)
+        if response is None:
+            raise OSError("management exchange failed")
+        return response
 
     def begin(self, command):
         operation = uuid.uuid4().hex
@@ -480,6 +483,7 @@ class Run:
         return gateway
 
     def start(self):
+        bootstrap = read_json(sys.stdin.buffer)
         (self.root / "placement.toml").write_text(CONFIG, encoding="utf-8")
         args = [str(self.options.botd), "--file", str(self.root / "placement.toml"),
                 "--runtime-root", str(self.root), "--gateway-program", str(self.options.gateway),
@@ -492,7 +496,7 @@ class Run:
         self.daemon = spawn(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         self.processes.append(self.daemon)
         self.pids.add(self.daemon.pid)
-        self.daemon.stdin.write(json.dumps({"secret": self.secret}).encode() + b"\n")
+        self.daemon.stdin.write(json.dumps(bootstrap).encode() + b"\n")
         self.daemon.stdin.close()
         announcement = announced(self.daemon.stdout)
         assert announcement["startup_ok"]
@@ -873,7 +877,7 @@ class Run:
         evidence = {"sent": self.sent, "http": self.observations,
                     "results": [{key: row.get(key) for key in ("type", "id", "outcome", "ns")} for row in self.replies]}
         (self.root / "events.json").write_text(json.dumps(evidence), encoding="utf-8")
-        emit(result)
+        emit(result, sys.stderr)
         if result["violations"]:
             print_failure_diagnostics(self.root, result, self.sent, self.observations, self.replies)
         watchdog.cancel()

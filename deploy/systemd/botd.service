@@ -32,7 +32,8 @@ User=discord-rs
 Group=discord-rs
 
 # 管理用 secret は --secret-file で渡す（64 文字の 16 進 1 行。discord-rs 所有・モード 0600 か 0400 のみ受理。
-# 満たさなければ botd は起動を拒否する）。管理用 loopback ポートは --control-port で固定し、botctl は
+# 満たさなければ botd は起動を拒否する）。botd と botctl は同一リリースで相互認証する。
+# 管理用 loopback ポートは --control-port で固定し、botctl は
 # 同じ secret ファイルと --port で接続する（docs/linux-deployment.md「管理 secret」）。
 # 作成: sudo /opt/discord-rs/bin/botctl secret generate --out /etc/discord-rs/botd.secret
 #       sudo chown discord-rs:discord-rs /etc/discord-rs/botd.secret
@@ -97,7 +98,7 @@ LockPersonality=yes
 RestrictNamespaces=yes
 CapabilityBoundingSet=
 AmbientCapabilities=
-# Gateway が Discord へ外向き接続するため AF_INET/AF_INET6 を許可。管理用は loopback TCP のみ。
+# Gateway が Discord へ外向き接続するため AF_INET/AF_INET6 を許可。この unit は管理用に loopback TCP を選ぶ。Unix ソケットへの切り替え例は docs/linux-deployment.md。
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 # 追加の硬化（systemd-analyze security の指摘に対応。2026-11-14 の実 systemd smoke で動作確認）。
 RemoveIPC=yes

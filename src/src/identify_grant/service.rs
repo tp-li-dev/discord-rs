@@ -10,7 +10,10 @@ use std::{
     io::{self, Read, Write},
     os::{fd::AsRawFd, unix::net::UnixStream},
     path::Path,
-    sync::mpsc::{self, Receiver, SyncSender, TryRecvError},
+    sync::{
+        Arc,
+        mpsc::{self, Receiver, SyncSender, TryRecvError},
+    },
     time::Duration,
 };
 use tokio::process::Command;
@@ -94,15 +97,29 @@ struct WriteRequest {
     ack: SyncSender<io::Result<()>>,
 }
 
-/// The worker owns the append descriptor and never touches daemon state.
+struct LockedJournal {
+    file: File,
+}
+
+impl Drop for LockedJournal {
+    fn drop(&mut self) {
+        // The last owner has finished writing. Release the lock even if a child
+        // forked by another thread still holds an inherited descriptor before exec.
+        // SAFETY: the descriptor remains open for this call.
+        unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+/// The worker shares the journal lock and never touches daemon state.
 fn start_writer(
-    mut file: File,
+    journal: Arc<LockedJournal>,
     mut before_sync: impl FnMut() + Send + 'static,
 ) -> io::Result<SyncSender<WriteRequest>> {
     let (sender, receiver) = mpsc::sync_channel::<WriteRequest>(1);
     std::thread::Builder::new()
         .name("identify-journal".into())
         .spawn(move || {
+            let mut file = &journal.file;
             while let Ok(request) = receiver.recv() {
                 let result = file.write_all(&request.bytes).and_then(|()| {
                     before_sync();
@@ -121,7 +138,7 @@ fn start_writer(
 /// The admission state for the shared launch/send history. Calls take the current
 /// boot-relative time explicitly so replay and fault cases can be tested.
 struct Budget {
-    journal: File,
+    journal: Arc<LockedJournal>,
     writer: Option<SyncSender<WriteRequest>>,
     write_ack: Option<Receiver<io::Result<()>>>,
     len: u64,
@@ -144,14 +161,15 @@ impl Budget {
         policy: LocalIdentifyPolicy,
     ) -> io::Result<Self> {
         create_runtime_root(root)?;
-        let mut journal = crate::core_units::open_append_private(&root.join(JOURNAL_NAME))?;
+        let file = crate::core_units::open_append_private(&root.join(JOURNAL_NAME))?;
         // One service per journal, including while verifying and repairing it.
-        if unsafe { libc::flock(journal.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             return Err(io::Error::last_os_error());
         }
+        let journal = Arc::new(LockedJournal { file });
         File::open(root)?.sync_all()?;
         let mut bytes = Vec::new();
-        (&mut journal)
+        (&journal.file)
             .take(MAX_JOURNAL + 1)
             .read_to_end(&mut bytes)?;
         if bytes.len() as u64 > MAX_JOURNAL {
@@ -185,8 +203,8 @@ impl Budget {
             budget.replay(record)?;
         }
         if complete < bytes.len() {
-            budget.journal.set_len(budget.len)?;
-            budget.journal.sync_all()?;
+            budget.journal.file.set_len(budget.len)?;
+            budget.journal.file.sync_all()?;
         }
         if budget.boot.as_deref() == Some(boot) {
             budget.observe(now)?;
@@ -386,8 +404,8 @@ impl Budget {
                 self.write_ack = Some(result);
             } else {
                 // Startup replay and its boot marker finish before the owner loop.
-                self.journal.write_all(&bytes)?;
-                self.journal.sync_all()?;
+                (&self.journal.file).write_all(&bytes)?;
+                self.journal.file.sync_all()?;
             }
             // Conservatively count a submitted write immediately. Its result
             // cannot reach a Gateway or authorize spawn before the worker ACK.
@@ -537,7 +555,7 @@ impl Service {
         mut budget: Budget,
         before_sync: impl FnMut() + Send + 'static,
     ) -> io::Result<Self> {
-        budget.writer = Some(start_writer(budget.journal.try_clone()?, before_sync)?);
+        budget.writer = Some(start_writer(Arc::clone(&budget.journal), before_sync)?);
         Ok(Self {
             budget,
             peers: Vec::new(),

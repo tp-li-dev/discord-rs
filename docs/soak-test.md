@@ -73,6 +73,8 @@ sudo install -m 0755 target/release/src /opt/discord-rs/bin/src.new && sudo mv /
 sudo -u discord-rs /opt/discord-rs/bin/botctl gateway-update test --secret-file /etc/discord-rs/botd.secret --port 47321 --json
 # 状態: botctl operation <操作ID>（state が succeeded）。記録: /var/lib/discord-rs/runtime/gateway-update-audit.jsonl
 ```
+
+botctl と botd は同じリリースを使用します。Unix ソケットを設定している場合は上の `--port 47321` を `--socket ABS` に変更し、採取スクリプトには `CONTROL_SOCKET=ABS` を設定します。
 一括確認：`sudo bash deploy/dev/update-check.sh test [--repeat N] [--shard N]` は、対象 Bot の shard 数を `botctl inspect` から取得し、更新の前後の PID、Core の不変、旧 Gateway の消滅、各 shard の IPC、マーカー、監査ログ、journald の警告を確認して PASS／FAIL の表を出す（終了コードは全 PASS のときだけ 0）。`--shard N` を省略すると全 shard を更新し、指定するとその shard だけを更新して他の Gateway の PID が変わらないことも確認する。`--repeat N` は更新を N 回繰り返し、2 回以上なら各 Gateway と Core の RSS を初回更新後の値と比較する（20% 以内）。Ubuntu の `python3` が必要。実行の記録：Oracle（実サーバー）で 1 シャードの更新に成功（全 PASS）。WSL（実 Discord、2 シャード）で、全更新と `--shard 1` が全 PASS、Core を落とした直後・存在しないシャード・`--repeat 0` が FAIL／拒否されることを確認（`docs/progress.md`）。表示が期待と違えば、スクリプト側の不具合も疑う。
 `--repeat` でも Bot ごとの Identify 枠を共有する。間隔待ちのまま結果を確認できなければ `IdentifyBudget`、間隔待ちで操作期限に達した場合は `IdentifyDeferred`、回数枠が足りなければ `IdentifyUnavailable` が更新の FAIL 行に表示される。
 

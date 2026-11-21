@@ -97,6 +97,7 @@ python3 /tmp/wsl-smoke-collector.py >/dev/null 2>&1 &
 COLLECTOR_PID=$!
 sleep 1
 
+# This smoke test uses paired release binaries and checks mutual authentication over TCP.
 status_json() {
   runuser -u "$USER_NAME" -- /opt/discord-rs/bin/botctl status --secret-file /etc/discord-rs/botd.secret --port "$PORT" --json 2>/dev/null
 }

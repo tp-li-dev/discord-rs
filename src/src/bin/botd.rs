@@ -1,13 +1,13 @@
 //! Local authenticated daemon control. Bootstrap capability arrives on anonymous stdin
 //! (`--bootstrap-stdin`) or from a permission-checked file (`--secret-file`, for systemd).
-//! The TCP listener is always loopback; it is not a remote management endpoint. Its port
-//! is random unless `--control-port` is given (only with `--secret-file`).
+//! The listener is loopback TCP (random port by default) or a private Linux Unix socket.
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use src::daemon::control::{AUDIT_ACK_TIMEOUT, CommandRequest, ControlPlane, NOTE};
 use src::daemon::update_control::{ControlAccess, UpdateHub};
+use src::management::{self, Key, Listener, Protocol, Session};
+use src::update_rollback::UpdateControlRequest;
 use src::{cluster::NodeId, cluster_runtime::RaftRuntimeOptions, raft_quorum::StorageMode};
-use src::{local_control::DaemonControlEnvelope, update_rollback::UpdateControlRequest};
 use std::{
     collections::{BTreeMap, HashSet},
     ffi::OsString,
@@ -16,19 +16,16 @@ use std::{
     path::PathBuf,
     time::Duration,
 };
-use subtle::ConstantTimeEq;
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
-    net::TcpListener,
     sync::{mpsc, oneshot},
-    task::JoinSet,
 };
 
 const REQUEST_LIMIT: u64 = 4096;
-const RESPONSE_LIMIT: usize = 64 * 1024;
+const RESPONSE_LIMIT: usize = management::RESPONSE_LIMIT;
 const DEADLINE: Duration = Duration::from_secs(3);
 const NONCE_RETRY_FOR: &str = "--enable-create-message-nonce-retry-for";
-const USAGE: &str = "usage: botd --file F --runtime-root ABS --gateway-program ABS (--bootstrap-stdin | --secret-file ABS [--control-port PORT]) [--no-autostart] [--stop-children-on-exit] [--core-mode embedded|separate] [--identify-send-grants] [--enable-create-message-nonce-retry-for BOT_ID ...] [--mock-discord LOOPBACK_IP:PORT] [--allow-test-quorum] [--allow-raft-quorum --raft-store ABS --raft-rpc-listen LOOPBACK_IP:PORT --raft-rpc-peer ID=LOOPBACK_IP:PORT ... [--raft-create] [--raft-bootstrap]] [--allow-test-gateway-switch --mock-identify-budget F]";
+const USAGE: &str = "usage: botd --file F --runtime-root ABS --gateway-program ABS (--bootstrap-stdin | --secret-file ABS [--control-port PORT | --control-socket ABS]) [--no-autostart] [--stop-children-on-exit] [--core-mode embedded|separate] [--identify-send-grants] [--enable-create-message-nonce-retry-for BOT_ID ...] [--mock-discord LOOPBACK_IP:PORT] [--allow-test-quorum] [--allow-raft-quorum --raft-store ABS --raft-rpc-listen LOOPBACK_IP:PORT --raft-rpc-peer ID=LOOPBACK_IP:PORT ... [--raft-create] [--raft-bootstrap]] [--allow-test-gateway-switch --mock-identify-budget F]";
 
 struct Options {
     file: PathBuf,
@@ -51,6 +48,7 @@ struct Options {
     mock_recovery_max_restarts: Option<u32>,
     secret_file: Option<PathBuf>,
     control_port: u16,
+    control_socket: Option<PathBuf>,
 }
 
 fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'static str> {
@@ -80,6 +78,7 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
     let mut mock_recovery_max_restarts = None;
     let mut secret_file = None;
     let mut control_port = None;
+    let mut control_socket = None;
     while let Some(arg) = args.next() {
         let target = match arg.to_str() {
             Some("--identify-send-grants")
@@ -127,6 +126,9 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
             Some("--gateway-program") if gateway_program.is_none() => &mut gateway_program,
             Some("--raft-store") if raft_store.is_none() => &mut raft_store,
             Some("--secret-file") if secret_file.is_none() => &mut secret_file,
+            Some("--control-socket") if cfg!(target_os = "linux") && control_socket.is_none() => {
+                &mut control_socket
+            }
             Some("--control-port") if control_port.is_none() => {
                 let port = args
                     .next()
@@ -306,6 +308,7 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
         mock_recovery_max_restarts,
         secret_file,
         control_port: control_port.unwrap_or(0),
+        control_socket,
     };
     if options
         .core_status_dir
@@ -329,6 +332,16 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
     }
     if control_port.is_some() && options.secret_file.is_none() {
         return Err("--control-port requires --secret-file");
+    }
+    if let Some(path) = &options.control_socket {
+        if control_port.is_some() || options.secret_file.is_none() {
+            return Err(
+                "--control-socket requires --secret-file and conflicts with --control-port",
+            );
+        }
+        if !path.is_absolute() {
+            return Err("--control-socket requires an absolute path");
+        }
     }
     if !options.runtime_root.is_absolute() || !options.gateway_program.is_absolute() {
         return Err("runtime root and gateway program must be absolute paths");
@@ -389,7 +402,6 @@ struct Bootstrap {
 #[derive(Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct StatusRequest {
-    secret: [u8; 32],
     command: String,
     #[serde(default)]
     bot: Option<String>,
@@ -424,12 +436,12 @@ struct Envelope {
     response: oneshot::Sender<Value>,
 }
 
-// Each alternative is strict, including the flattened update payload. No role,
+// Each alternative is strict, including the typed update payload. No role,
 // subject or scope supplied by a connected client is accepted here.
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum WireRequest {
-    Update(Box<DaemonControlEnvelope<UpdateControlRequest>>),
+    Update(Box<UpdateControlRequest>),
     Command(Box<StatusRequest>),
 }
 
@@ -489,44 +501,36 @@ async fn load_bootstrap(secret_file: Option<&std::path::Path>) -> Result<Bootstr
 
 #[cfg(test)]
 async fn serve_status<S: AsyncRead + AsyncWrite + Unpin>(
-    stream: S,
+    mut stream: S,
     secret: &[u8; 32],
     commands: &mpsc::Sender<Envelope>,
 ) -> io::Result<()> {
-    serve_control(stream, secret, &ControlAccess::default(), commands).await
+    let (session, _) =
+        management::authenticate_server(&mut stream, Protocol::Botd, &[Key::new(secret)]).await?;
+    serve_control(stream, session, &ControlAccess::default(), commands).await
 }
 
 async fn serve_control<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
-    secret: &[u8; 32],
+    session: Session,
     access: &ControlAccess,
     commands: &mpsc::Sender<Envelope>,
 ) -> io::Result<()> {
-    let frame = tokio::time::timeout(DEADLINE, read_frame(&mut stream))
+    let frame = tokio::time::timeout(DEADLINE, session.read_request(&mut stream))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "control frame timed out"))??;
     let request: WireRequest = serde_json::from_slice(&frame)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid status request"))?;
-    let received_secret = match &request {
-        WireRequest::Update(wire) => &wire.secret,
-        WireRequest::Command(wire) => &wire.secret,
-    };
-    if !bool::from(received_secret.ct_eq(secret)) {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "status request denied",
-        ));
-    }
     let (command, update) = match request {
         WireRequest::Update(wire) => (
             CommandRequest {
-                command: wire.request.command_name().into(),
-                bot: Some(wire.request.bot.clone()),
-                operation_id: Some(wire.request.operation_id.clone()),
-                yes: wire.request.yes,
+                command: wire.command_name().into(),
+                bot: Some(wire.bot.clone()),
+                operation_id: Some(wire.operation_id.clone()),
+                yes: wire.yes,
                 ..Default::default()
             },
-            Some(wire.request),
+            Some(*wire),
         ),
         WireRequest::Command(request) => (
             CommandRequest {
@@ -578,15 +582,8 @@ async fn serve_control<S: AsyncRead + AsyncWrite + Unpin>(
         } else {
             json!({"ok": false, "offline": false, "error": "daemon control busy", "note": NOTE})
         };
-        let mut response = encode_response(value)?;
-        response.push(b'\n');
-        if response.len() > RESPONSE_LIMIT {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "status response exceeds limit",
-            ));
-        }
-        stream.write_all(&response).await?;
+        let response = encode_response(value)?;
+        session.write_response(&mut stream, &response).await?;
         stream.shutdown().await
     })
     .await
@@ -623,7 +620,7 @@ fn encode_response(mut value: Value) -> io::Result<Vec<u8>> {
     let mut omitted = 0;
     loop {
         let bytes = serde_json::to_vec(&value)?;
-        if bytes.len() < RESPONSE_LIMIT {
+        if bytes.len() <= RESPONSE_LIMIT {
             return Ok(bytes);
         }
         let removed = trim(&mut value);
@@ -638,25 +635,38 @@ fn encode_response(mut value: Value) -> io::Result<Vec<u8>> {
     }
 }
 
+async fn bind_control(options: &Options) -> Result<Listener, &'static str> {
+    #[cfg(target_os = "linux")]
+    if let Some(path) = &options.control_socket {
+        return Listener::bind_unix(path).map_err(
+            |_| "cannot bind local daemon control socket; check path, ownership and mode",
+        );
+    }
+    Listener::bind_tcp(options.control_port)
+        .await
+        .map_err(|_| "cannot bind local daemon control")
+}
+
 async fn status_server(
-    listener: TcpListener,
+    listener: Listener,
     secret: [u8; 32],
     access: ControlAccess,
     commands: mpsc::Sender<Envelope>,
 ) -> io::Result<()> {
-    let mut sessions = JoinSet::new();
-    loop {
-        tokio::select! {
-            accepted = listener.accept(), if sessions.len() < 32 => {
-                let (stream, peer) = accepted?;
-                if !peer.ip().is_loopback() { continue; }
-                let commands = commands.clone();
-                let access = access.clone();
-                sessions.spawn(async move { let _ = serve_control(stream, &secret, &access, &commands).await; });
+    management::serve(
+        listener,
+        Protocol::Botd,
+        vec![Key::new(&secret)],
+        |stream, session, _| {
+            let commands = commands.clone();
+            let access = access.clone();
+            async move {
+                let _ = serve_control(stream, session, &access, &commands).await;
             }
-            _ = sessions.join_next(), if !sessions.is_empty() => {}
-        }
-    }
+        },
+        || {},
+    )
+    .await
 }
 
 // Recovery telemetry never blocks process observation or a Gateway heartbeat.
@@ -846,13 +856,10 @@ async fn run() -> Result<(), &'static str> {
             .map_err(|_| "invalid mock Discord configuration")?;
     }
     let bootstrap = load_bootstrap(options.secret_file.as_deref()).await?;
-    let listener = TcpListener::bind(("127.0.0.1", options.control_port))
-        .await
-        .map_err(|_| "cannot bind local daemon control")?;
+    let listener = bind_control(&options).await?;
     let port = listener
-        .local_addr()
-        .map_err(|_| "cannot inspect local daemon control")?
-        .port();
+        .port()
+        .map_err(|_| "cannot inspect local daemon control")?;
     let audit = RecoveryAudit::open(options.runtime_root.join("recovery-audit.jsonl")).await?;
     let credentials = EnvironmentCredentials;
     // Partial startup failures remain visible through snapshots. Dropping this
@@ -898,7 +905,10 @@ async fn run() -> Result<(), &'static str> {
     announcement.push(b'\n');
     let mut stdout = tokio::io::stdout();
     if stdout.write_all(&announcement).await.is_err() || stdout.flush().await.is_err() {
-        server.abort();
+        if !server.is_finished() {
+            server.abort();
+            let _ = server.await;
+        }
         return Err("cannot announce local daemon control");
     }
     // systemd Type=notify: the control listener is bound and announced.
@@ -978,7 +988,10 @@ async fn run() -> Result<(), &'static str> {
         }
     };
     let _ = notifier.stopping();
-    server.abort();
+    if !server.is_finished() {
+        server.abort();
+        let _ = server.await;
+    }
     if options.stop_children_on_exit && signaled {
         // Graceful only, within STOP_CHILDREN_DEADLINE overall. A child that
         // does not stop in time is left running, never force-killed.
@@ -1055,13 +1068,10 @@ async fn run_raft_cluster(
     {
         return Err("Raft cluster requires a full local administrator capability");
     }
-    let listener = TcpListener::bind(("127.0.0.1", options.control_port))
-        .await
-        .map_err(|_| "cannot bind local daemon control")?;
+    let listener = bind_control(&options).await?;
     let port = listener
-        .local_addr()
-        .map_err(|_| "cannot inspect local daemon control")?
-        .port();
+        .port()
+        .map_err(|_| "cannot inspect local daemon control")?;
     let mut host = src::daemon::cluster_host::ClusterHost::bind(
         &config,
         options.raft.take().ok_or("Raft opt-in required")?,
@@ -1084,7 +1094,10 @@ async fn run_raft_cluster(
     bytes.push(b'\n');
     let mut stdout = tokio::io::stdout();
     if stdout.write_all(&bytes).await.is_err() || stdout.flush().await.is_err() {
-        server.abort();
+        if !server.is_finished() {
+            server.abort();
+            let _ = server.await;
+        }
         host.shutdown().await;
         return Err("cannot announce local daemon control");
     }
@@ -1112,7 +1125,10 @@ async fn run_raft_cluster(
             _ = &mut server => break Err("local daemon control stopped"),
         }
     };
-    server.abort();
+    if !server.is_finished() {
+        server.abort();
+        let _ = server.await;
+    }
     host.shutdown().await;
     result
 }
@@ -1171,13 +1187,10 @@ async fn run_test_cluster(
     {
         return Err("test cluster requires a full local administrator capability");
     }
-    let listener = TcpListener::bind(("127.0.0.1", options.control_port))
-        .await
-        .map_err(|_| "cannot bind local daemon control")?;
+    let listener = bind_control(&options).await?;
     let port = listener
-        .local_addr()
-        .map_err(|_| "cannot inspect local daemon control")?
-        .port();
+        .port()
+        .map_err(|_| "cannot inspect local daemon control")?;
     let (sender, mut receiver) = mpsc::channel::<Envelope>(64);
     let mut server = tokio::spawn(status_server(
         listener,
@@ -1192,7 +1205,10 @@ async fn run_test_cluster(
     bytes.push(b'\n');
     let mut stdout = tokio::io::stdout();
     if stdout.write_all(&bytes).await.is_err() || stdout.flush().await.is_err() {
-        server.abort();
+        if !server.is_finished() {
+            server.abort();
+            let _ = server.await;
+        }
         runtime.shutdown().await;
         return Err("cannot announce local daemon control");
     }
@@ -1245,7 +1261,10 @@ async fn run_test_cluster(
             _=&mut server=>break Err("local daemon control stopped"),
         }
     };
-    server.abort();
+    if !server.is_finished() {
+        server.abort();
+        let _ = server.await;
+    }
     runtime.shutdown().await;
     // Dropping parent pipes cannot extend a guardian's last lease. Shutdown and
     // botd crash therefore use the same independently supervised expiry path.
@@ -1274,13 +1293,10 @@ async fn run_test_gateway_switch(
     }
     let limits = serde_json::from_slice(&bytes).map_err(|_| "invalid mock Identify budget")?;
     let bootstrap = load_bootstrap(options.secret_file.as_deref()).await?;
-    let listener = TcpListener::bind(("127.0.0.1", options.control_port))
-        .await
-        .map_err(|_| "cannot bind local daemon control")?;
+    let listener = bind_control(&options).await?;
     let port = listener
-        .local_addr()
-        .map_err(|_| "cannot inspect local daemon control")?
-        .port();
+        .port()
+        .map_err(|_| "cannot inspect local daemon control")?;
     let core_program = std::env::current_exe().map_err(|_| "Core executable unavailable")?;
     let audit = RecoveryAudit::open(options.runtime_root.join("recovery-audit.jsonl")).await?;
     let mut recovery_config = src::child_recovery::RecoveryConfig::default();
@@ -1324,7 +1340,10 @@ async fn run_test_gateway_switch(
     announcement.push(b'\n');
     let mut stdout = tokio::io::stdout();
     if stdout.write_all(&announcement).await.is_err() || stdout.flush().await.is_err() {
-        server.abort();
+        if !server.is_finished() {
+            server.abort();
+            let _ = server.await;
+        }
         return Err("cannot announce local daemon control");
     }
     let mut update_tick = tokio::time::interval(Duration::from_millis(25));
@@ -1388,7 +1407,10 @@ async fn run_test_gateway_switch(
             _ = &mut server => break Err("local daemon control stopped"),
         }
     };
-    server.abort();
+    if !server.is_finished() {
+        server.abort();
+        let _ = server.await;
+    }
     result
 }
 
@@ -1770,7 +1792,11 @@ mod tests {
         }
     }
 
-    async fn status_session(request: &[u8], status: Value) -> (io::Result<()>, Vec<u8>) {
+    async fn status_session(
+        key: [u8; 32],
+        request: &[u8],
+        status: Value,
+    ) -> (io::Result<()>, Vec<u8>) {
         let (mut client, server) = duplex(128 * 1024);
         let (sender, mut receiver) = mpsc::channel::<Envelope>(1);
         let backend = tokio::spawn(async move {
@@ -1781,30 +1807,42 @@ mod tests {
             }
         });
         let task = tokio::spawn(async move { serve_status(server, &[7; 32], &sender).await });
-        client.write_all(request).await.unwrap();
-        client.shutdown().await.unwrap();
         let mut response = Vec::new();
-        client.read_to_end(&mut response).await.unwrap();
+        if let Ok(session) = client_auth(&mut client, &key).await {
+            if request.len() > management::BOTD_REQUEST_LIMIT {
+                client
+                    .write_all(&(request.len() as u32).to_be_bytes())
+                    .await
+                    .unwrap();
+            } else {
+                session.write_request(&mut client, request).await.unwrap();
+            }
+            client.shutdown().await.unwrap();
+            response = session.read_response(&mut client).await.unwrap_or_default();
+        } else {
+            drop(client);
+        }
         let result = task.await.unwrap();
         backend.await.unwrap();
         (result, response)
     }
 
-    fn request(secret: [u8; 32], command: &str) -> Vec<u8> {
-        let mut frame = serde_json::to_vec(&StatusRequest {
-            secret,
+    async fn client_auth(stream: &mut DuplexStream, key: &[u8; 32]) -> io::Result<Session> {
+        management::authenticate_client(stream, Protocol::Botd, Key::new(key)).await
+    }
+
+    fn request(command: &str) -> Vec<u8> {
+        serde_json::to_vec(&StatusRequest {
             command: command.into(),
             ..Default::default()
         })
-        .unwrap();
-        frame.push(b'\n');
-        frame
+        .unwrap()
     }
 
     #[tokio::test]
     async fn authenticated_status_returns_snapshot_without_secret() {
         let (result, response) =
-            status_session(&request([7; 32], "status"), json!({"processes": []})).await;
+            status_session([7; 32], &request("status"), json!({"processes": []})).await;
         result.unwrap();
         let response: Value = serde_json::from_slice(&response).unwrap();
         assert_eq!(response["ok"], true);
@@ -1814,9 +1852,12 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_wrong_capability_and_mutating_command_without_response() {
-        for frame in [request([8; 32], "status"), request([7; 32], "stop")] {
-            let (result, response) = status_session(&frame, json!([])).await;
-            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        for (key, command, expected) in [
+            ([8; 32], "status", io::ErrorKind::UnexpectedEof),
+            ([7; 32], "stop", io::ErrorKind::PermissionDenied),
+        ] {
+            let (result, response) = status_session(key, &request(command), json!([])).await;
+            assert_eq!(result.unwrap_err().kind(), expected);
             assert!(response.is_empty());
         }
     }
@@ -1828,24 +1869,38 @@ mod tests {
             b"{}".to_vec(),
             b"bad\n".to_vec(),
         ] {
-            let (result, response) = status_session(&frame, json!([])).await;
+            let (result, response) = status_session([7; 32], &frame, json!([])).await;
             assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
             assert!(response.is_empty());
         }
+
+        let (mut client, server) = duplex(8192);
+        let (sender, mut receiver) = mpsc::channel::<Envelope>(1);
+        let task = tokio::spawn(async move { serve_status(server, &[7; 32], &sender).await });
+        let session = client_auth(&mut client, &[7; 32]).await.unwrap();
+        client.write_all(b"\0\0\0\x05{").await.unwrap();
+        client.shutdown().await.unwrap();
+        assert_eq!(
+            session.read_response(&mut client).await.unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(
+            task.await.unwrap().unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert!(receiver.try_recv().is_err());
     }
 
     #[tokio::test]
     async fn rejects_unknown_request_fields_without_response() {
         let mut value = serde_json::to_value(StatusRequest {
-            secret: [7; 32],
             command: "status".into(),
             ..Default::default()
         })
         .unwrap();
         value["extra"] = json!(true);
-        let mut frame = serde_json::to_vec(&value).unwrap();
-        frame.push(b'\n');
-        let (result, response) = status_session(&frame, json!([])).await;
+        let frame = serde_json::to_vec(&value).unwrap();
+        let (result, response) = status_session([7; 32], &frame, json!([])).await;
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
         assert!(response.is_empty());
     }
@@ -1853,7 +1908,7 @@ mod tests {
     #[tokio::test]
     async fn core_restart_dispatches_only_valid_authenticated_requests() {
         let wire = json!({
-            "secret": vec![7; 32], "command": "core-restart", "bot": "bot",
+            "command": "core-restart", "bot": "bot",
             "shard": 1, "core": 0, "expect_total_shards": 2, "expect_bot_id": "7",
             "expect_incarnation": "fedcba9876543210", "force": true,
             "core_recovery_version": src::daemon::control::CORE_RECOVERY_VERSION,
@@ -1870,23 +1925,29 @@ mod tests {
         ] {
             let mut rejected = wire.clone();
             rejected[field] = value;
-            let (result, response) =
-                status_session(format!("{rejected}\n").as_bytes(), json!(null)).await;
+            let (result, response) = status_session(
+                [7; 32],
+                &serde_json::to_vec(&rejected).unwrap(),
+                json!(null),
+            )
+            .await;
             assert!(result.is_err(), "{field}");
             assert!(response.is_empty());
         }
 
         let mut old = wire.clone();
         old.as_object_mut().unwrap().remove("core_recovery_version");
-        let (result, response) = status_session(format!("{old}\n").as_bytes(), json!(null)).await;
+        let (result, response) =
+            status_session([7; 32], &serde_json::to_vec(&old).unwrap(), json!(null)).await;
         assert!(result.is_err());
         assert!(response.is_empty());
 
         let (mut client, server) = duplex(8192);
         let (sender, mut receiver) = mpsc::channel::<Envelope>(1);
         let task = tokio::spawn(async move { serve_status(server, &[7; 32], &sender).await });
-        client
-            .write_all(format!("{wire}\n").as_bytes())
+        let session = client_auth(&mut client, &[7; 32]).await.unwrap();
+        session
+            .write_request(&mut client, &serde_json::to_vec(&wire).unwrap())
             .await
             .unwrap();
         let envelope = receiver.recv().await.unwrap();
@@ -1908,7 +1969,7 @@ mod tests {
     #[tokio::test]
     async fn authenticated_core_admission_can_reply_after_the_frame_deadline() {
         let wire = json!({
-            "secret": vec![7; 32], "command": "core-restart", "bot": "bot",
+            "command": "core-restart", "bot": "bot",
             "shard": 1, "core": 0, "expect_total_shards": 2, "expect_bot_id": "7",
             "expect_incarnation": "fedcba9876543210", "force": true,
             "core_recovery_version": src::daemon::control::CORE_RECOVERY_VERSION,
@@ -1916,11 +1977,10 @@ mod tests {
         });
         let (mut client, server) = duplex(8192);
         let (sender, mut receiver) = mpsc::channel::<Envelope>(1);
-        let task = tokio::spawn(async move {
-            serve_control(server, &[7; 32], &ControlAccess::default(), &sender).await
-        });
-        client
-            .write_all(format!("{wire}\n").as_bytes())
+        let task = tokio::spawn(async move { serve_status(server, &[7; 32], &sender).await });
+        let session = client_auth(&mut client, &[7; 32]).await.unwrap();
+        session
+            .write_request(&mut client, &serde_json::to_vec(&wire).unwrap())
             .await
             .unwrap();
         let envelope = receiver.recv().await.unwrap();
@@ -1930,7 +1990,7 @@ mod tests {
             .response
             .send(json!({"ok": false, "error": "audit_timeout"}))
             .unwrap();
-        let reply = read_frame(&mut client).await.unwrap();
+        let reply = session.read_response(&mut client).await.unwrap();
         let reply: Value = serde_json::from_slice(&reply).unwrap();
         assert_eq!(reply["error"], "audit_timeout");
         task.await.unwrap().unwrap();
@@ -1939,7 +1999,8 @@ mod tests {
     #[tokio::test]
     async fn rejects_oversized_response_before_writing() {
         let (result, response) = status_session(
-            &request([7; 32], "status"),
+            [7; 32],
+            &request("status"),
             json!("x".repeat(RESPONSE_LIMIT)),
         )
         .await;
@@ -1966,12 +2027,16 @@ mod tests {
         let (sender, mut receiver) = mpsc::channel::<Envelope>(1);
         let task = tokio::spawn(async move { serve_status(server, &[7; 32], &sender).await });
         assert!(receiver.try_recv().is_err());
-        client.write_all(&request([7; 32], "status")).await.unwrap();
+        let session = client_auth(&mut client, &[7; 32]).await.unwrap();
+        assert!(receiver.try_recv().is_err());
+        session
+            .write_request(&mut client, &request("status"))
+            .await
+            .unwrap();
         let envelope = receiver.recv().await.unwrap();
         assert_eq!(envelope.request.command, "status");
         envelope.response.send(json!({"ok": true, "status": {"processes": [{"state": "Failed"}], "monitor_ok": false}})).unwrap();
-        let mut response = Vec::new();
-        client.read_to_end(&mut response).await.unwrap();
+        let response = session.read_response(&mut client).await.unwrap();
         task.await.unwrap().unwrap();
         let response: Value = serde_json::from_slice(&response).unwrap();
         assert_eq!(response["status"]["monitor_ok"], false);

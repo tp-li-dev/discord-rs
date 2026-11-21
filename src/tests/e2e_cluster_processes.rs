@@ -1,6 +1,8 @@
 //! T10-T14 with three real botd processes, mTLS and real Gateway/Worker trees.
 //! The quorum is explicitly TEST ONLY. These loopback, normal-clock experiments
 //! do not establish production consensus, OS suspend safety or Discord behavior.
+#[path = "fixtures/control_channel.rs"]
+mod control_channel;
 #[path = "fixtures/e2e_cluster_support.rs"]
 mod support;
 

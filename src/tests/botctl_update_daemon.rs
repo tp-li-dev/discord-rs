@@ -1,5 +1,8 @@
 //! Real botctl and botd processes, with explicit mock Discord and no autostart.
 //! Exercises authenticated admission/failure/audit, never real Discord or deploys.
+#[path = "fixtures/control_channel.rs"]
+mod control_channel;
+
 use serde_json::{Value, json};
 use std::{
     future::Future,
@@ -9,8 +12,8 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    net::{TcpListener, TcpStream},
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    net::TcpListener,
     process::Child,
 };
 
@@ -133,7 +136,7 @@ impl Fixture {
     }
 
     fn request(&self, command: &str) -> Value {
-        json!({"secret":SECRET,"command":command,"bot":"101","operation_id":ID,
+        json!({"command":command,"bot":"101","operation_id":ID,
             "yes":true,"component":"core","manifest":self.manifest()})
     }
 
@@ -181,18 +184,18 @@ impl Fixture {
     }
 
     async fn raw(&self, value: &Value) -> Vec<u8> {
-        bounded(async {
-            let mut stream = TcpStream::connect(("127.0.0.1", self.port)).await.unwrap();
-            stream
-                .write_all(format!("{value}\n").as_bytes())
-                .await
-                .unwrap();
-            let mut bytes = Vec::new();
-            stream.take(65537).read_to_end(&mut bytes).await.unwrap();
-            assert!(bytes.len() <= 65536);
-            bytes
-        })
-        .await
+        match bounded(control_channel::request(self.port, &SECRET, value)).await {
+            Ok(body) => body,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                Vec::new()
+            }
+            Err(error) => panic!("authenticated request failed: {error}"),
+        }
     }
 
     async fn json(&self, value: &Value) -> Value {
@@ -203,7 +206,7 @@ impl Fixture {
         bounded(async {
             loop {
                 let value = self
-                    .json(&json!({"secret":SECRET,"command":"operation","operation_id":ID}))
+                    .json(&json!({"command":"operation","operation_id":ID}))
                     .await;
                 if value["operation"]["state"] != "running" {
                     return value;
@@ -323,7 +326,7 @@ async fn server_roles_and_shard_scopes_deny_without_started_records() {
             assert_eq!(fixture.finished().await["ok"], false);
         } else {
             let query = fixture
-                .json(&json!({"secret":SECRET,"command":"operation","operation_id":ID}))
+                .json(&json!({"command":"operation","operation_id":ID}))
                 .await;
             assert_eq!(query["ok"], false);
             assert!(query.get("operation").is_none());
@@ -356,7 +359,7 @@ async fn idempotent_ids_never_reexecute_and_changed_content_conflicts() {
     assert!(conflict["error"].as_str().unwrap().contains("conflict"));
     assert_eq!(fixture.finished().await, completed);
     let legacy = fixture
-        .json(&json!({"secret":SECRET,"command":"stop","bot":"first","operation_id":ID}))
+        .json(&json!({"command":"stop","bot":"first","operation_id":ID}))
         .await;
     assert_eq!(legacy["ok"], false);
     assert_eq!(fixture.finished().await, completed);
@@ -369,7 +372,7 @@ async fn idempotent_ids_never_reexecute_and_changed_content_conflicts() {
 async fn update_id_cannot_shadow_an_earlier_lifecycle_operation() {
     let mut fixture = Fixture::new(None).await;
     let stopped = fixture
-        .json(&json!({"secret":SECRET,"command":"stop","bot":"first","operation_id":ID}))
+        .json(&json!({"command":"stop","bot":"first","operation_id":ID}))
         .await;
     assert_eq!(stopped["ok"], true);
     let original = fixture.finished().await;
@@ -416,7 +419,11 @@ async fn unauthenticated_or_identity_injected_wire_requests_cannot_admit_updates
         assert!(fixture.raw(&request).await.is_empty());
     }
     let mut request = fixture.request("update");
-    request["secret"] = json!(vec![0; 32]);
+    let wrong = bounded(control_channel::request(fixture.port, &[0; 32], &request))
+        .await
+        .unwrap_err();
+    assert_eq!(wrong.kind(), std::io::ErrorKind::PermissionDenied);
+    request["secret"] = json!(SECRET); // The former bearer field is rejected too.
     assert!(fixture.raw(&request).await.is_empty());
     let mut request = fixture.request("update");
     request["manifest"]["secret"] = json!(SECRET);

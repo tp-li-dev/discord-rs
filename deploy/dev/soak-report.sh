@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
 # 長時間稼働（放置）試験のスナップショット。読み取り専用で、秘密を出力しない。
 # サーバーで root（または sudo）で実行する。例:  sudo ./soak-report.sh | tee -a /home/ubuntu/soak.log
+# 稼働中の botd と同じリリースの botctl を使用する。Unix ソケットの場合は CONTROL_SOCKET を設定する。
 # 数時間おきに実行して、増え続ける値（RSS、fd、ログの大きさ、再起動回数）を比べる。
 set -u
 UNIT=${UNIT:-botd}
 USER_NAME=${USER_NAME:-discord-rs}
 ROOT=${ROOT:-/var/lib/discord-rs/runtime}
 PORT=${PORT:-47321}
+control_endpoint=(--port "$PORT")
+if [ -n "${CONTROL_SOCKET:-}" ]; then
+  control_endpoint=(--socket "$CONTROL_SOCKET")
+fi
 SECRET=${SECRET:-/etc/discord-rs/botd.secret}
 
 echo "=== soak snapshot $(date -Is) host=$(hostname) arch=$(uname -m) ==="
@@ -60,7 +65,7 @@ journalctl -u "$UNIT" -b -p warning --no-pager 2>/dev/null | grep -vc "^-- "
 
 if [ -r "$SECRET" ] && command -v botctl >/dev/null 2>&1 || [ -x /opt/discord-rs/bin/botctl ]; then
   echo "--- botctl status (state, restarts, cores) ---"
-  sudo -u "$USER_NAME" /opt/discord-rs/bin/botctl status --secret-file "$SECRET" --port "$PORT" --json 2>/dev/null \
+  sudo -u "$USER_NAME" /opt/discord-rs/bin/botctl status --secret-file "$SECRET" "${control_endpoint[@]}" --json 2>/dev/null \
     | grep -E '"(state|restarts|restart_exhausted|running|failures)"' | sort | uniq -c
 fi
 echo "=== end ==="

@@ -1,10 +1,13 @@
 //! CLI planning and authenticated loopback contract tests. The listener below
 //! is a mock daemon; no Gateway, Discord connection, or deployment is exercised.
+#[path = "fixtures/control_channel.rs"]
+mod control_channel;
+
 use serde_json::{Value, json};
 use std::{
     ffi::OsString,
-    io::{BufRead, BufReader, Read, Write},
-    net::{Ipv4Addr, TcpListener, TcpStream},
+    io::{Read, Write},
+    net::{Ipv4Addr, TcpListener},
     path::PathBuf,
     process::{Command, Output, Stdio},
     sync::{
@@ -348,64 +351,31 @@ fn apply_authenticates_inspection_and_sends_canonical_request_once() {
                     }
                 }
             };
-            let read = |stream: &mut TcpStream| {
-                let mut frame = Vec::new();
-                BufReader::new(stream)
-                    .take(4097)
-                    .read_until(b'\n', &mut frame)
-                    .unwrap();
-                assert!(frame.len() <= 4096 && frame.last() == Some(&b'\n'));
-                serde_json::from_slice::<Value>(&frame).unwrap()
-            };
-            let mut stream = accept();
-            let inspection = read(&mut stream);
+            let mut stream =
+                control_channel::BlockingPeer::botd(accept(), &TEST_CAPABILITY).unwrap();
+            let inspection = stream.read();
             assert_eq!(inspection["command"], "inspect");
             assert_eq!(inspection["bot"], "first");
-            assert_eq!(inspection["secret"], json!(TEST_CAPABILITY));
             assert!(inspection.get("manifest").is_none());
-            writeln!(
-                stream,
-                "{}",
-                json!({"ok":true,"offline":false,
-                "bot":{"bot_id":"bot-one","total_shards":2}})
-            )
-            .unwrap();
+            stream.reply(&json!({"ok":true,"offline":false,
+                "bot":{"bot_id":"bot-one","total_shards":2}}));
             drop(stream);
-            let mut stream = accept();
-            let request = read(&mut stream);
-            let envelope: src::local_control::DaemonControlEnvelope<
-                src::update_rollback::UpdateControlRequest,
-            > = serde_json::from_value(request.clone()).unwrap();
-            assert_eq!(envelope.secret, TEST_CAPABILITY);
-            envelope.request.validate().unwrap();
-            assert_eq!(envelope.request.command_name(), command);
-            assert_eq!(envelope.request.bot, "bot-one");
-            assert!(envelope.request.yes);
-            assert_eq!(
-                envelope.request.component,
-                src::update_rollback::Component::Core
-            );
+            let mut stream =
+                control_channel::BlockingPeer::botd(accept(), &TEST_CAPABILITY).unwrap();
+            let request = stream.read();
+            let envelope: src::update_rollback::UpdateControlRequest =
+                serde_json::from_value(request.clone()).unwrap();
+            envelope.validate().unwrap();
+            assert_eq!(envelope.command_name(), command);
+            assert_eq!(envelope.bot, "bot-one");
+            assert!(envelope.yes);
+            assert_eq!(envelope.component, src::update_rollback::Component::Core);
             assert!(request.get("role").is_none());
             assert!(request.get("principal").is_none());
-            assert_eq!(envelope.request.manifest.shards.len(), 2);
-            assert!(
-                envelope
-                    .request
-                    .manifest
-                    .artifacts
-                    .core
-                    .unwrap()
-                    .path
-                    .is_absolute()
-            );
-            let id = envelope.request.operation_id;
-            writeln!(
-                stream,
-                "{}",
-                json!({"ok":false,"offline":false,
-                "error":"update admission denied"})
-            )
-            .unwrap();
+            assert_eq!(envelope.manifest.shards.len(), 2);
+            assert!(envelope.manifest.artifacts.core.unwrap().path.is_absolute());
+            let id = envelope.operation_id;
+            stream.reply(&json!({"ok":false,"offline":false,"error":"update admission denied"}));
             drop(stream);
             // A rejection must terminate the command, never replay the mutation.
             thread::sleep(Duration::from_millis(200));

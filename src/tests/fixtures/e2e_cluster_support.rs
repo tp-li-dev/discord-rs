@@ -675,28 +675,18 @@ stop_margin_ms = {STOP_MARGIN_MS}
     pub async fn status(&self, id: u64) -> Value {
         self.request(id, json!({"command":"status"})).await
     }
-    pub async fn request(&self, id: u64, mut value: Value) -> Value {
+    pub async fn request(&self, id: u64, value: Value) -> Value {
         self.monitor.check();
-        value["secret"] = json!(SECRET.to_vec());
-        let mut bytes = serde_json::to_vec(&value).unwrap();
-        bytes.push(b'\n');
-        let value = tokio::time::timeout(WAIT, async {
-            let mut stream = TcpStream::connect(("127.0.0.1", self.nodes[&id].port))
-                .await
-                .unwrap();
-            stream.write_all(&bytes).await.unwrap();
-            let mut bytes = Vec::new();
-            BufReader::new(stream)
-                .take(FRAME_LIMIT + 1)
-                .read_until(b'\n', &mut bytes)
-                .await
-                .unwrap();
-            assert!(bytes.len() as u64 <= FRAME_LIMIT);
-            no_secrets(&bytes);
-            serde_json::from_slice(&bytes).expect("authenticated botd JSON response")
-        })
+        let bytes = tokio::time::timeout(
+            WAIT,
+            super::control_channel::request(self.nodes[&id].port, &SECRET, &value),
+        )
         .await
+        .unwrap()
         .unwrap();
+        assert!(bytes.len() as u64 <= FRAME_LIMIT);
+        no_secrets(&bytes);
+        let value = serde_json::from_slice(&bytes).expect("authenticated botd JSON response");
         self.monitor.check();
         value
     }

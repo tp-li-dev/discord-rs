@@ -84,7 +84,7 @@ Worker の stdout は JSON IPC 専用で、通常の content/state や設定を�
 | `src/src/cogs/mod.rs`, `src/framework/src/lib.rs` | EventContext::log_info の文字列を logger がそのまま eprintln する。ハンドラーが token やユーザー入力を含む任意文字列を出せる。 | logger の出口で Redacted を適用。秘密を含むイベント本文の記録自体を避ける。 |
 | `src/framework/src/arguments.rs`, `src/src/cogs/mod.rs` | ArgumentError::Unexpected は入力値を Display に含む。prefix の余剰引数は cogs 側で抑制するが、エラー型自体は他の呼出元から表示可能。 | エラーに入力本文を含めず種類・位置のみ持たせる。ラベルのない短い秘密は文字列マスクで識別できない。 |
 | `src/src/worker.rs` | 更新・再起動・状態復旧等のエラー本文、Worker の拒否 reason、更新先 path を表示・エラーへ組込む経路がある。未知応答一覧は本文でなく識別子のみ。 | エラー本文・外部 reason・path の出口を保護し、固定分類を採用。パスに含まれる任意秘密やログ改行の扱いも別途検討。 |
-| `src/src/bin/manage.rs` | reload の stdout / stderr をそのまま表示し、管理の message / 起動エラーをログや last_failure に保存・応答する。Endpoint / Request の secret は String だが Debug derive はない。 | 子プロセス出力と管理応答の入口・表示・保存に保護を適用。secret の型を Secret にし、専用 wire 型で意図的にシリアライズする。シリアライズ内容自体はログに出さない。 |
+| `src/src/bin/manage.rs` | reload の stdout / stderr をそのまま表示し、管理の message / 起動エラーをログや last_failure に保存・応答する。当時の Endpoint / Request の secret は String だが Debug derive はなかった。 | 子プロセス出力と管理応答の入口・表示・保存に保護を適用。secret の型を Secret にし、保存用 endpoint ファイルに専用 serde を使用する。 |
 | `src/src/bin/register.rs`, `doctor.rs`, `reload.rs` | main の Result / `?` 経由で外部エラーが表示されうる。register の schema 表示、reload の build 名表示にも汎用マスクはない。 | CLI 最上位で固定分類・マスク済み説明へ変換。利用者が秘密を schema や build 名に混入させない設計・検証。 |
 | `src/src/placement.rs`, `gateway_metadata.rs` | 配置検証は不正 ID を本文へ含めず、メタデータの取得失敗は main 側で固定エラーに変換。配置には token 値でなく環境変数名を持つ。 | 既存対策あり。設定構造体の Debug 等を将来ログへ出す場合にも未信頼文字列の混入に注意。 |
 | `src/src/shard_runtime.rs`, `worker.rs`, `bin/manage.rs`, `bin/reload.rs` | Shard 起動仕様は token 環境参照を Gateway 側へ限定。当時のビルド経路は `DISCORD_TOKEN` だけを除外していた。 | 現在のビルド境界は「従来の manage / reload のビルド環境」を参照。環境を継承する従来の Worker 起動では `DISCORD_TOKEN` だけを除外する。 |
@@ -99,7 +99,7 @@ Worker の stdout は JSON IPC 専用で、通常の content/state や設定を�
 
 ## 既存経路への適用（2026-11-12）
 
-- `bin/manage.rs`: Endpoint / Request の認証秘密を `Secret<String>` に保持し、専用 serde adapter だけが wire 用に明示的に取り出す。JSON の形式と定数時間比較は維持。管理応答受信、応答作成、操作失敗・再起動失敗の保存前、reload 子出力、ビルド stdout/stderr、既存ログの表示、および最上位エラー表示で `redact` を適用した。既存ログファイル自体は書き換えない。
+- `bin/manage.rs`: Endpoint / Request の認証秘密を `Secret<String>` に保持し、専用 serde adapter で明示的に取り出していた。現在の管理ワイヤーでは相互認証の MAC を使う。管理応答受信、応答作成、操作失敗・再起動失敗の保存前、reload 子出力、ビルド stdout/stderr、既存ログの表示、および最上位エラー表示で `redact` を適用した。既存ログファイル自体は書き換えない。
 - `bin/register.rs`: token を `Secret` で保持し Twilight への引渡時だけ取り出す。非 Unicode 環境変数エラーは値を含めず固定分類にする。schema と最上位エラー表示をマスクし、Plan の Debug はコマンド名全体を隠す。
 - `bin/reload.rs`: ビルド stdout/stderr、build 名、状態ファイルの失敗 reason、最上位エラーをマスク。`bin/doctor.rs` の最上位エラーにも適用。
 - `placement.rs`: 設定・配置・起動 intent の自由文字列を Debug 時に `Secret` で丸ごと隠す。短い無ラベル文字列も対象。PlacementError の Display / Debug は `redact` を通す。Serialize の wire 内容や実配置の値は変更しない。
@@ -192,7 +192,7 @@ Worker の stdout は JSON IPC 専用で、通常の content/state や設定を�
 
 ## ローカル管理経路への適用
 
-`manage` は loopback の管理接続で資格情報を照合し、`core.json` の資格情報に admin、別の `viewer.json` の資格情報に viewer をサーバー側で結び付ける。クライアントが要求でロールを選ぶことはできない。各ファイルには同じ形式の接続先とそれぞれ別の秘密が入るため、必要な権限を持つユーザーにだけ該当ファイルへのアクセスを許可する。Windows ACL はサポート外（Windows非対応）。資格情報を読める同一ユーザーのプロセスからの利用を区別する仕組みではない。
+`manage` は loopback の管理接続で資格情報による相互認証を行い、`core.json` の資格情報に admin、別の `viewer.json` の資格情報に viewer をサーバー側で結び付ける。クライアントが要求でロールを選ぶことはできない。各ファイルには同じ形式の接続先とそれぞれ別の秘密が入るため、必要な権限を持つユーザーにだけ該当ファイルへのアクセスを許可する。Windows ACL はサポート外（Windows非対応）。資格情報を読める同一ユーザーのプロセスからの利用を区別する仕組みではない。
 
 認証・認可の拒否と管理操作を `runtime/audit.jsonl` に記録する。操作前の監査書き込み・同期に失敗した場合は操作を実行しない。操作後の結果記録が失敗した場合は副作用を巻き戻せず、結果不明として扱う。監査の容量、排他、改竄耐性の制約は前節に従う。受信できなかったフレームなど、要求として識別できない接続のすべてを監査できる保証はない。接続枠または処理待ちキューの飽和時も拒否を記録できない場合がある。未認証の遠隔管理を許可せず、遠隔管理ハンドラーへの mTLS・RBAC の接続は未実装。試験用 daemon 間通信と Raft RPC は mTLS Transport を使う。
 
@@ -200,7 +200,10 @@ Worker の stdout は JSON IPC 専用で、通常の content/state や設定を�
 
 ## botd / botctl のローカル管理境界
 
-`botd` は loopback のみで受け付け、匿名 stdin（`--bootstrap-stdin`）または権限検査済みの secret ファイル（`--secret-file`。通常ファイル・モード 0600/0400・所有者検査。[linux-deployment.md](linux-deployment.md)）で渡された非ゼロの32バイト共有資格情報を要求と定数時間比較してから操作を管理キューに渡す。`botctl` は bootstrap 情報を読みこの資格情報を送信する。これは `manage` の viewer / admin と別の経路で、更新capabilityにはrole・shard scopeと監査が接続されるが、全操作で利用者ごとの役割分離・永続監査を提供しない。資格情報や bootstrap ファイルを閲覧可能な主体から保護する必要がある。`--force` の確認は権限認証の代替ではない。遠隔管理や mTLS とこのローカル listener は接続されていない。`src/src/bin/botd.rs` の `authenticated_status_returns_snapshot_without_secret`、`status_is_dispatched_only_after_authentication` と `src/tests/botctl_daemon.rs` がローカル経路の一部を検証する。Windows ACL はサポート外、複数ホストでの利用は未検証。
+`botd` と `botctl` は loopback TCP または明示指定の Linux Unix ソケットで相互認証する。匿名 stdin または権限検査済みの secret ファイルから読み込んだ 32 バイトの資格情報で HMAC-SHA256 の証明を作る。クライアントは両 nonce に結び付いたサーバー証明を検証してからクライアント証明と要求を送る。要求と応答は方向別の MAC で保護し、検証は定数時間で行う。管理接続では secret を送信しない。Unix ソケットでは OS のファイル権限と双方の SO_PEERCRED も使用する。
+
+`botd` と `manage` は認証前に小さな固定長の入力だけを読み、認証前と認証後の処理枠を分ける。管理操作の role、shard scope、監査、および `--force` の確認要件は従来どおり適用する。TCP の可用性や機密性の制約、移行手順は設計書を参照。[ローカル管理チャネルの設計](design-decisions/12-control-channel-hardening.md)。
+
 
 ## Daemon 間 mTLS TCP Transport（2026-11-12）
 
