@@ -44,8 +44,8 @@ struct Options {
     /// `--guild ID` (repeatable): act on the Shard that serves each guild
     /// (`(guild_id >> 22) % total_shards`, resolved from the daemon's `inspect` before any mutation).
     guilds: Vec<u64>,
-    /// `--all`: run the command for every Bot that has local Shards, one Bot at a time,
-    /// stopping at the first failure. Needs `--yes` (or `--dry-run` to only list the targets).
+    /// `--all`: target every Bot with local Shards. Execution needs `--yes`;
+    /// `--dry-run` only lists the targets.
     all: bool,
     all_dry_run: bool,
     /// Only populated from the `--all` snapshot, never a fuzzy identity.
