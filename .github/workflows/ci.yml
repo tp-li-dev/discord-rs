@@ -87,6 +87,12 @@ jobs:
           # Fetch the reference archive separately from the test dependency cache.
           (cd "$RUNNER_TEMP" && cargo info --registry crates-io "twilight-gateway@$version")
           bash deploy/dev/check-vendor.sh --offline
+      - name: Shell self-tests
+        if: matrix.shard == 'rest'
+        run: |
+          bash deploy/dev/update-check.test.sh
+          bash deploy/dev/soak.test.sh
+          bash deploy/dev/check-vendor.test.sh
       - name: Test shard
         run: bash .github/scripts/test-shard.sh ${{ matrix.shard }}
       - name: Upload test log on failure

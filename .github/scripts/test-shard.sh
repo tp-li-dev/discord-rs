@@ -56,10 +56,10 @@ case "${1:?shard name required}" in
     for t in $(targets); do
       case "$heavy" in *" $t "*) ;; *) args="$args --test $t" ;; esac
     done
-    # Unit tests of lib/bin targets run here; doc tests cannot be combined with
+    # Unit tests of lib/bin and the nonce probe run here; doc tests cannot be combined with
     # other target selectors, so they run as a separate cargo invocation.
     # shellcheck disable=SC2086
-    run --lib --bins $args
+    run --lib --bins --example nonce_probe $args
     cargo test --locked --workspace --doc 2>&1 | tee -a test-output.log
     ;;
   *)
