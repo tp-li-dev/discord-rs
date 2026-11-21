@@ -14,7 +14,7 @@ sudo systemctl edit botd      # 開いたエディタに、次の 3 行以上を
 ```ini
 [Service]
 ExecStart=
-ExecStart=/opt/discord-rs/bin/botd --file /etc/discord-rs/bots.toml --runtime-root /var/lib/discord-rs/runtime --gateway-program /opt/discord-rs/bin/src --secret-file /etc/discord-rs/botd.secret --control-port 47321 --stop-children-on-exit --core-mode separate
+ExecStart=/opt/discord-rs/bin/botd --file /etc/discord-rs/bots.toml --runtime-root /var/lib/discord-rs/runtime --gateway-program /opt/discord-rs/bin/src --secret-file /etc/discord-rs/botd.secret --token-stdin --control-port 47321 --stop-children-on-exit --core-mode separate
 ```
 ```bash
 sudo systemctl restart botd

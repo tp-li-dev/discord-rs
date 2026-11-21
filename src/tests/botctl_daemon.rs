@@ -110,6 +110,44 @@ struct DaemonFixture {
     port: u16,
 }
 
+#[tokio::test]
+async fn missing_autostart_token_fails_before_announcing_control() {
+    let root = directory("missing-startup-token");
+    let file = root.join("placement.toml");
+    std::fs::write(&file, CONFIG).unwrap();
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_botd"))
+        .arg("--file")
+        .arg(&file)
+        .arg("--runtime-root")
+        .arg(&root)
+        .arg("--gateway-program")
+        .arg(gateway_binary())
+        .arg("--bootstrap-stdin")
+        .env_remove("TOKEN_ALPHA")
+        .env_remove("TOKEN_BETA")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let bootstrap = format!("{}\n", json!({"secret": SECRET.to_vec()}));
+    let _ = child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(bootstrap.as_bytes())
+        .await;
+    let output = bounded(child.wait_with_output()).await.unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("missing Gateway credential for an autostart shard")
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 impl DaemonFixture {
     async fn new() -> Self {
         Self::configured(CONFIG, false).await
