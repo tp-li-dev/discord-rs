@@ -1447,9 +1447,47 @@ async fn run_test_gateway_switch(
     result
 }
 
+#[cfg(unix)]
+fn exec_with_token(args: &[OsString]) -> Result<(), &'static str> {
+    use std::os::unix::process::CommandExt;
+
+    let [file, name, program, rest @ ..] = args else {
+        return Err("usage: botd --with-token FILE NAME /absolute/program [ARG ...]");
+    };
+    let name = name
+        .to_str()
+        .filter(|name| src::placement::valid_token_env(name))
+        .ok_or("invalid token variable name")?;
+    if !Path::new(program).is_absolute() {
+        return Err("token command must be an absolute path");
+    }
+    let tokens = read_token_file(Path::new(file))?;
+    let token = tokens
+        .get(name)
+        .filter(|token| !token.expose_secret().is_empty())
+        .ok_or("selected token missing or empty")?;
+    let _ = std::process::Command::new(program)
+        .args(rest)
+        .env_clear()
+        .env(name, token.expose_secret())
+        .exec();
+    Err("cannot execute token command")
+}
+
 #[tokio::main(worker_threads = 2)]
 async fn main() {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    // exec replaces the current process and gives the command a fresh environment.
+    #[cfg(unix)]
+    if let [flag, rest @ ..] = args.as_slice()
+        && flag == "--with-token"
+    {
+        if let Err(error) = exec_with_token(rest) {
+            eprintln!("botd: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let result = if let [flag, path] = args.as_slice()
         && flag == "--check-env-file"
     {

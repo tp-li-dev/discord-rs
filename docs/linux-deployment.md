@@ -119,6 +119,15 @@ sudo -e /etc/discord-rs/botd.env     # 変数名は bots.toml の token_env に�
 書かないでください。botd は `token_env` で指定された token を、その Bot 用の Gateway にだけ渡します。Core
 （Worker）へ token は渡りません。
 
+単独の REST smoke を実行する場合は、選択した token だけを 1 プロセスの環境へ渡せます。
+次の例は `root:discord-rs 0640` の場合です。`root:root 0600` のファイルは
+読み取りを許可された実行ユーザーで扱ってください。`--apply` を付けると Discord に接続します。
+
+```sh
+sudo -u discord-rs /opt/discord-rs/bin/botd --with-token /etc/discord-rs/botd.env \
+    DISCORD_TEST_BOT_TOKEN /absolute/path/to/discord_smoke --apply
+```
+
 ### 管理 secret
 
 `botctl` が接続するための管理 secret（32 byte。64 文字の 16 進 1 行）をファイルで渡します。この unit は

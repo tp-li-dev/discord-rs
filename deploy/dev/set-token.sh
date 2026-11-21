@@ -9,6 +9,9 @@
 # 保存先は root:discord-rs の 0640。systemd の LoadCredential= で botd に渡る。
 # /etc/environment には書かない（誰でも読め、全プロセスに入るため）。
 # 既存のファイルの他の行は保持し、同名の変数だけを置き換える。
+set +x
+unset BASH_XTRACEFD
+set +a
 set -eu
 ENV_FILE="${1:-/etc/discord-rs/botd.env}"
 VAR="${2:-DISCORD_TEST_BOT_TOKEN}"
@@ -25,6 +28,7 @@ dir=$(dirname "$ENV_FILE")
 install -d -m 0750 -o root -g discord-rs "$dir"
 
 printf 'token を貼り付けて Enter（画面には何も表示されません）: ' >&2
+unset token
 IFS= read -rs token
 printf '\n' >&2
 # 前後の空白・改行・引用符の混入を除く（貼り付け時の事故対策）
@@ -51,5 +55,5 @@ chmod 0640 "$tmp"
 mv -f "$tmp" "$ENV_FILE"
 unset token
 
-echo "保存しました: $ENV_FILE ($(stat -c '%a %U:%G' "$ENV_FILE"))、変数: $VAR（値の長さ: $(grep "^${VAR}=" "$ENV_FILE" | cut -d= -f2- | tr -d '\n' | wc -c) 文字）"
-echo "systemd では LoadCredential で botd に渡ります。端末で使う場合: set -a; . $ENV_FILE; set +a （root または discord-rs グループで）"
+echo "保存しました: $ENV_FILE ($(stat -c '%a %U:%G' "$ENV_FILE"))、変数: $VAR"
+echo "systemd では LoadCredential で botd に渡ります。単独コマンドで使う手順は docs/linux-deployment.md を参照してください。"

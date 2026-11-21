@@ -19,6 +19,29 @@ fn directory(label: &str) -> PathBuf {
     path
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn token_command_inherits_only_the_selected_assignment() {
+    let dir = directory("token-command");
+    let file = dir.join("tokens");
+    std::fs::write(
+        &file,
+        "DISCORD_TEST_BOT_TOKEN=selected.fixture\nTOKEN_OTHER=other.fixture\n",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_botd"))
+        .args(["--with-token"])
+        .arg(&file)
+        .args(["DISCORD_TEST_BOT_TOKEN", "/usr/bin/env"])
+        .env("TOKEN_INHERITED", "parent.fixture")
+        .output()
+        .unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"DISCORD_TEST_BOT_TOKEN=selected.fixture\n");
+    assert!(output.stderr.is_empty());
+}
+
 struct CoreGuard {
     child: Child,
     fixture_exit: PathBuf,
