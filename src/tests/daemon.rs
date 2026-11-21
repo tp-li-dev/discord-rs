@@ -1,5 +1,6 @@
 #[path = "fixtures/control_channel.rs"]
 mod control_channel;
+include!("fixtures/gateway_credential.rs");
 
 use src::{
     daemon::*,
@@ -172,10 +173,8 @@ fn fixture_process() {
     };
     let label = std::env::var("FIXTURE_LABEL").unwrap();
     let expected = format!("dummy-{label}");
-    let isolated = std::env::var(src::placement::GATEWAY_TOKEN_ENV)
-        .ok()
-        .as_deref()
-        == Some(expected.as_str())
+    let isolated = fixture_credential(src::placement::GATEWAY_TOKEN_ENV).as_deref()
+        == Some(std::ffi::OsStr::new(&expected))
         && ["TOKEN_A", "TOKEN_B"]
             .iter()
             .all(|n| std::env::var_os(n).is_none())
@@ -286,11 +285,21 @@ async fn nonce_retry_allowlist_is_used_for_normal_recovery_and_standby() {
     let program = root.0.join("gateway");
     std::fs::write(
         &program,
-        r##"#!/bin/sh
+        r##"#!/bin/bash
 if [ "$1" = '--core-listen' ]; then
+    [ -z "${DISCORD_RS_GATEWAY_TOKEN_FD+x}" ] || exit 92
     while IFS= read -r ignored; do :; done
     exit 0
 fi
+[ -z "${DISCORD_RS_GATEWAY_TOKEN+x}" ] || exit 93
+case "$DISCORD_RS_GATEWAY_TOKEN_FD" in
+    *:DISCORD_RS_GATEWAY_TOKEN) ;;
+    *) exit 94 ;;
+esac
+token_fd=${DISCORD_RS_GATEWAY_TOKEN_FD%%:*}
+IFS= read -r -d '' -u "$token_fd" token || :
+[ "$token" = 'fixture' ] || exit 95
+exec {token_fd}<&-
 kind=active
 count=0
 operand=0
@@ -1353,6 +1362,7 @@ fn compile_gateway_fixture(root: &Root) -> PathBuf {
         .0
         .join(format!("gateway-fixture{}", std::env::consts::EXE_SUFFIX));
     std::fs::write(&source, r#"
+include!(env!("GATEWAY_FIXTURE_CREDENTIAL_SOURCE"));
 use std::{collections::HashMap, path::PathBuf, time::{Duration, Instant}};
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -1362,7 +1372,7 @@ fn main() {
     let token_name = &args["--token-env"];
     let expected = format!("dummy-{bot}");
     let token_ok = token_name == "DISCORD_RS_GATEWAY_TOKEN"
-        && std::env::var(token_name).ok().as_deref() == Some(expected.as_str())
+        && fixture_credential(token_name).as_deref() == Some(std::ffi::OsStr::new(&expected))
         && std::env::vars_os().all(|(name, value)| value != expected.as_str() || name == token_name.as_str());
     let foreign_absent = ["TOKEN_A", "TOKEN_B"].iter()
         .all(|name| std::env::var_os(name).is_none());
@@ -1388,6 +1398,13 @@ fn main() {
 }
 "#).unwrap();
     let output = std::process::Command::new("rustc")
+        .env(
+            "GATEWAY_FIXTURE_CREDENTIAL_SOURCE",
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/gateway_credential.rs"
+            ),
+        )
         .arg("--edition=2024")
         .arg(source)
         .arg("-o")

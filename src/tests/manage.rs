@@ -322,8 +322,10 @@ async fn independent_commands_manage_a_persistent_core() {
             .success()
     );
     let audit = std::fs::read_to_string(runtime.join("audit.jsonl")).unwrap();
+    let rejection_audit = std::fs::read_to_string(runtime.join("rejection-audit.jsonl")).unwrap();
     let records: Vec<serde_json::Value> = audit
         .lines()
+        .chain(rejection_audit.lines())
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
     assert!(
@@ -334,8 +336,22 @@ async fn independent_commands_manage_a_persistent_core() {
     assert!(records.iter().any(|record| record["role"] == "viewer"
         && record["result"] == "denied"
         && record["reason"] == "insufficient_permission"));
+    let malformed: Vec<_> = records
+        .iter()
+        .filter(|record| record["operation"] == "malformed_request")
+        .collect();
+    assert_eq!(
+        malformed.len(),
+        1,
+        "the authenticated spoof is the only malformed request"
+    );
+    assert_eq!(malformed[0]["role"], "viewer");
+    assert_eq!(malformed[0]["subject"], "local-capability");
+    assert_eq!(malformed[0]["result"], "denied");
     assert!(!audit.contains(viewer["secret"].as_str().unwrap()));
     assert!(!audit.contains(admin["secret"].as_str().unwrap()));
+    assert!(!rejection_audit.contains(viewer["secret"].as_str().unwrap()));
+    assert!(!rejection_audit.contains(admin["secret"].as_str().unwrap()));
     assert!(!runtime.join("core.json").exists());
     remove_runtime(&runtime).await;
 }

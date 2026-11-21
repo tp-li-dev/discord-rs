@@ -417,7 +417,7 @@ cargo build --offline --bin manage --bin reload
 | `restart` | 現在のBot親バイナリを再起動。再ビルドはせず、メモリ状態を失う |
 | `shutdown` | Bot親と管理プロセスを終了。メモリ状態を失う |
 
-既定の管理TCPは `127.0.0.1:39483`。`DISCORD_CORE_DIR` で管理ディレクトリ、`DISCORD_CORE_PORT` でポートを変更できます。起動時と操作時で揃えてください。既定ログは `src/core-runtime/core.log`、endpointは `src/core-runtime/core.json` と読み取り権限用 `viewer.json`（リポジトリルート基準）です。両方とも管理認証情報を含むため内容を共有しないでください。管理経路はadmin/viewerを区別し `audit.jsonl` に監査します。管理ディレクトリのアクセス権保護が必要です。
+既定の管理TCPは `127.0.0.1:39483`。`DISCORD_CORE_DIR` で管理ディレクトリ、`DISCORD_CORE_PORT` でポートを変更できます。起動時と操作時で揃えてください。既定ログは `src/core-runtime/core.log`、endpointは `src/core-runtime/core.json` と読み取り権限用 `viewer.json`（リポジトリルート基準）です。両方とも管理認証情報を含むため内容を共有しないでください。管理操作は admin/viewer を区別して `audit.jsonl` に監査します。相互認証の失敗と要求の形式エラーは `rejection-audit.jsonl` に記録します。管理ディレクトリのアクセス権保護が必要です。
 
 管理操作とビルドは直列です。更新ビルド中はstatusやBot親の異常終了監視も待機する場合があります。Bot親が異常終了すると管理プロセスは最大3回再起動を試み、60秒の安定稼働後に回数をリセットします。OSサービス登録やホスト障害からの復旧機能ではありません。
 

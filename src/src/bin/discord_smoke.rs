@@ -201,7 +201,18 @@ async fn apply(token: Secret<String>) -> bool {
 
 fn run(args: impl IntoIterator<Item = OsString>) -> Result<bool, &'static str> {
     let plan = parse(args)?;
-    let value = env::var_os(&plan.token_env).map(Secret::new);
+    #[cfg(target_os = "linux")]
+    // SAFETY: main has disabled dumps and this is before runtime creation.
+    let inherited = unsafe { src::gateway_token::take_inherited() }
+        .and_then(|token| {
+            token
+                .map(|token| token.for_name(std::ffi::OsStr::new(&plan.token_env)))
+                .transpose()
+        })
+        .map_err(|_| "token_descriptor_invalid")?;
+    #[cfg(not(target_os = "linux"))]
+    let inherited: Option<Secret<OsString>> = None;
+    let value = inherited.or_else(|| env::var_os(&plan.token_env).map(Secret::new));
     println!(
         "mode={} config=valid token_env={} token={} requests={}",
         if plan.apply { "apply" } else { "dry_run" },
@@ -236,6 +247,11 @@ fn execute(args: impl IntoIterator<Item = OsString>) -> bool {
 
 fn main() {
     install_panic_hook();
+    #[cfg(target_os = "linux")]
+    if src::redact::disable_process_dumps().is_err() {
+        eprintln!("result=failure kind=process_dump_protection rate_limit_headers=unknown");
+        std::process::exit(1);
+    }
     if !execute(env::args_os().skip(1)) {
         std::process::exit(1);
     }

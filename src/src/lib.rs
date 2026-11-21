@@ -1,3 +1,5 @@
+#[cfg(unix)]
+mod boot_id;
 pub mod botref;
 pub mod build_env;
 pub mod cert_policy;
@@ -23,6 +25,8 @@ pub mod failover;
 pub mod fs_perms;
 pub mod gateway_metadata;
 pub mod gateway_switch;
+#[cfg(target_os = "linux")]
+pub mod gateway_token;
 pub mod identify;
 #[cfg(target_os = "linux")]
 pub mod identify_grant;

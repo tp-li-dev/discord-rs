@@ -937,16 +937,27 @@ async fn run() -> Result<(), &'static str> {
             .enable_mock_discord(address)
             .map_err(|_| "invalid mock Discord configuration")?;
     }
+    let credentials = |name: &str| match &token_file {
+        Some(tokens) => tokens.get(name).map(|token| token.expose_secret().clone()),
+        None => EnvironmentCredentials.read(name),
+    };
+    if !options.no_autostart && options.mock_discord.is_none() {
+        let local = daemon.snapshots();
+        if config.bots.iter().any(|bot| {
+            local.iter().any(|shard| shard.key.bot_id == bot.bot_id)
+                && credentials(&bot.token_env).is_none_or(|token| token.is_empty())
+        }) {
+            return Err(
+                "missing Gateway credential for an autostart shard; check the token source",
+            );
+        }
+    }
     let bootstrap = load_bootstrap(options.secret_file.as_deref()).await?;
     let listener = bind_control(&options).await?;
     let port = listener
         .port()
         .map_err(|_| "cannot inspect local daemon control")?;
     let audit = RecoveryAudit::open(options.runtime_root.join("recovery-audit.jsonl")).await?;
-    let credentials = |name: &str| match &token_file {
-        Some(tokens) => tokens.get(name).map(|token| token.expose_secret().clone()),
-        None => EnvironmentCredentials.read(name),
-    };
     // Partial startup failures remain visible through snapshots. Dropping this
     // daemon, including any error below, deliberately does not force-kill children.
     let startup_ok = options.no_autostart || daemon.start_all(&credentials).is_ok();
@@ -1522,11 +1533,14 @@ fn exec_with_token(args: &[OsString]) -> Result<(), &'static str> {
         .get(name)
         .filter(|token| !token.expose_secret().is_empty())
         .ok_or("selected token missing or empty")?;
-    let _ = std::process::Command::new(program)
-        .args(rest)
-        .env_clear()
-        .env(name, token.expose_secret())
-        .exec();
+    let mut command = std::process::Command::new(program);
+    command.args(rest).env_clear();
+    #[cfg(target_os = "linux")]
+    let _token_fd = src::gateway_token::attach(&mut command, name, token.expose_secret())
+        .map_err(|_| "cannot prepare token descriptor")?;
+    #[cfg(not(target_os = "linux"))]
+    command.env(name, token.expose_secret());
+    let _ = command.exec();
     Err("cannot execute token command")
 }
 

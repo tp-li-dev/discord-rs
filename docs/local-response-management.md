@@ -42,6 +42,6 @@ Windows ACL・ハンドル継承、Linux 所有権・権限は未検証。既存
 
 ### ローカル管理の認可・監査とメトリクス
 
-`manage` は `core.json` の admin 資格情報と別の `viewer.json` の viewer 資格情報を生成する。いずれも loopback 接続用で、ロールはサーバー側で認証済み資格情報に結び付ける。`list-unknown` は閲覧操作として認可し、拒否と実行を `runtime/audit.jsonl` に記録する。監査の操作前記録に失敗した場合は処理しない。操作後の結果記録の失敗は結果不明であり、すでに発生した副作用を取り消す保証はない。詳細とログの運用上の制限は [security.md](security.md) を参照。
+`manage` は `core.json` の admin 資格情報と別の `viewer.json` の viewer 資格情報を生成する。いずれも loopback 接続用で、ロールはサーバー側で認証済み資格情報に結び付ける。`list-unknown` は閲覧操作として認可し、認可の拒否と実行を `runtime/audit.jsonl` に記録する。相互認証の失敗と要求の形式エラーは `runtime/rejection-audit.jsonl` に記録する。監査の操作前記録に失敗した場合は処理しない。操作後の結果記録の失敗は結果不明であり、すでに発生した副作用を取り消す保証はない。詳細とログの運用上の制限は [security.md](security.md) を参照。
 
 `manage metrics-json` と `manage metrics-prometheus` は管理プロセス内のスナップショットを JSON または Prometheus テキストで返す。現状の registry は Gateway / Worker と接続していないため、それらの稼働状況を示すものではない。遠隔管理や遠隔経路の認証・認可は対象外。Windows の資格情報ファイル・監査ディレクトリの ACL は未検証であり、運用前にアクセス制限を個別に確認する。

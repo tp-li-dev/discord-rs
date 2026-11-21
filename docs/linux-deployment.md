@@ -122,6 +122,7 @@ botd の `--token-stdin` が全行を検査し、botd は子を起動する前�
 単独の REST smoke を実行する場合は、選択した token だけを 1 プロセスの環境へ渡せます。
 次の例では root がファイルを開き、コマンドは `discord-rs` ユーザーで実行します。
 `--apply` を付けると Discord に接続します。
+Linux の `--with-token` は token を継承 fd で渡します。受け取るプログラムはこの方式に対応する同じリリースの `discord_smoke` を使用し、別の参照名を選ぶ場合は `--token-env` に同じ名前を指定します。
 
 ```sh
 sudo sh -c 'exec runuser -u discord-rs -- /opt/discord-rs/bin/botd --with-token - \
@@ -206,6 +207,7 @@ unit の要点（`deploy/systemd/botd.service` 内のコメントも参照）:
   `PR_SET_DUMPABLE=0` を設定します。カーネルによるクラッシュダンプとコアダンプハンドラーへの引き渡しを
   抑止します。root の `CAP_SYS_PTRACE` による読み取りは可能です。Gateway の fd 一覧を含む soak 採取は
   手順どおり root で実行します。P1 は Core の tmpfs 上の状態ファイルと Core の PID を使います。
+  botd と Gateway は継承 fd 方式に対応する同じリリースを配置してください。任意の Gateway 実行ファイルを使う場合も、この起動契約への対応が必要です。
   [Linux の procfs アクセス判定](https://github.com/torvalds/linux/blob/v6.8/fs/proc/base.c)
   · [Linux PR_SET_DUMPABLE](https://man7.org/linux/man-pages/man2/pr_set_dumpable.2const.html)
 - 同じ runtime root に対して複数の botd を同時に動かす構成は非対応です（一方が予約を作ってから Gateway を起動するまでの

@@ -161,6 +161,8 @@ where
 enum StartupFailure {
     MissingToken,
     NonUnicodeToken,
+    #[cfg(target_os = "linux")]
+    InvalidTokenDescriptor,
     InvalidBootstrap,
     MetadataTimeout,
     MetadataUnavailable,
@@ -179,6 +181,10 @@ impl fmt::Display for StartupFailure {
         f.write_str(match self {
             Self::MissingToken => "DISCORD_TOKEN is not configured [token_missing]",
             Self::NonUnicodeToken => "DISCORD_TOKEN is not Unicode [token_encoding]",
+            #[cfg(target_os = "linux")]
+            Self::InvalidTokenDescriptor => {
+                "invalid inherited Gateway credential [token_descriptor_invalid]"
+            }
             Self::InvalidBootstrap => "invalid management bootstrap [bootstrap_invalid]",
             Self::MetadataTimeout => "gateway metadata timed out [metadata_timeout]",
             Self::MetadataUnavailable => "gateway metadata unavailable [metadata_unavailable]",
@@ -250,6 +256,20 @@ struct GatewayOptions {
 
 impl GatewayOptions {
     fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Self, StartupFailure> {
+        let managed_nonce_retry =
+            match env::var_os(src::shard_runtime::GATEWAY_NONCE_RETRY_POLICY_ENV) {
+                None => None,
+                Some(value) if value == "0" => Some(false),
+                Some(value) if value == "1" && cfg!(target_os = "linux") => Some(true),
+                Some(_) => return Err(StartupFailure::InvalidArguments),
+            };
+        Self::parse_with_nonce_policy(args, managed_nonce_retry)
+    }
+
+    fn parse_with_nonce_policy(
+        args: impl IntoIterator<Item = OsString>,
+        managed_nonce_retry: Option<bool>,
+    ) -> Result<Self, StartupFailure> {
         let mut options = Self::default();
         let mut args = args.into_iter();
         while let Some(flag) = args.next() {
@@ -265,6 +285,9 @@ impl GatewayOptions {
                     );
                 }
                 "--local-control" if !options.local_control => options.local_control = true,
+                // Strip standalone copies during managed ingestion. Values
+                // consumed by options below are operands and stay literal.
+                NONCE_RETRY_FLAG if managed_nonce_retry.is_some() => {}
                 NONCE_RETRY_FLAG if cfg!(target_os = "linux") && !options.nonce_retry => {
                     options.nonce_retry = true;
                 }
@@ -301,6 +324,9 @@ impl GatewayOptions {
                 }
                 _ => return Err(StartupFailure::InvalidArguments),
             }
+        }
+        if let Some(enabled) = managed_nonce_retry {
+            options.nonce_retry = enabled;
         }
         #[cfg(target_os = "linux")]
         if options.identify_grant_fd.is_some()
@@ -954,19 +980,39 @@ fn main() -> ExitCode {
     src::redact::install_panic_hook();
     let args: Vec<_> = env::args_os().skip(1).collect();
     #[cfg(target_os = "linux")]
-    if !args
-        .first()
-        .is_some_and(|arg| arg == "--worker" || arg == "--core-listen")
-        && src::redact::disable_process_dumps().is_err()
-    {
-        eprintln!("Gateway: cannot disable process dumps");
-        return ExitCode::FAILURE;
-    }
+    let inherited_token = {
+        let core = args
+            .first()
+            .is_some_and(|arg| arg == "--worker" || arg == "--core-listen");
+        if core && env::var_os(src::gateway_token::FD_ENV).is_some() {
+            eprintln!("Core: unexpected credential descriptor");
+            return ExitCode::FAILURE;
+        }
+        if !core && src::redact::disable_process_dumps().is_err() {
+            eprintln!("Gateway: cannot disable process dumps");
+            return ExitCode::FAILURE;
+        }
+        // SAFETY: the managed launcher supplies a dedicated inherited fd,
+        // which we consume before the runtime can allocate any descriptors.
+        match unsafe { src::gateway_token::take_inherited() } {
+            Ok(token) => token,
+            Err(_) => {
+                eprintln!("Gateway: {}", StartupFailure::InvalidTokenDescriptor);
+                return ExitCode::FAILURE;
+            }
+        }
+    };
     let result = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|error| Box::new(error) as AppError)
-        .and_then(|runtime| runtime.block_on(run(args)));
+        .and_then(|runtime| {
+            runtime.block_on(run(
+                args,
+                #[cfg(target_os = "linux")]
+                inherited_token,
+            ))
+        });
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -976,7 +1022,10 @@ fn main() -> ExitCode {
     }
 }
 
-async fn run(args: Vec<OsString>) -> Result<(), AppError> {
+async fn run(
+    args: Vec<OsString>,
+    #[cfg(target_os = "linux")] inherited_token: Option<src::gateway_token::InheritedToken>,
+) -> Result<(), AppError> {
     if args == [OsString::from("--worker")] {
         return worker::run().await;
     }
@@ -1075,6 +1124,10 @@ async fn run(args: Vec<OsString>) -> Result<(), AppError> {
         .await;
     }
     let mut options = GatewayOptions::parse(args)?;
+    #[cfg(target_os = "linux")]
+    if inherited_token.is_some() && options.mock_discord.is_some() {
+        return Err(StartupFailure::InvalidTokenDescriptor.into());
+    }
     let bootstrap = if options.local_control {
         Some(
             src::local_control::read_bootstrap()
@@ -1110,7 +1163,23 @@ async fn run(args: Vec<OsString>) -> Result<(), AppError> {
     // No production client, token lookup, metadata request or WebSocket exists
     // on the explicit mock branch. Environment variables never enable it.
     let live = if mock.is_none() {
-        Some(live_gateway(&options, &deployment).await?)
+        #[cfg(target_os = "linux")]
+        let inherited = inherited_token
+            .map(|token| token.for_name(options.token_env()))
+            .transpose()
+            .map_err(|_| StartupFailure::InvalidTokenDescriptor)?;
+        #[cfg(not(target_os = "linux"))]
+        let inherited: Option<Secret<OsString>> = None;
+        let token = match inherited {
+            Some(token) => Secret::new(
+                token
+                    .into_inner()
+                    .into_string()
+                    .map_err(|_| StartupFailure::NonUnicodeToken)?,
+            ),
+            None => token_from_env(env::var(options.token_env()))?,
+        };
+        Some(live_gateway(&options, &deployment, token).await?)
     } else {
         None
     };
@@ -1242,11 +1311,12 @@ impl GatewayQueue {
 type LiveShard = Shard<GatewayQueue>;
 
 async fn live_gateway(
-    options: &GatewayOptions,
+    _options: &GatewayOptions,
     deployment: &worker::DeploymentIdentity,
+    token: Secret<String>,
 ) -> Result<(LiveShard, Arc<Client>), AppError> {
     #[cfg(target_os = "linux")]
-    let grant_socket = options
+    let grant_socket = _options
         .identify_grant_fd
         .map(|fd| {
             // Managed mode accepts a dedicated FD inherited at exec from botd.
@@ -1257,7 +1327,6 @@ async fn live_gateway(
         .map_err(|_| StartupFailure::IdentifyGrantUnavailable)?;
     let _ = rustls::crypto::ring::default_provider().install_default();
     let shard_id = configured_shard(deployment);
-    let token = token_from_env(env::var(options.token_env()))?;
     let http = Arc::new(Client::new(token.expose_secret().clone()));
     let queue = single_shard_queue(deployment.shard.total(), async {
         let response = http.gateway().authed().await.map_err(|_| ())?;
@@ -1748,6 +1817,39 @@ mod tests {
             args.extend([OsString::from(flag), root.join(name).into_os_string()]);
         }
         args
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn managed_nonce_policy_owns_the_switch_in_prepopulated_process_specs() {
+        let intents = [src::placement::LocalShardIntent {
+            bot_id: "101".into(),
+            shard_id: 0,
+            total_shards: 1,
+            token_env: "TOKEN_ALPHA".into(),
+        }];
+        let mut specs = src::shard_runtime::plan(&intents, &env::current_dir().unwrap()).unwrap();
+        let spec = &mut specs[0].gateway;
+        spec.args.push(NONCE_RETRY_FLAG.into());
+        assert!(
+            GatewayOptions::parse_with_nonce_policy(spec.args.clone(), None)
+                .unwrap()
+                .nonce_retry
+        );
+        assert!(
+            !GatewayOptions::parse_with_nonce_policy(spec.args.clone(), Some(false))
+                .unwrap()
+                .nonce_retry
+        );
+
+        // The enabled allowlist also adds the compat switch for custom executables.
+        spec.args.push(NONCE_RETRY_FLAG.into());
+        assert!(
+            GatewayOptions::parse_with_nonce_policy(spec.args.clone(), Some(true))
+                .unwrap()
+                .nonce_retry
+        );
+        assert!(GatewayOptions::parse_with_nonce_policy(spec.args.clone(), None).is_err());
     }
 
     #[test]

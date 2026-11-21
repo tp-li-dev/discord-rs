@@ -5,7 +5,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::File,
     io::{self, Read, Write},
     os::{fd::AsRawFd, unix::net::UnixStream},
@@ -21,8 +21,9 @@ use tokio::process::Command;
 #[cfg(test)]
 mod tests;
 
-const BOOT_ID_PATH: &str = "/proc/sys/kernel/random/boot_id";
-const BOOT_ID_CREDENTIAL: &str = "identify-boot-id";
+use crate::boot_id::{self, valid as valid_boot_id};
+#[cfg(test)]
+use crate::boot_id::{CREDENTIAL as BOOT_ID_CREDENTIAL, read_from as read_boot_id};
 const JOURNAL_NAME: &str = "identify-send-grants.jsonl";
 const MAX_JOURNAL: u64 = 16 * 1024 * 1024;
 const MAX_LINE: usize = 4096;
@@ -559,32 +560,6 @@ impl Budget {
     }
 }
 
-fn read_boot_id(proc_path: &Path, credentials: Option<&Path>) -> io::Result<String> {
-    let contents = match std::fs::read_to_string(proc_path) {
-        Ok(contents) => contents,
-        Err(error) => match credentials {
-            Some(dir) => std::fs::read_to_string(dir.join(BOOT_ID_CREDENTIAL))?,
-            None => return Err(error),
-        },
-    };
-    let boot = contents.trim();
-    if !valid_boot_id(boot) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid kernel boot ID",
-        ));
-    }
-    Ok(boot.to_owned())
-}
-
-fn valid_boot_id(id: &str) -> bool {
-    id.len() == 36
-        && id.bytes().enumerate().all(|(i, b)| match i {
-            8 | 13 | 18 | 23 => b == b'-',
-            _ => b.is_ascii_hexdigit(),
-        })
-}
-
 fn invalid_journal() -> io::Error {
     io::Error::other("invalid Identify grant journal")
 }
@@ -655,13 +630,12 @@ pub(crate) struct Service {
     launch: Option<PendingLaunch>,
     launch_waiting: bool,
     write: Option<PendingWrite>,
+    restart_writer: HashSet<ShardKey>,
 }
 
 impl Service {
     pub(crate) fn open(root: &Path, policy: LocalIdentifyPolicy) -> Result<Self, DaemonError> {
-        let credentials = std::env::var_os("CREDENTIALS_DIRECTORY").map(std::path::PathBuf::from);
-        let boot = read_boot_id(Path::new(BOOT_ID_PATH), credentials.as_deref())
-            .map_err(|_| DaemonError::IdentifyBootIdUnavailable)?;
+        let boot = boot_id::read().map_err(|_| DaemonError::IdentifyBootIdUnavailable)?;
         let now = boot_now().map_err(|_| DaemonError::IdentifyUnavailable)?;
         let budget =
             Budget::open(root, &boot, now, policy).map_err(|_| DaemonError::IdentifyUnavailable)?;
@@ -674,7 +648,7 @@ impl Service {
         policy: LocalIdentifyPolicy,
         before_sync: impl FnMut() + Send + 'static,
     ) -> io::Result<Self> {
-        let boot = read_boot_id(Path::new(BOOT_ID_PATH), None)?;
+        let boot = boot_id::read()?;
         Self::with_writer(
             Budget::open(root, boot.trim(), boot_now()?, policy)?,
             before_sync,
@@ -685,11 +659,26 @@ impl Service {
         self.settle_write(false);
         if self.budget.failed {
             Err(DaemonError::IdentifyUnavailable)
-        } else if self.write.is_some() || self.launch.is_some() || self.launch_waiting {
+        } else if self.write.is_some()
+            || self.launch.is_some()
+            || self.launch_waiting
+            || !self.restart_writer.is_empty()
+        {
             Err(DaemonError::IdentifyJournalBusy)
         } else {
             Ok(())
         }
+    }
+
+    /// The same owner tick reserves the writer and begins the first drain.
+    /// Peers and unrelated launches cannot submit until this restart finishes.
+    pub(crate) fn reserve_restart_writer(
+        &mut self,
+        targets: &[ShardKey],
+    ) -> Result<(), DaemonError> {
+        self.check_restart_writer()?;
+        self.restart_writer.extend(targets.iter().cloned());
+        Ok(())
     }
 
     fn with_writer(
@@ -703,6 +692,7 @@ impl Service {
             launch: None,
             launch_waiting: false,
             write: None,
+            restart_writer: HashSet::new(),
         })
     }
 
@@ -725,6 +715,11 @@ impl Service {
     ) -> Result<LocalAdmission, crate::local_identify::JournalPending> {
         use crate::local_identify::JournalPending;
         self.settle_write(false);
+        if !(self.restart_writer.is_empty()
+            || reserved_restart && self.restart_writer.contains(key))
+        {
+            return Err(JournalPending);
+        }
         let Some(now) = self.observe_clock() else {
             return Ok(UNAVAILABLE);
         };
@@ -863,6 +858,7 @@ impl Service {
     pub(crate) fn release_restart_space(&mut self, targets: &[ShardKey]) {
         for key in targets {
             self.budget.restart_space.remove(key);
+            self.restart_writer.remove(key);
         }
     }
 
@@ -945,7 +941,7 @@ impl Service {
 
     pub(crate) fn poll(&mut self, reservations: impl Fn(&str) -> (bool, bool)) {
         self.settle_write(false);
-        if self.write.is_some() {
+        if self.write.is_some() || !self.restart_writer.is_empty() {
             return;
         }
         // Give a management launch waiting for this writer a tick to submit

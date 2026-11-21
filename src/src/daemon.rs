@@ -1647,14 +1647,26 @@ pub mod control {
             path: PathBuf,
             read: impl FnOnce(&Path) -> std::io::Result<CoreAuditReplay> + Send + 'static,
         ) -> std::io::Result<()> {
+            self.start_core_recovery_audit_with_clock(path, read, || {
+                (Self::boot_id(), crate::core_status::try_boot_ms())
+            })
+        }
+
+        #[cfg(unix)]
+        fn start_core_recovery_audit_with_clock(
+            &mut self,
+            path: PathBuf,
+            read: impl FnOnce(&Path) -> std::io::Result<CoreAuditReplay> + Send + 'static,
+            clock: impl FnOnce() -> (Option<String>, Option<u64>) + Send + 'static,
+        ) -> std::io::Result<()> {
             let (replay, receive) = tokio::sync::oneshot::channel();
             self.core_audit_ready = false;
             self.core_audit_worker = Some(self.start_audit_worker(
                 path,
                 move |path| {
                     let startup = read(path).map(|replay| {
-                        let boot_id = Self::boot_id();
-                        let clock = boot_id.as_deref().zip(crate::core_status::try_boot_ms());
+                        let (boot_id, boot_ms) = clock();
+                        let clock = boot_id.as_deref().zip(boot_ms);
                         let budget =
                             Self::replayed_core_restart_budget(&replay, Instant::now(), clock);
                         CoreAuditStartup {
@@ -1703,9 +1715,9 @@ pub mod control {
 
         #[cfg(unix)]
         fn boot_id() -> Option<String> {
-            let id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
-            let id = id.trim();
-            CoreAuditRow::valid_boot_id(id).then(|| id.to_owned())
+            crate::boot_id::read()
+                .ok()
+                .map(|id| id.to_ascii_lowercase())
         }
 
         #[cfg(unix)]
@@ -3834,12 +3846,12 @@ pub mod control {
                 self.finish(op);
                 return;
             }
-            // poll() can submit a new grant between admission and this first
-            // stop. Refuse while every target is still running.
+            // Reserve the writer before stopping any target. An unrelated
+            // grant can otherwise strand a drained Gateway behind its sync.
             if op.phase == Phase::Stopping
                 && op.next == 0
                 && op.is_restart()
-                && let Err(error) = self.daemon.check_restart_writer()
+                && let Err(error) = self.daemon.reserve_restart_writer(&op.targets)
             {
                 op.errors.insert(op.targets[0].clone(), error);
                 self.finish(op);
@@ -5533,6 +5545,67 @@ pub mod control {
                 assert!(ControlPlane::replayed_core_restart_budget(&replay, now, clock).is_empty());
             }
 
+            #[tokio::test]
+            async fn core_audit_replay_ages_charges_with_a_systemd_boot_id() {
+                const BOOT_ID: &str = "00000000-0000-4000-8000-000000000001";
+                let mut original = Fixture::new(false, None);
+                original.plane.core_audit_boot_id = Some(BOOT_ID.into());
+                let request = original.request(1, 0, true);
+                assert_eq!(original.submit(&request, Duration::ZERO)["ok"], true);
+                assert_eq!(original.complete(1, Duration::ZERO)["ok"], true);
+                let path = original.dir.join("core-recovery-audit.jsonl");
+                let replay = ControlPlane::read_core_recovery_audit(&path).unwrap();
+                let clock = replay
+                    .archived
+                    .values()
+                    .next()
+                    .unwrap()
+                    .terminal
+                    .as_ref()
+                    .unwrap()
+                    .charge_clock
+                    .as_ref()
+                    .unwrap();
+                assert_eq!(clock.boot_id, BOOT_ID);
+                let now = clock.boot_ms + CORE_RESTART_WINDOW.as_millis() as u64;
+
+                let credentials = original.dir.join("credentials");
+                std::fs::create_dir(&credentials).unwrap();
+                std::fs::write(credentials.join(crate::boot_id::CREDENTIAL), BOOT_ID).unwrap();
+                let hidden_proc = original.dir.join("hidden-proc");
+                let mut restarted = Fixture::new(false, None);
+                restarted
+                    .plane
+                    .start_core_recovery_audit_with_clock(
+                        path,
+                        ControlPlane::read_core_recovery_audit,
+                        move || {
+                            let id = crate::boot_id::read_from(&hidden_proc, Some(&credentials))
+                                .unwrap();
+                            (Some(id), Some(now))
+                        },
+                    )
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while restarted.plane.core_audit_replay.is_some() {
+                        restarted.plane.poll_core_audit_replay();
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert!(restarted.plane.core_audit_ready);
+                assert_eq!(restarted.plane.core_audit_boot_id.as_deref(), Some(BOOT_ID));
+                assert_eq!(restarted.plane.archived_core_restarts.len(), 1);
+                assert!(restarted.plane.core_restart_history.is_empty());
+                assert!(
+                    restarted
+                        .plane
+                        .shutdown_control_audits_with_timeout(Duration::from_secs(2))
+                        .await
+                );
+            }
+
             #[test]
             fn replay_reserves_orphan_and_rejected_ids_without_returning_foreign_data() {
                 let mut f = Fixture::new(false, None);
@@ -6427,12 +6500,24 @@ pub mod control {
                 for entry in plane.daemon.entries.values() {
                     let mut command = Command::new(&entry.spec.gateway.program);
                     entry.add_gateway_args(&mut command);
+                    entry.set_gateway_nonce_policy(&mut command);
                     let count = command
                         .as_std()
                         .get_args()
                         .filter(|arg| *arg == NONCE_RETRY_FLAG)
                         .count();
                     assert_eq!(count, (entry.spec.bot_id == enabled) as usize);
+                    let policy = command
+                        .as_std()
+                        .get_envs()
+                        .find(|(key, _)| *key == shard_runtime::GATEWAY_NONCE_RETRY_POLICY_ENV)
+                        .and_then(|(_, value)| value);
+                    let expected = if entry.spec.bot_id == enabled {
+                        "1"
+                    } else {
+                        "0"
+                    };
+                    assert_eq!(policy, Some(std::ffi::OsStr::new(expected)));
                 }
             }
         }
@@ -7562,6 +7647,104 @@ pub mod control {
 
             #[cfg(target_os = "linux")]
             #[tokio::test]
+            async fn restart_keeps_the_writer_after_first_stop_until_replacement() {
+                use std::io::{Read, Write};
+
+                let (mut plane, _) = fixture(2, 1, 10);
+                let root = std::env::temp_dir()
+                    .join(format!("igr-reserved-{:016x}", getrandom::u64().unwrap()));
+                let policy = LocalIdentifyPolicy {
+                    min_interval: Duration::ZERO,
+                    ..Default::default()
+                };
+                plane.daemon.set_local_identify_policy(policy);
+                let journal = root.join("identify-send-grants.jsonl");
+                let (entered, mut entered_sync) = tokio::sync::oneshot::channel();
+                let (release, release_sync) = std::sync::mpsc::channel();
+                let mut entered = Some(entered);
+                plane.daemon.local_identify.send_grants = Some(
+                    crate::identify_grant::service::Service::open_with_sync_hook(
+                        &root,
+                        policy,
+                        move || {
+                            let records = std::fs::read_to_string(&journal).unwrap();
+                            let last: Value =
+                                serde_json::from_str(records.lines().last().unwrap()).unwrap();
+                            if last["action"]["kind"] == "grant" {
+                                entered.take().unwrap().send(()).unwrap();
+                                let _ = release_sync.recv_timeout(Duration::from_secs(10));
+                            }
+                        },
+                    )
+                    .unwrap(),
+                );
+                let a = key(0, 0);
+                let b = key(1, 0);
+                plane.daemon.start(&a, &credentials).unwrap();
+                plane.daemon.start(&b, &credentials).unwrap();
+                let pid = running_pid(&plane, &b);
+                let generation = plane.daemon.entries[&a]
+                    .snapshot
+                    .identity
+                    .as_ref()
+                    .unwrap()
+                    .generation
+                    .clone();
+                let mut socket = plane
+                    .daemon
+                    .local_identify
+                    .send_grants
+                    .as_mut()
+                    .unwrap()
+                    .attach(
+                        &mut tokio::process::Command::new("/bin/true"),
+                        &a,
+                        generation,
+                        false,
+                    )
+                    .unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+
+                assert_eq!(plane.request(&request("restart", 1, 1))["ok"], true);
+                plane.tick(&credentials).await;
+                assert_eq!(plane.daemon.entries[&b].graceful_stop, Some(Ok(())));
+                assert!(!plane.daemon.entries[&b].snapshot.desired_running);
+                // Only now let A request a grant. On the old code it blocks B
+                // at the next tick, before the replacement can submit.
+                socket.write_all(&[1]).unwrap();
+                assert_eq!(
+                    complete(&mut plane, 1).await["operation"]["state"],
+                    "succeeded"
+                );
+                let replacement = running_pid(&plane, &b);
+                assert_ne!(replacement, pid);
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        plane.tick(&credentials).await;
+                        match entered_sync.try_recv() {
+                            Ok(()) => break,
+                            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+                            Err(error) => panic!("grant writer disappeared: {error}"),
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert_eq!(running_pid(&plane, &b), replacement);
+                release.send(()).unwrap();
+                let service = plane.daemon.local_identify.send_grants.as_mut().unwrap();
+                assert!(service.wait_for_write());
+                socket.read_exact(&mut [0; 10]).unwrap();
+                cleanup(&mut plane).await;
+                drop(plane);
+                std::fs::remove_dir_all(root).unwrap();
+            }
+
+            #[cfg(target_os = "linux")]
+            #[tokio::test]
             async fn restart_all_refuses_when_only_one_replacement_fits_in_the_journal() {
                 let (mut plane, _) = fixture(2, 1, 10);
                 plane.daemon.set_local_identify_policy(LocalIdentifyPolicy {
@@ -8618,6 +8801,13 @@ impl Entry {
         }
     }
 
+    fn set_gateway_nonce_policy(&self, command: &mut Command) {
+        command.env(
+            shard_runtime::GATEWAY_NONCE_RETRY_POLICY_ENV,
+            if self.nonce_retry { "1" } else { "0" },
+        );
+    }
+
     fn acquire_identify(
         &self,
         registry: &mut crate::local_identify::LocalIdentifyRegistry,
@@ -8918,6 +9108,8 @@ fn validate_specs(specs: &[ShardRuntimeSpec]) -> Result<(), DaemonError> {
                     || value.contains('\0')
                     || name.eq_ignore_ascii_case("SYSTEMROOT")
                     || name.eq_ignore_ascii_case(crate::placement::GATEWAY_TOKEN_ENV)
+                    || name.eq_ignore_ascii_case(shard_runtime::GATEWAY_NONCE_RETRY_POLICY_ENV)
+                    || name.eq_ignore_ascii_case(crate::placement::GATEWAY_TOKEN_FD_ENV)
                     || credential_names.contains(&name.to_ascii_uppercase())
                     || !names.insert(name.to_ascii_uppercase())
                 {
@@ -9209,6 +9401,14 @@ impl<C: Clock> Daemon<C> {
         Ok(())
     }
 
+    fn reserve_restart_writer(&mut self, _targets: &[ShardKey]) -> Result<(), DaemonError> {
+        #[cfg(target_os = "linux")]
+        if let Some(service) = &mut self.local_identify.send_grants {
+            return service.reserve_restart_writer(_targets);
+        }
+        Ok(())
+    }
+
     fn reserve_restart_identify(&mut self, targets: &[ShardKey]) -> Result<(), DaemonError> {
         use crate::local_identify::LocalAdmission;
         let now = self.now()?;
@@ -9399,15 +9599,30 @@ impl<C: Clock> Daemon<C> {
             .stderr(err)
             .kill_on_drop(false)
             .process_group(0);
+        entry.set_gateway_nonce_policy(&mut command);
         if let Some(address) = entry.mock_discord {
             command
                 .arg("--mock-discord")
                 .arg(address.to_string())
                 .env_remove("DISCORD_TOKEN")
                 .env_remove(crate::placement::GATEWAY_TOKEN_ENV);
-        } else if let Some(credential) = credential {
+        }
+        #[cfg(not(target_os = "linux"))]
+        if let Some(credential) = credential {
             command.env(crate::placement::GATEWAY_TOKEN_ENV, credential);
         }
+        #[cfg(target_os = "linux")]
+        let _token_fd = credential
+            .as_deref()
+            .map(|token| {
+                crate::gateway_token::attach(
+                    command.as_std_mut(),
+                    crate::placement::GATEWAY_TOKEN_ENV,
+                    token,
+                )
+            })
+            .transpose()
+            .map_err(|_| DaemonError::SpawnFailed)?;
         #[cfg(target_os = "linux")]
         let grant_fd = self
             .local_identify
@@ -10032,6 +10247,7 @@ impl<C: Clock> Daemon<C> {
             .env("GENERATION_ID", sequence.to_string())
             .stdin(Stdio::piped())
             .kill_on_drop(false);
+        entry.set_gateway_nonce_policy(&mut command);
         // Failure reasons (close codes etc.) go to gateway.log beside the
         // shard's state; if it cannot be opened safely, fall back to null.
         let (out, err) = match spec
@@ -10052,9 +10268,29 @@ impl<C: Clock> Daemon<C> {
                 .arg(address.to_string())
                 .env_remove("DISCORD_TOKEN")
                 .env_remove(crate::placement::GATEWAY_TOKEN_ENV);
-        } else if let Some(credential) = credential {
+        }
+        #[cfg(not(target_os = "linux"))]
+        if let Some(credential) = credential {
             command.env(crate::placement::GATEWAY_TOKEN_ENV, credential);
         }
+        #[cfg(target_os = "linux")]
+        let _token_fd = match credential
+            .as_deref()
+            .map(|token| {
+                crate::gateway_token::attach(
+                    command.as_std_mut(),
+                    crate::placement::GATEWAY_TOKEN_ENV,
+                    token,
+                )
+            })
+            .transpose()
+        {
+            Ok(fd) => fd,
+            Err(_) => {
+                Self::release_reservation(entry)?;
+                return Err(DaemonError::SpawnFailed);
+            }
+        };
         // Terminal Ctrl-C must target the daemon's foreground group, not its
         // independently supervised Gateway units. This is not a service manager
         // or a guarantee against an OS/session/job object's teardown policy.

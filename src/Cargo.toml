@@ -29,6 +29,7 @@ resolver = "3"
 twilight-gateway = { path = "vendor/twilight-gateway" }
 
 [dev-dependencies]
+tokio = { version = "1.54.1", features = ["test-util"] }
 futures-util = { version = "0.3", features = ["sink"] }
 rcgen = "0.13"
 rmp-serde = "1"

@@ -1,5 +1,6 @@
 //! Test-only Gateway contract: private stdin requests shutdown; EOF is not shutdown.
 //! Audit files contain process IDs and booleans only, never credential values.
+include!("gateway_credential.rs");
 use std::{
     collections::HashMap,
     io::{BufRead, BufReader, Read},
@@ -29,7 +30,8 @@ fn main() {
     }
     let token_name = "DISCORD_RS_GATEWAY_TOKEN";
     let isolated = args["--token-env"] == token_name
-        && std::env::var(token_name).ok().as_deref() == (!mock).then_some(value)
+        && fixture_credential(token_name).as_deref()
+            == (!mock).then_some(std::ffi::OsStr::new(value))
         && ["TOKEN_ALPHA", "TOKEN_BETA", "DISCORD_TOKEN", "PATH"]
             .iter()
             .all(|name| std::env::var_os(name).is_none())
