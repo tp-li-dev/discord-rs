@@ -8084,10 +8084,42 @@ fn gateway_alive_in(cmdlines: &[Vec<u8>], program: &Path, management_path: &Path
     })
 }
 
+#[cfg(target_os = "linux")]
+fn proc_mount_shows_all_pids(mountinfo: &str) -> bool {
+    let mut found = false;
+    for line in mountinfo.lines() {
+        let Some((mount, filesystem)) = line.split_once(" - ") else {
+            return false;
+        };
+        if mount.split_ascii_whitespace().nth(4) != Some("/proc") {
+            continue;
+        }
+        let mut fields = filesystem.split_ascii_whitespace();
+        if fields.next() != Some("proc") {
+            return false;
+        }
+        let Some(options) = fields.nth(1) else {
+            return false;
+        };
+        if options.split(',').any(|option| {
+            option.starts_with("hidepid=") && !matches!(option, "hidepid=off" | "hidepid=0")
+        }) {
+            return false;
+        }
+        found = true;
+    }
+    found
+}
+
 /// Reads every `/proc/<pid>/cmdline`. None when the table cannot be trusted
 /// (no /proc, unreadable entry other than one that vanished meanwhile).
 #[cfg(target_os = "linux")]
 fn read_proc_cmdlines() -> Option<Vec<Vec<u8>>> {
+    // hidepid can omit non-dumpable Gateways without returning a read error.
+    let mounts = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    if !proc_mount_shows_all_pids(&mounts) {
+        return None;
+    }
     let mut lines = Vec::new();
     let mut seen_pid = false;
     for entry in std::fs::read_dir("/proc").ok()? {
@@ -8295,6 +8327,20 @@ mod stale_reservation_tests {
             GatewayLiveness::NotAlive
         ));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn filtered_proc_mount_cannot_prove_a_gateway_is_absent() {
+        let mount = |options| format!("29 25 0:24 / /proc rw - proc proc rw,{options}");
+        assert!(proc_mount_shows_all_pids(&mount("subset=pid")));
+        assert!(proc_mount_shows_all_pids(&mount("hidepid=off,subset=pid")));
+        assert!(!proc_mount_shows_all_pids(&mount(
+            "hidepid=invisible,subset=pid"
+        )));
+        assert!(!proc_mount_shows_all_pids(&mount("hidepid=2")));
+        assert!(!proc_mount_shows_all_pids(&mount("hidepid=noaccess")));
+        assert!(!proc_mount_shows_all_pids(""));
     }
 
     #[cfg(target_os = "linux")]

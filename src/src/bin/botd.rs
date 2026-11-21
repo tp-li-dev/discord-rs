@@ -1479,8 +1479,17 @@ fn exec_with_token(args: &[OsString]) -> Result<(), &'static str> {
     Err("cannot execute token command")
 }
 
+fn main() {
+    #[cfg(target_os = "linux")]
+    if src::redact::disable_process_dumps().is_err() {
+        eprintln!("botd: cannot disable process dumps");
+        std::process::exit(1);
+    }
+    daemon_main();
+}
+
 #[tokio::main(worker_threads = 2)]
-async fn main() {
+async fn daemon_main() {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     // exec replaces the current process and gives the command a fresh environment.
     #[cfg(unix)]

@@ -12,6 +12,8 @@ on:
       - '.github/workflows/systemd-smoke.yml'
       - 'src/src/sd_notify.rs'
       - 'src/src/secret_file.rs'
+      - 'src/src/redact.rs'
+      - 'src/src/main.rs'
       - 'src/src/bin/botd.rs'
       - 'src/src/bin/botctl.rs'
       - 'src/src/core_units.rs'
@@ -267,6 +269,16 @@ jobs:
           sudo rm -rf /var/lib/discord-rs/runtime
           sudo systemctl start botd || { echo "botd failed to start"; sudo journalctl -u botd --no-pager | tail -30; exit 1; }
           wait_running 45 || { echo "FAIL: not Running after start"; status_json | head -c 1500; fail=1; }
+          # Check the service user's view in botd's mount namespace, without
+          # printing process environments. cmdline is needed for orphan checks.
+          main=$(systemctl show botd -p MainPID --value)
+          gw=$(gateway_pid)
+          if [ -z "$gw" ] || [ "$main" = 0 ] || [ "$(systemctl show botd -p LimitCORE --value)" != 0 ] || \
+            ! sudo nsenter --target "$main" --mount -- runuser -u discord-rs -- \
+              /bin/sh -c 'for pid do cat "/proc/$pid/cmdline" >/dev/null && [ ! -r "/proc/$pid/environ" ] || exit 1; done' sh "$main" "$gw"; then
+            echo "FAIL: process dump protection or orphan visibility"
+            fail=1
+          fi
           echo "--- 1. kill -9 the Gateway ---"
           old=$(gateway_pid); echo "gateway pid before: $old"
           sudo kill -9 "$old"

@@ -952,11 +952,21 @@ async fn mock_events(
 
 fn main() -> ExitCode {
     src::redact::install_panic_hook();
+    let args: Vec<_> = env::args_os().skip(1).collect();
+    #[cfg(target_os = "linux")]
+    if !args
+        .first()
+        .is_some_and(|arg| arg == "--worker" || arg == "--core-listen")
+        && src::redact::disable_process_dumps().is_err()
+    {
+        eprintln!("Gateway: cannot disable process dumps");
+        return ExitCode::FAILURE;
+    }
     let result = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|error| Box::new(error) as AppError)
-        .and_then(|runtime| runtime.block_on(run()));
+        .and_then(|runtime| runtime.block_on(run(args)));
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -966,8 +976,7 @@ fn main() -> ExitCode {
     }
 }
 
-async fn run() -> Result<(), AppError> {
-    let args: Vec<_> = env::args_os().skip(1).collect();
+async fn run(args: Vec<OsString>) -> Result<(), AppError> {
     if args == [OsString::from("--worker")] {
         return worker::run().await;
     }

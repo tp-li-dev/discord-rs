@@ -199,8 +199,15 @@ unit の要点（`deploy/systemd/botd.service` 内のコメントも参照）:
   `KillSignal=SIGINT` に戻してください。この停止シーケンスは実機の systemd では未検証です。
 - **起動予約の整理**: botd の再起動時、前回の予約ファイルが残っていても、Linux では `/proc/*/cmdline` を調べてその
   Shard の Gateway（`--management-path` が一致）が生きていないと確認できた場合だけ、予約を削除して起動します。
-  生きている、または判定できない場合は従来どおり拒否します。`ProtectProc=invisible` でも同一ユーザー（`discord-rs`）の
-  Gateway は見えます。孤児の再採用（生きている子を新しい botd が引き継ぐ）は未実装のままです。
+  生きている、または判定できない場合は従来どおり拒否します。dumpable を無効にした Gateway の
+  `cmdline` を照合できるように、unit は `ProtectProc=default` と `ProcSubset=pid` を使います。
+  PID を隠す procfs では予約を自動回収しません。孤児の再採用は未実装です。
+- **クラッシュ時の保護**: unit の `LimitCORE=0` に加え、Linux の botd と Gateway は起動時に
+  `PR_SET_DUMPABLE=0` を設定します。カーネルによるクラッシュダンプとコアダンプハンドラーへの引き渡しを
+  抑止します。root の `CAP_SYS_PTRACE` による読み取りは可能です。Gateway の fd 一覧を含む soak 採取は
+  手順どおり root で実行します。P1 は Core の tmpfs 上の状態ファイルと Core の PID を使います。
+  [Linux の procfs アクセス判定](https://github.com/torvalds/linux/blob/v6.8/fs/proc/base.c)
+  · [Linux PR_SET_DUMPABLE](https://man7.org/linux/man-pages/man2/pr_set_dumpable.2const.html)
 - 同じ runtime root に対して複数の botd を同時に動かす構成は非対応です（一方が予約を作ってから Gateway を起動するまでの
   短い間、他方が予約を古いと誤判定する可能性があります）。
 - ローカルでは未ビルドで、動作は CI の結果待ちです。
