@@ -28,11 +28,11 @@ const REQUEST_LIMIT: u64 = 4096;
 const RESPONSE_LIMIT: usize = 64 * 1024;
 const DEADLINE: Duration = Duration::from_secs(3);
 const NONCE_RETRY_FOR: &str = "--enable-create-message-nonce-retry-for";
-const USAGE: &str = "usage: botd --file F [--token-file ABS] --runtime-root ABS --gateway-program ABS (--bootstrap-stdin | --secret-file ABS [--control-port PORT]) [--no-autostart] [--stop-children-on-exit] [--core-mode embedded|separate] [--identify-send-grants] [--enable-create-message-nonce-retry-for BOT_ID ...] [--mock-discord LOOPBACK_IP:PORT] [--allow-test-quorum] [--allow-raft-quorum --raft-store ABS --raft-rpc-listen LOOPBACK_IP:PORT --raft-rpc-peer ID=LOOPBACK_IP:PORT ... [--raft-create] [--raft-bootstrap]] [--allow-test-gateway-switch --mock-identify-budget F]";
+const USAGE: &str = "usage: botd --file F [--token-stdin] --runtime-root ABS --gateway-program ABS (--bootstrap-stdin | --secret-file ABS [--control-port PORT]) [--no-autostart] [--stop-children-on-exit] [--core-mode embedded|separate] [--identify-send-grants] [--enable-create-message-nonce-retry-for BOT_ID ...] [--mock-discord LOOPBACK_IP:PORT] [--allow-test-quorum] [--allow-raft-quorum --raft-store ABS --raft-rpc-listen LOOPBACK_IP:PORT --raft-rpc-peer ID=LOOPBACK_IP:PORT ... [--raft-create] [--raft-bootstrap]] [--allow-test-gateway-switch --mock-identify-budget F]";
 
 struct Options {
     file: PathBuf,
-    token_file: Option<PathBuf>,
+    token_stdin: bool,
     runtime_root: PathBuf,
     gateway_program: PathBuf,
     no_autostart: bool,
@@ -57,7 +57,7 @@ struct Options {
 fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'static str> {
     let mut args = args.into_iter();
     let mut file = None;
-    let mut token_file = None;
+    let mut token_stdin = false;
     let mut runtime_root = None;
     let mut gateway_program = None;
     let mut bootstrap = false;
@@ -125,7 +125,10 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
                 continue;
             }
             Some("--file") if file.is_none() => &mut file,
-            Some("--token-file") if token_file.is_none() => &mut token_file,
+            Some("--token-stdin") if cfg!(unix) && !token_stdin => {
+                token_stdin = true;
+                continue;
+            }
             Some("--runtime-root") if runtime_root.is_none() => &mut runtime_root,
             Some("--gateway-program") if gateway_program.is_none() => &mut gateway_program,
             Some("--raft-store") if raft_store.is_none() => &mut raft_store,
@@ -291,7 +294,7 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
     };
     let options = Options {
         file: file.ok_or(USAGE)?,
-        token_file,
+        token_stdin,
         runtime_root: runtime_root.ok_or(USAGE)?,
         gateway_program: gateway_program.ok_or(USAGE)?,
         no_autostart,
@@ -339,13 +342,8 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
     }
     let test_or_raft =
         options.raft.is_some() || options.allow_test_quorum || options.allow_test_gateway_switch;
-    if options
-        .token_file
-        .as_ref()
-        .is_some_and(|p| !p.is_absolute())
-        || (test_or_raft && options.token_file.is_some())
-    {
-        return Err("--token-file requires an absolute path in standalone mode");
+    if options.token_stdin && (test_or_raft || options.secret_file.is_none()) {
+        return Err("--token-stdin requires standalone mode with --secret-file");
     }
     if options.identify_send_grants && (test_or_raft || options.mock_discord.is_some()) {
         return Err("--identify-send-grants requires standalone live Discord");
@@ -814,9 +812,37 @@ fn parse_token_file(contents: &str) -> Result<TokenFile, &'static str> {
     Ok(tokens)
 }
 
-fn read_token_file(path: &Path) -> Result<TokenFile, &'static str> {
-    let contents = std::fs::read_to_string(path).map_err(|_| "cannot read token file")?;
+fn read_token_input(reader: impl io::Read) -> Result<TokenFile, &'static str> {
+    use std::io::Read;
+
+    const MAX_FILE: u64 = 1024 * 1024;
+    let mut contents = String::new();
+    reader
+        .take(MAX_FILE + 1)
+        .read_to_string(&mut contents)
+        .map_err(|_| "cannot read token file")?;
+    if contents.len() as u64 > MAX_FILE {
+        return Err("token file too large");
+    }
     parse_token_file(&contents)
+}
+
+fn read_token_file(path: &Path) -> Result<TokenFile, &'static str> {
+    read_token_input(std::fs::File::open(path).map_err(|_| "cannot open token file")?)
+}
+
+#[cfg(unix)]
+fn read_token_stdin() -> Result<TokenFile, &'static str> {
+    use std::os::fd::AsRawFd;
+
+    let tokens = read_token_input(io::stdin().lock())?;
+    let null = std::fs::File::open("/dev/null").map_err(|_| "cannot detach token input")?;
+    // SAFETY: null owns an open descriptor, stdin is open, and no child has
+    // been launched. Replacing fd 0 closes the credential file for this process.
+    if unsafe { libc::dup2(null.as_raw_fd(), libc::STDIN_FILENO) } < 0 {
+        return Err("cannot detach token input");
+    }
+    Ok(tokens)
 }
 
 async fn run() -> Result<(), &'static str> {
@@ -825,11 +851,10 @@ async fn run() -> Result<(), &'static str> {
         supervisor::RestartPolicy,
     };
     let options = parse_options(std::env::args_os().skip(1))?;
-    let token_file = options
-        .token_file
-        .as_deref()
-        .map(read_token_file)
-        .transpose()?;
+    #[cfg(unix)]
+    let token_file = options.token_stdin.then(read_token_stdin).transpose()?;
+    #[cfg(not(unix))]
+    let token_file: Option<TokenFile> = None;
     let loaded = src::cluster_runtime::LoadedClusterConfig::load(&options.file)
         .map_err(|_| "cannot load daemon configuration")?;
     if options.raft.is_some() {
@@ -1457,7 +1482,7 @@ fn exec_with_token(args: &[OsString]) -> Result<(), &'static str> {
     use std::os::unix::process::CommandExt;
 
     let [file, name, program, rest @ ..] = args else {
-        return Err("usage: botd --with-token FILE NAME /absolute/program [ARG ...]");
+        return Err("usage: botd --with-token FILE|- NAME /absolute/program [ARG ...]");
     };
     let name = name
         .to_str()
@@ -1466,7 +1491,11 @@ fn exec_with_token(args: &[OsString]) -> Result<(), &'static str> {
     if !Path::new(program).is_absolute() {
         return Err("token command must be an absolute path");
     }
-    let tokens = read_token_file(Path::new(file))?;
+    let tokens = if file == "-" {
+        read_token_stdin()?
+    } else {
+        read_token_file(Path::new(file))?
+    };
     let token = tokens
         .get(name)
         .filter(|token| !token.expose_secret().is_empty())
@@ -1497,6 +1526,14 @@ async fn daemon_main() {
         && flag == "--with-token"
     {
         if let Err(error) = exec_with_token(rest) {
+            eprintln!("botd: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    #[cfg(unix)]
+    if matches!(args.as_slice(), [flag] if flag == "--check-env-stdin") {
+        if let Err(error) = read_token_stdin() {
             eprintln!("botd: {error}");
             std::process::exit(1);
         }

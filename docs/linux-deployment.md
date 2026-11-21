@@ -82,7 +82,7 @@ sudo install -o root -g discord-rs -m 0640 src/examples/placement.toml /etc/disc
 | `/opt/discord-rs/bin/*` | root:root | 0755 | 実行ファイルを `discord-rs` ユーザーが書換えられないようにする（任意バイナリ実行の回避） |
 | `/etc/discord-rs/` | root:discord-rs | 0750 | |
 | `/etc/discord-rs/bots.toml` | root:discord-rs | 0640 | 秘密値は書かない |
-| `/etc/discord-rs/botd.env` | root:discord-rs | 0640 または root:root 0600 | token を含む。systemd が root で読むため 0600 でも読める |
+| `/etc/discord-rs/botd.env` | root:root | 0600 | systemd が root で開き、botd の標準入力に接続する |
 | `/etc/discord-rs/botd.secret` | discord-rs:discord-rs | 0600（0400 も可） | 管理用 secret。botd/botctl が所有者・モードを検査する（下記「管理 secret」） |
 | `/var/lib/discord-rs`（状態） | discord-rs:discord-rs | 0700 | unit の `StateDirectory=` が作成・維持する |
 
@@ -104,28 +104,28 @@ sudo install -o root -g discord-rs -m 0640 src/examples/placement.toml /etc/disc
 ### token の置き場所
 
 ```sh
-sudo install -o root -g discord-rs -m 0640 deploy/botd.env.example /etc/discord-rs/botd.env
+sudo install -o root -g root -m 0600 deploy/botd.env.example /etc/discord-rs/botd.env
 sudo -e /etc/discord-rs/botd.env     # 変数名は bots.toml の token_env に合わせ、値を入れる
 ```
 
-同梱 unit は `LoadCredential=` でファイルを読み取り専用で渡し、`ExecStartPre` と botd の
-`--token-file` が全行を検査します。空行とコメント、`NAME=VALUE` を扱います。名前は
+同梱 unit の `StandardInput=file:` は token ファイルを読み取り専用で開きます。`ExecStartPre` と
+botd の `--token-stdin` が全行を検査し、botd は子を起動する前にその FD を閉じます。空行とコメント、`NAME=VALUE` を扱います。名前は
 `bots.toml` の `token_env` と同じ規則です。値は引用符なしの ASCII 英数字・`.`・`_`・`-` で、
 空欄はプレースホルダーです。重複や不正な行があれば、値を出力せず起動に失敗します。
 既存の drop-in を移行する場合は `EnvironmentFile=` を外し、`ExecStart` の上書きにも
-`--token-file %d/botd.env` を入れてください。
+`--token-stdin` を入れてください。既存のファイルは `root:root 0600` に変更してください。
 
 値をコマンドラインに書いたり、`echo >>` で履歴に残したりしないでください。リポジトリ内のファイルに token を
 書かないでください。botd は `token_env` で指定された token を、その Bot 用の Gateway にだけ渡します。Core
 （Worker）へ token は渡りません。
 
 単独の REST smoke を実行する場合は、選択した token だけを 1 プロセスの環境へ渡せます。
-次の例は `root:discord-rs 0640` の場合です。`root:root 0600` のファイルは
-読み取りを許可された実行ユーザーで扱ってください。`--apply` を付けると Discord に接続します。
+次の例では root がファイルを開き、コマンドは `discord-rs` ユーザーで実行します。
+`--apply` を付けると Discord に接続します。
 
 ```sh
-sudo -u discord-rs /opt/discord-rs/bin/botd --with-token /etc/discord-rs/botd.env \
-    DISCORD_TEST_BOT_TOKEN /absolute/path/to/discord_smoke --apply
+sudo sh -c 'exec runuser -u discord-rs -- /opt/discord-rs/bin/botd --with-token - \
+    DISCORD_TEST_BOT_TOKEN /absolute/path/to/discord_smoke --apply </etc/discord-rs/botd.env'
 ```
 
 ### 管理 secret
@@ -183,7 +183,7 @@ unit の要点（`deploy/systemd/botd.service` 内のコメントも参照）:
 - 起動引数は `--file`、`--runtime-root`、`--gateway-program`、`--secret-file`、`--control-port`（`src/src/bin/botd.rs` の USAGE）。
   `--runtime-root` は `/var/lib/discord-rs/runtime`（`StateDirectory=` で作成）。
 - `User=discord-rs`、`NoNewPrivileges=yes`、`ProtectSystem=strict`、`ProtectHome=yes`、`PrivateTmp=yes`、
-  `ReadWritePaths=/var/lib/discord-rs`、`LoadCredential=botd.env:/etc/discord-rs/botd.env`、
+  `ReadWritePaths=/var/lib/discord-rs`、`StandardInput=file:/etc/discord-rs/botd.env`、
   `Restart=on-failure`、`RestartSec=5s`、`LimitNOFILE=65536`、ログは journald。
 - `--identify-send-grants` はカーネルの boot ID が必要です。`ProcSubset=pid` は維持し、
   systemd が `LoadCredential=identify-boot-id:/proc/sys/kernel/random/boot_id` でその値だけを

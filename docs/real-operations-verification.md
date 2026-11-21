@@ -43,7 +43,7 @@ secret（管理用）と token（Bot の認証）：
 chown discord-rs:discord-rs /etc/discord-rs/botd.secret && chmod 0600 /etc/discord-rs/botd.secret
 
 # token：bots.toml の token_env と同じ名前で、環境変数ファイルに書く（値をチャットや履歴に残さない）
-install -m 0640 -o root -g discord-rs /dev/null /etc/discord-rs/botd.env
+install -m 0600 -o root -g root /dev/null /etc/discord-rs/botd.env
 nano /etc/discord-rs/botd.env        # 例: DISCORD_TEST_BOT_TOKEN=（token をここに貼る。KEY=VALUE、export は付けない）
 ```
 **`botd.env` の変数名は、`grep token_env /etc/discord-rs/bots.toml` の名前と一致させる。** 違うと `MissingCredential` で起動前に失敗する（`state: Failed`、`gateway.log` はできない）。

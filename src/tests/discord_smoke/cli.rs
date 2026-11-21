@@ -103,7 +103,7 @@ fn arguments_and_environment_names_are_never_echoed() {
         vec!["--token-env", SYNTHETIC],
         vec!["--apply", "--apply"],
         vec!["--token-env"],
-        vec!["--token-env", "A", "--token-env", "B"],
+        vec!["--token-env", "TOKEN_A", "--token-env", "TOKEN_B"],
     ] {
         let output = process(&args, DEFAULT_TOKEN_ENV, Some(SYNTHETIC));
         assert_eq!(output.status.code(), Some(1));
@@ -111,12 +111,26 @@ fn arguments_and_environment_names_are_never_echoed() {
     }
     // A syntactically valid name can itself be sensitive: report only custom/default.
     let output = process(
-        &["--token-env", "PRIVATE_ENV_NAME"],
-        "PRIVATE_ENV_NAME",
+        &["--token-env", "PRIVATE_TOKEN_ENV"],
+        "PRIVATE_TOKEN_ENV",
         Some(SYNTHETIC),
     );
     assert!(output.status.success());
-    assert!(!text(&output).contains("PRIVATE_ENV_NAME"));
+    assert!(!text(&output).contains("PRIVATE_TOKEN_ENV"));
+}
+
+#[test]
+fn loader_and_runtime_names_are_rejected_before_credential_lookup() {
+    for name in [
+        "LD_PRELOAD",
+        "LD_CUSTOM_TOKEN",
+        "RUST_BACKTRACE_TOKEN",
+        "DISCORD_RS_GATEWAY_TOKEN",
+    ] {
+        let output = process(&["--token-env", name], DEFAULT_TOKEN_ENV, None);
+        assert_eq!(output.status.code(), Some(1));
+        assert!(text(&output).contains("kind=token_env_invalid"));
+    }
 }
 
 #[test]

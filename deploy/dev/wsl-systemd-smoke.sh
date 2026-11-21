@@ -69,7 +69,7 @@ install -m 0640 -o root -g "$USER_NAME" /tmp/wsl-smoke-bots.toml /etc/discord-rs
 rm -f /tmp/wsl-smoke-bots.toml
 /opt/discord-rs/bin/botctl secret generate --out /etc/discord-rs/botd.secret --json >/dev/null || exit 2
 chown "$USER_NAME:$USER_NAME" /etc/discord-rs/botd.secret && chmod 0600 /etc/discord-rs/botd.secret
-install -m 0640 -o root -g "$USER_NAME" "$REPO/deploy/botd.env.example" /etc/discord-rs/botd.env
+install -m 0600 -o root -g root "$REPO/deploy/botd.env.example" /etc/discord-rs/botd.env
 install -m 0644 "$UNIT_SRC" /etc/systemd/system/botd.service
 install -d /etc/systemd/system/botd.service.d
 # 出荷する unit と同じ引数 + 模擬 Discord。Watchdog と Type=notify も有効にして sd_notify を確認する。
@@ -80,7 +80,7 @@ NotifyAccess=main
 WatchdogSec=10s
 TimeoutStartSec=30s
 ExecStart=
-ExecStart=/opt/discord-rs/bin/botd --file /etc/discord-rs/bots.toml --runtime-root /var/lib/discord-rs/runtime --gateway-program /opt/discord-rs/bin/src --secret-file /etc/discord-rs/botd.secret --token-file %d/botd.env --control-port $PORT --stop-children-on-exit --mock-discord 127.0.0.1:$COLLECTOR_PORT
+ExecStart=/opt/discord-rs/bin/botd --file /etc/discord-rs/bots.toml --runtime-root /var/lib/discord-rs/runtime --gateway-program /opt/discord-rs/bin/src --secret-file /etc/discord-rs/botd.secret --token-stdin --control-port $PORT --stop-children-on-exit --mock-discord 127.0.0.1:$COLLECTOR_PORT
 CONF
 systemctl daemon-reload
 
@@ -147,7 +147,7 @@ echo "--- 6. --core-mode separate (Core is botd's child, not the Gateway's) ---"
 cat > /etc/systemd/system/botd.service.d/zz-separate.conf <<CONF
 [Service]
 ExecStart=
-ExecStart=/opt/discord-rs/bin/botd --file /etc/discord-rs/bots.toml --runtime-root /var/lib/discord-rs/runtime --gateway-program /opt/discord-rs/bin/src --secret-file /etc/discord-rs/botd.secret --token-file %d/botd.env --control-port $PORT --stop-children-on-exit --core-mode separate --mock-discord 127.0.0.1:$COLLECTOR_PORT
+ExecStart=/opt/discord-rs/bin/botd --file /etc/discord-rs/bots.toml --runtime-root /var/lib/discord-rs/runtime --gateway-program /opt/discord-rs/bin/src --secret-file /etc/discord-rs/botd.secret --token-stdin --control-port $PORT --stop-children-on-exit --core-mode separate --mock-discord 127.0.0.1:$COLLECTOR_PORT
 CONF
 systemctl daemon-reload
 rm -rf /var/lib/discord-rs/runtime
@@ -190,7 +190,7 @@ echo "--- 7. --identify-send-grants --no-autostart (READY=1) ---"
 cat > /etc/systemd/system/botd.service.d/zz-grants.conf <<CONF
 [Service]
 ExecStart=
-ExecStart=/opt/discord-rs/bin/botd --file /etc/discord-rs/bots.toml --runtime-root /var/lib/discord-rs/grant-smoke --gateway-program /opt/discord-rs/bin/src --secret-file /etc/discord-rs/botd.secret --token-file %d/botd.env --control-port $PORT --stop-children-on-exit --identify-send-grants --no-autostart
+ExecStart=/opt/discord-rs/bin/botd --file /etc/discord-rs/bots.toml --runtime-root /var/lib/discord-rs/grant-smoke --gateway-program /opt/discord-rs/bin/src --secret-file /etc/discord-rs/botd.secret --token-stdin --control-port $PORT --stop-children-on-exit --identify-send-grants --no-autostart
 CONF
 systemctl daemon-reload
 if systemctl start botd && systemctl is-active --quiet botd && \

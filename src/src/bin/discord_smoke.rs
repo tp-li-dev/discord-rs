@@ -48,25 +48,6 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Plan, &'static str>
     Ok(plan)
 }
 
-#[cfg(test)]
-#[test]
-fn custom_token_name_uses_the_placement_rule() {
-    for name in [
-        "DISCORD_TEST_BOT_TOKEN",
-        "TOKEN_ALPHA",
-        "LD_PRELOAD",
-        "LD_TOKEN",
-        "BASH_ENV",
-        "DISCORD_RS_GATEWAY_TOKEN",
-    ] {
-        assert_eq!(
-            parse(["--token-env".into(), name.into()]).is_ok(),
-            src::placement::valid_token_env(name),
-            "{name}"
-        );
-    }
-}
-
 fn token_state(value: &Option<Secret<OsString>>) -> &'static str {
     match value {
         None => "missing",

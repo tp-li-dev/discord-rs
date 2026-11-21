@@ -6,7 +6,7 @@
 #     ENV_FILE  既定 /etc/discord-rs/botd.env
 #     VAR_NAME  既定 DISCORD_TEST_BOT_TOKEN（bots.toml の token_env と同じ名前にする）
 #
-# 保存先は root:discord-rs の 0640。systemd の LoadCredential= で botd に渡る。
+# 保存先は root:root の 0600。systemd が標準入力として botd に渡す。
 # /etc/environment には書かない（誰でも読め、全プロセスに入るため）。
 # 既存のファイルの他の行は保持し、同名の変数だけを置き換える。
 set +x
@@ -50,10 +50,10 @@ if [ -f "$ENV_FILE" ]; then
 fi
 printf '%s=%s\n' "$VAR" "$token" >> "$tmp"
 "$BOTD" --check-env-file "$tmp"
-chown root:discord-rs "$tmp"
-chmod 0640 "$tmp"
+chown root:root "$tmp"
+chmod 0600 "$tmp"
 mv -f "$tmp" "$ENV_FILE"
 unset token
 
 echo "保存しました: $ENV_FILE ($(stat -c '%a %U:%G' "$ENV_FILE"))、変数: $VAR"
-echo "systemd では LoadCredential で botd に渡ります。単独コマンドで使う手順は docs/linux-deployment.md を参照してください。"
+echo "systemd は botd の標準入力として渡します。単独コマンドで使う手順は docs/linux-deployment.md を参照してください。"

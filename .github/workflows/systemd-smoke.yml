@@ -80,8 +80,51 @@ jobs:
           sudo /opt/discord-rs/bin/botctl secret generate --out /etc/discord-rs/botd.secret --json
           sudo chown discord-rs:discord-rs /etc/discord-rs/botd.secret
           sudo chmod 0600 /etc/discord-rs/botd.secret
-          sudo install -m 0640 -o root -g discord-rs deploy/botd.env.example /etc/discord-rs/botd.env
+          sudo install -m 0600 -o root -g root deploy/botd.env.example /etc/discord-rs/botd.env
           sudo install -m 0644 deploy/systemd/botd.service /etc/systemd/system/botd.service
+      - name: Provisioning refuses invalid names and does not trace a token
+        run: |
+          set -euo pipefail
+          file=/etc/discord-rs/provisioning-fixture.env
+          marker=synthetic-provisioning-fixture
+          if sudo bash deploy/dev/set-token.sh "$file" LD_PRELOAD </dev/null; then
+            echo "provisioning accepted a loader variable name"
+            exit 1
+          fi
+          trace=$(printf '%s\n' "$marker" | sudo bash -x deploy/dev/set-token.sh "$file" 2>&1)
+          if [[ "$trace" == *"$marker"* ]]; then
+            echo "provisioning trace contained the fixture token"
+            exit 1
+          fi
+          sudo /opt/discord-rs/bin/botd --check-env-file "$file"
+          test "$(sudo stat -c '%U:%G %a' "$file")" = "root:root 600"
+          printf '%s\n' 'LD_PRELOAD=synthetic-existing-fixture' | sudo tee -a "$file" >/dev/null
+          if printf '%s\n' "$marker" | sudo bash deploy/dev/set-token.sh "$file" >/dev/null 2>&1; then
+            echo "provisioning accepted an invalid existing entry"
+            exit 1
+          fi
+          sudo rm -f "$file"
+      - name: Unit refuses a loader entry before running the daemon
+        run: |
+          set -euo pipefail
+          marker=synthetic-loader-log-fixture
+          printf 'LD_PRELOAD=%s\n' "$marker" | sudo tee /etc/discord-rs/botd.env >/dev/null
+          sudo install -d /etc/systemd/system/botd.service.d
+          printf '[Service]\nRestart=no\n' | sudo tee /etc/systemd/system/botd.service.d/reject-fixture.conf >/dev/null
+          sudo systemctl daemon-reload
+          if sudo systemctl start botd; then
+            echo "unit accepted an invalid token file"
+            exit 1
+          fi
+          journal=$(sudo journalctl -u botd --no-pager)
+          if [[ "$journal" == *"$marker"* || "$journal" != *'invalid token file variable name'* ]]; then
+            echo "unit did not reject the loader entry without logging its value"
+            exit 1
+          fi
+          sudo systemctl reset-failed botd
+          sudo rm /etc/systemd/system/botd.service.d/reject-fixture.conf
+          sudo install -m 0600 -o root -g root deploy/botd.env.example /etc/discord-rs/botd.env
+          sudo systemctl daemon-reload
       - name: Smoke drop-in (notify + watchdog, no Discord)
         run: |
           set -euxo pipefail
@@ -100,7 +143,7 @@ jobs:
               --runtime-root /var/lib/discord-rs/runtime \
               --gateway-program /opt/discord-rs/bin/src \
               --secret-file /etc/discord-rs/botd.secret \
-              --token-file %d/botd.env \
+              --token-stdin \
               --control-port 47321 \
               --stop-children-on-exit \
               --no-autostart
@@ -201,7 +244,7 @@ jobs:
               echo "[Service]"; echo "Type=notify"; echo "NotifyAccess=main"; echo "WatchdogSec=6s"
               echo "TimeoutStartSec=30s"
               echo "ExecStart="
-              echo "ExecStart=/opt/discord-rs/bin/botd --file /etc/discord-rs/bots.toml --runtime-root /var/lib/discord-rs/runtime --gateway-program /opt/discord-rs/bin/src --secret-file /etc/discord-rs/botd.secret --token-file %d/botd.env --control-port 47321 --stop-children-on-exit --mock-discord 127.0.0.1:47400"
+              echo "ExecStart=/opt/discord-rs/bin/botd --file /etc/discord-rs/bots.toml --runtime-root /var/lib/discord-rs/runtime --gateway-program /opt/discord-rs/bin/src --secret-file /etc/discord-rs/botd.secret --token-stdin --control-port 47321 --stop-children-on-exit --mock-discord 127.0.0.1:47400"
               echo "$extra"
             } > /tmp/case.conf
             sudo install -m 0644 /tmp/case.conf /etc/systemd/system/botd.service.d/smoke.conf
@@ -271,7 +314,7 @@ jobs:
           gw=$(gateway_pid)
           if [ -z "$gw" ] || [ "$main" = 0 ] || [ "$(systemctl show botd -p LimitCORE --value)" != 0 ] || \
             ! sudo nsenter --target "$main" --mount -- runuser -u discord-rs -- \
-              /bin/sh -c 'for pid do cat "/proc/$pid/cmdline" >/dev/null && [ ! -r "/proc/$pid/environ" ] || exit 1; done' sh "$main" "$gw"; then
+              /bin/sh -c '[ ! -r /etc/discord-rs/botd.env ] || exit 1; for pid do cat "/proc/$pid/cmdline" >/dev/null && [ ! -r "/proc/$pid/environ" ] || exit 1; done' sh "$main" "$gw"; then
             echo "FAIL: process dump protection or orphan visibility"
             fail=1
           fi
@@ -340,7 +383,7 @@ jobs:
               --runtime-root /var/lib/discord-rs/runtime \
               --gateway-program /opt/discord-rs/bin/src \
               --secret-file /etc/discord-rs/botd.secret \
-              --token-file %d/botd.env \
+              --token-stdin \
               --control-port 47321 \
               --stop-children-on-exit \
               --core-mode separate \

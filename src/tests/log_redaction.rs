@@ -36,7 +36,20 @@ fn token_command_inherits_only_the_selected_assignment() {
         .env("TOKEN_INHERITED", "parent.fixture")
         .output()
         .unwrap();
+    let fd = Command::new(env!("CARGO_BIN_EXE_botd"))
+        .args([
+            "--with-token",
+            "-",
+            "DISCORD_TEST_BOT_TOKEN",
+            "/usr/bin/readlink",
+            "/proc/self/fd/0",
+        ])
+        .stdin(std::fs::File::open(&file).unwrap())
+        .output()
+        .unwrap();
     std::fs::remove_dir_all(dir).unwrap();
+    assert!(fd.status.success());
+    assert_eq!(fd.stdout, b"/dev/null\n");
     assert!(output.status.success());
     assert_eq!(output.stdout, b"DISCORD_TEST_BOT_TOKEN=selected.fixture\n");
     assert!(output.stderr.is_empty());
