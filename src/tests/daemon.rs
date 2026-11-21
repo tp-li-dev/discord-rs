@@ -32,28 +32,30 @@ impl Clock for ManualClock {
     }
 }
 
-struct Root(PathBuf);
+struct Root(PathBuf, PathBuf);
 impl Root {
     fn new() -> Self {
+        Self::under(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join("daemon-tests"),
+        )
+    }
+
+    fn under(base: PathBuf) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("daemon-tests")
-            .join(format!(
-                "{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
+        let path = base.join(format!(
+            "{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
         std::fs::create_dir_all(&path).unwrap();
-        Self(path)
+        Self(path, base)
     }
 }
 impl Drop for Root {
     fn drop(&mut self) {
-        let base = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("daemon-tests");
-        if let (Ok(target), Ok(base)) = (self.0.canonicalize(), base.canonicalize())
+        if let (Ok(target), Ok(base)) = (self.0.canonicalize(), self.1.canonicalize())
             && target != base
             && target.starts_with(&base)
         {
@@ -236,6 +238,154 @@ async fn terminal(d: &mut Daemon<ManualClock>) {
             .all(|s| !matches!(s.state, ProcessState::Running))
     })
     .await;
+}
+
+#[cfg(target_os = "linux")]
+fn nonce_retry_placement() -> String {
+    let mut text = String::from("[cluster]\nid='local'\nmode='standalone'\n[node]\nid='one'\n");
+    for bot in ["101", "202"] {
+        text.push_str(&format!(
+            "[[bots]]\nname='bot{bot}'\nbot_id='{bot}'\napplication_id='{bot}'\ntoken_env='FIXTURE_{bot}'\ntotal_shards=1\n[[bots.shard_placement]]\nshard_id=0\nprimary='one'\n"
+        ));
+    }
+    text
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn nonce_retry_allowlist_is_used_for_normal_recovery_and_standby() {
+    use std::{collections::HashSet, os::unix::fs::PermissionsExt};
+
+    let root = Root::under(std::env::temp_dir().join("discord-rs-daemon-tests"));
+    let program = root.0.join("gateway");
+    std::fs::write(
+        &program,
+        r##"#!/bin/sh
+if [ "$1" = '--core-listen' ]; then
+    while IFS= read -r ignored; do :; done
+    exit 0
+fi
+kind=active
+count=0
+for arg in "$@"; do
+    case "$arg" in
+        --standby) kind=standby ;;
+        --enable-create-message-nonce-retry) count=$((count + 1)) ;;
+    esac
+done
+printf '%s\n' "$count" >> "$NONCE_TEST_DIR/$BOT_ID.$kind"
+IFS= read -r ignored
+"##,
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let config: Config = toml::from_str(&nonce_retry_placement()).unwrap();
+    let intents = config.local_primary_intents(&HashMap::new()).unwrap();
+    let mut plan = shard_runtime::plan(&intents, &root.0).unwrap();
+    for shard in &mut plan {
+        shard
+            .gateway
+            .environment
+            .variables
+            .insert("NONCE_TEST_DIR".into(), root.0.to_str().unwrap().into());
+    }
+    let clock = ManualClock::default();
+    let mut daemon = managed(plan, policy(), &clock);
+    daemon.0.set_gateway_program(&program).unwrap();
+    daemon.0.enable_separate_cores().unwrap();
+    daemon
+        .0
+        .set_local_identify_policy(src::local_identify::LocalIdentifyPolicy {
+            min_interval: Duration::ZERO,
+            ..Default::default()
+        });
+    let allowlist = HashSet::from(["101".into()]);
+    daemon
+        .0
+        .configure_create_message_nonce_retry(&config, &allowlist)
+        .unwrap();
+
+    // The fixture does not connect to Discord. Audit files contain flag counts only.
+    let fixture_credentials = |_: &str| Some(OsString::from("fixture"));
+    let launches_match = |kind: &str, listed: &str, unlisted: &str| {
+        [("101", listed), ("202", unlisted)]
+            .into_iter()
+            .all(|(bot, expected)| {
+                std::fs::read_to_string(root.0.join(format!("{bot}.{kind}")))
+                    .is_ok_and(|audit| audit == expected)
+            })
+    };
+    daemon.0.start_all(&fixture_credentials).unwrap();
+    eventually(|| launches_match("active", "1\n", "0\n")).await;
+    assert_eq!(
+        daemon
+            .0
+            .configure_create_message_nonce_retry(&config, &HashSet::new()),
+        Err(DaemonError::InvalidState),
+    );
+
+    for process in daemon.0.snapshots() {
+        let pid = process.identity.unwrap().pid.try_into().unwrap();
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+    }
+    terminal(&mut daemon.0).await;
+    clock.set(1);
+    daemon.0.poll(&fixture_credentials).unwrap();
+    eventually(|| launches_match("active", "1\n1\n", "0\n0\n")).await;
+
+    for bot in ["101", "202"] {
+        assert!(
+            daemon
+                .0
+                .begin_gateway_update(&key(bot, 0), &fixture_credentials)
+                .unwrap()
+        );
+    }
+    eventually(|| launches_match("standby", "1\n", "0\n")).await;
+    for bot in ["101", "202"] {
+        let key = key(bot, 0);
+        daemon.0.cancel_gateway_update(&key);
+        daemon.0.stop(&key, StopMode::Force).unwrap();
+    }
+    terminal(&mut daemon.0).await;
+    daemon.0.stop_cores(Duration::from_secs(2)).await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn botd_rejects_an_unknown_nonce_retry_bot_id_at_startup() {
+    let root = Root::new();
+    let config_path = root.0.join("placement.toml");
+    std::fs::write(&config_path, nonce_retry_placement()).unwrap();
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_botd"));
+    command
+        .arg("--file")
+        .arg(config_path)
+        .arg("--runtime-root")
+        .arg(&root.0)
+        .arg("--gateway-program")
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--bootstrap-stdin",
+            "--no-autostart",
+            "--enable-create-message-nonce-retry-for",
+            "101",
+            "--enable-create-message-nonce-retry-for",
+            "20", // A valid Bot ID prefix, but not a full ID.
+        ])
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(5), command.output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap().trim_end(),
+        "botd: unknown Bot ID in Create Message nonce retry allowlist",
+    );
 }
 
 #[tokio::test]
