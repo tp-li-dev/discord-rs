@@ -954,7 +954,25 @@ fn open_log(dir: &Path, index: usize) -> Option<std::fs::File> {
 #[cfg(test)]
 mod manual_restart_tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+
+    const CORE_FIXTURE: &str =
+        "#!/bin/sh\nIFS= read -r capability || exit 1\nwhile IFS= read -r line; do :; done\n";
+
+    fn write_executable(path: &Path, script: &str) {
+        // Keep the writable descriptor out of the test process. A concurrent
+        // fork could retain it until exec and make our spawn fail with ETXTBSY.
+        let status = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "printf '%s' \"$2\" > \"$1\" && exec /bin/chmod 700 \"$1\"",
+                "sh",
+            ])
+            .arg(path)
+            .arg(script)
+            .status()
+            .unwrap();
+        assert!(status.success(), "fixture creation failed: {status}");
+    }
 
     struct Fixture {
         cores: CoreUnits,
@@ -967,10 +985,7 @@ mod manual_restart_tests {
             let dir = std::env::temp_dir().join(format!("cr-{:016x}", getrandom::u64().unwrap()));
             std::fs::create_dir(&dir).unwrap();
             let program = dir.join("child");
-            std::fs::write(&program,
-                "#!/bin/sh\nIFS= read -r capability || exit 1\nwhile IFS= read -r line; do :; done\n",
-            ).unwrap();
-            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+            write_executable(&program, CORE_FIXTURE);
             let mut cores = CoreUnits::new(
                 dir.join("core"),
                 BotId(7),
@@ -1032,11 +1047,21 @@ mod manual_restart_tests {
     #[test]
     fn peer_availability_rejects_a_reserved_sibling() {
         let mut f = Fixture::new();
-        assert!(f.cores.peer_available(0));
+        // A freshly spawned child can be in a short uninterruptible state (D) while the
+        // kernel loads it; production deliberately treats that as unavailable, so the
+        // fixture waits (bounded) for the steady state before asserting availability.
+        let wait_until_available = |cores: &mut CoreUnits| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !cores.peer_available(0) {
+                assert!(Instant::now() < deadline, "sibling never became available");
+                std::thread::yield_now();
+            }
+        };
+        wait_until_available(&mut f.cores);
         f.cores.reserve_manual_restart(1);
         assert!(!f.cores.peer_available(0));
         f.cores.release_manual_restart(1);
-        assert!(f.cores.peer_available(0));
+        wait_until_available(&mut f.cores);
     }
 
     #[test]
@@ -1097,12 +1122,10 @@ mod manual_restart_tests {
             f.empty_slot(0);
             let marker = socket_path(f.cores.dir(), 0).with_extension("sock.capability");
             let program = f.dir.join("late-child");
-            std::fs::write(
+            write_executable(
                 &program,
                 "#!/bin/sh\nif IFS= read -r capability; then : > \"$2.capability\"; fi\nexec /bin/sleep 30\n",
-            )
-            .unwrap();
-            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+            );
             let now = Instant::now();
             f.cores.reserve_manual_restart(0);
             assert!(f.cores.begin_manual_restart(0, None, now, true).unwrap());
@@ -1281,12 +1304,7 @@ mod manual_restart_tests {
         let dir = std::env::temp_dir().join(format!("cr-{:016x}", getrandom::u64().unwrap()));
         std::fs::create_dir(&dir).unwrap();
         let program = dir.join("child");
-        std::fs::write(
-            &program,
-            "#!/bin/sh\nIFS= read -r capability || exit 1\nwhile IFS= read -r line; do :; done\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        write_executable(&program, CORE_FIXTURE);
         let core_dir = dir.join("core");
         let mut cores = CoreUnits::new(core_dir, BotId(7), Shard::new(0, 1).unwrap(), [7; 16]);
         cores.configure_status(Some(dir.clone()), true, None);
