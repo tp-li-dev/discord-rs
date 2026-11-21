@@ -489,27 +489,25 @@ mod tests {
         .unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn partial_first_frame_does_not_extend_deadline() {
         let (mut client, mut server) = duplex(8192);
         let keys = [Key::new(&TEST_KEY)];
-        let slowly = async {
-            for byte in b"DRSB" {
-                client.write_all(&[*byte]).await.unwrap();
-                tokio::time::sleep(Duration::from_millis(170)).await;
-            }
-            // Keep the writer open so a truncated frame cannot explain the error.
-            std::future::pending::<()>().await;
-        };
-        let result = timeout(Duration::from_millis(1800), async {
-            tokio::select! {
-                result = authenticate_server(&mut server, Protocol::Botd, &keys) => result,
-                _ = slowly => unreachable!(),
-            }
-        })
-        .await
-        .expect("partial input must expire at the initial deadline");
-        assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::TimedOut));
+        let mut hello = std::pin::pin!(authenticate_server(&mut server, Protocol::Botd, &keys));
+        assert!(futures_util::poll!(&mut hello).is_pending());
+        client.write_all(b"DRS").await.unwrap();
+        assert!(futures_util::poll!(&mut hello).is_pending());
+
+        tokio::time::advance(Duration::from_millis(999)).await;
+        client.write_all(b"B").await.unwrap();
+        assert!(futures_util::poll!(&mut hello).is_pending());
+
+        // The stream stays open, and the last byte arrived only 2 ms ago.
+        tokio::time::advance(Duration::from_millis(2)).await;
+        assert!(matches!(
+            futures_util::poll!(&mut hello),
+            Poll::Ready(Err(error)) if error.kind() == io::ErrorKind::TimedOut
+        ));
     }
 
     #[tokio::test]
