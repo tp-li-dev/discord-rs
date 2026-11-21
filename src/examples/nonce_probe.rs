@@ -8,7 +8,7 @@ use std::{
     collections::BTreeSet, env, ffi::OsString, future::IntoFuture, process::ExitCode,
     time::Duration,
 };
-use tokio::time::{Instant, sleep, timeout, timeout_at};
+use tokio::time::{Instant, sleep, timeout_at};
 use twilight_http::Client;
 use twilight_model::{
     channel::Message,
@@ -96,20 +96,18 @@ fn parse(args: Vec<OsString>) -> Result<Plan, &'static str> {
 #[derive(Clone, Copy)]
 enum ProbeError {
     Attempt(AttemptError),
-    Deadline,
     Message,
 }
 
-fn print_attempt_error(label: &str, error: ProbeError) {
+fn print_attempt_error(label: &str, error: AttemptError) {
     let (status, reason) = match error {
-        ProbeError::Attempt(AttemptError::Http(status)) => (Some(status), "http_error"),
-        ProbeError::Attempt(AttemptError::RateLimited) => (Some(429), "rate_limited"),
-        ProbeError::Attempt(AttemptError::Transport) => (None, "transport"),
-        ProbeError::Attempt(AttemptError::Timeout) => (None, "http_timeout"),
-        ProbeError::Attempt(AttemptError::GuardUnavailable) => (None, "guard_unavailable"),
-        ProbeError::Attempt(AttemptError::Other) => (None, "request_or_response_error"),
-        ProbeError::Deadline => (None, "deadline"),
-        ProbeError::Message => (None, "unexpected_message"),
+        AttemptError::Deadline => (None, "deadline"),
+        AttemptError::Http(status) => (Some(status), "http_error"),
+        AttemptError::RateLimited => (Some(429), "rate_limited"),
+        AttemptError::Transport => (None, "transport"),
+        AttemptError::Timeout => (None, "http_timeout"),
+        AttemptError::GuardUnavailable => (None, "guard_unavailable"),
+        AttemptError::Other => (None, "request_or_response_error"),
     };
     let status = status.map_or_else(|| "unknown".to_owned(), |status| status.to_string());
     println!("{label} status={status} result={reason}");
@@ -128,11 +126,11 @@ async fn post(
         .create_message(channel)
         .payload_json(body)
         .into_future();
-    let response = timeout_at(deadline, single_attempt(request))
+    let response = timeout_at(deadline, single_attempt(request, deadline))
         .await
-        .map_err(|_| ProbeError::Deadline)
-        .and_then(|result| result.map_err(ProbeError::Attempt))
-        .inspect_err(|error| print_attempt_error(label, *error))?;
+        .unwrap_or(Err(AttemptError::Deadline))
+        .inspect_err(|error| print_attempt_error(label, *error))
+        .map_err(ProbeError::Attempt)?;
     let status = response.status().get();
     let message: Message = match timeout_at(deadline, response.model()).await {
         Ok(Ok(message)) if message.channel_id == channel && message.content == content => message,
@@ -208,35 +206,32 @@ async fn run(plan: Plan) -> Result<bool, &'static str> {
     if plan.cleanup {
         if matches!(
             verdict,
-            Err(ProbeError::Attempt(AttemptError::RateLimited) | ProbeError::Deadline)
+            Err(ProbeError::Attempt(
+                AttemptError::RateLimited | AttemptError::Deadline
+            ))
         ) {
             println!("cleanup=skipped_possible_rate_limit");
             return Ok(false);
         }
         let mut cleaned = true;
         for id in ids {
-            match timeout(
-                DEADLINE,
-                single_attempt(http.delete_message(channel, id).into_future()),
+            let deadline = Instant::now() + DEADLINE;
+            match timeout_at(
+                deadline,
+                single_attempt(http.delete_message(channel, id).into_future(), deadline),
             )
             .await
+            .unwrap_or(Err(AttemptError::Deadline))
             {
-                Ok(Ok(response)) => {
+                Ok(response) => {
                     println!("cleanup message_id={id} status={}", response.status().get())
                 }
-                Ok(Err(error)) => {
-                    print_attempt_error(
-                        &format!("cleanup message_id={id}"),
-                        ProbeError::Attempt(error),
-                    );
+                Err(error) => {
+                    print_attempt_error(&format!("cleanup message_id={id}"), error);
                     cleaned = false;
-                    if error == AttemptError::RateLimited {
+                    if matches!(error, AttemptError::RateLimited | AttemptError::Deadline) {
                         break;
                     }
-                }
-                Err(_) => {
-                    print_attempt_error(&format!("cleanup message_id={id}"), ProbeError::Deadline);
-                    return Ok(false);
                 }
             }
         }
@@ -253,6 +248,10 @@ async fn main() -> ExitCode {
         println!("{HELP}");
         return ExitCode::SUCCESS;
     }
+    if !cfg!(target_os = "linux") {
+        eprintln!("nonce_probe: Linux required");
+        return ExitCode::FAILURE;
+    }
     let result = match parse(args) {
         Ok(plan) => run(plan).await,
         Err(error) => {
@@ -267,5 +266,29 @@ async fn main() -> ExitCode {
             eprintln!("nonce_probe: {error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn posting_requires_explicit_consent() {
+        let args = ["--token-env", "NONCE_PROBE_BOT_TOKEN", "--channel-id", "1"];
+        assert!(matches!(
+            parse(args.into_iter().map(OsString::from).collect()),
+            Err("explicit_yes_post_required")
+        ));
+        let plan = parse(
+            args.into_iter()
+                .chain(["--yes-post", "--cleanup", "--delay-seconds", "30"])
+                .map(OsString::from)
+                .collect(),
+        )
+        .unwrap();
+        assert_eq!(plan.channel.get(), 1);
+        assert_eq!(plan.delay, Some(Duration::from_secs(30)));
+        assert!(plan.cleanup);
     }
 }

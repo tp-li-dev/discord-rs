@@ -8113,6 +8113,21 @@ impl<C: Clock> Daemon<C> {
         Ok(())
     }
 
+    /// Explicit startup opt-in. Only Gateway launch specs receive the flag.
+    pub fn enable_create_message_nonce_retry(&mut self) -> Result<(), DaemonError> {
+        use crate::discord_message::NONCE_RETRY_FLAG;
+        if self.entries.values().any(|entry| entry.started) {
+            return Err(DaemonError::InvalidState);
+        }
+        for entry in self.entries.values_mut() {
+            let args = &mut entry.spec.gateway.args;
+            if !args.iter().any(|arg| arg == NONCE_RETRY_FLAG) {
+                args.push(NONCE_RETRY_FLAG.into());
+            }
+        }
+        Ok(())
+    }
+
     /// Explicit token-free Discord simulation. Gateways connect out to the
     /// caller's loopback collector; no listener or remote management is exposed.
     /// Configuration is frozen after the first launch attempt, including failed

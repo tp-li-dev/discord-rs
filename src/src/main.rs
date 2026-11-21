@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use serde_json::{Value, json};
+use src::discord_message::{NONCE_RETRY_FLAG, TextMessageKind, send_text_message};
 use src::{AppError, redact::Secret, worker};
 use std::{
     collections::BTreeMap,
@@ -258,6 +259,7 @@ struct GatewayOptions {
     launch: BTreeMap<String, OsString>,
     mock_discord: Option<SocketAddr>,
     local_control: bool,
+    nonce_retry: bool,
     /// Directory of the Cores botd runs for this Shard (separated layout). When set, the
     /// Gateway connects to them instead of starting its own Core processes.
     core_dir: Option<PathBuf>,
@@ -276,6 +278,9 @@ impl GatewayOptions {
             let flag = flag.to_str().ok_or(StartupFailure::InvalidArguments)?;
             match flag {
                 "--local-control" if !options.local_control => options.local_control = true,
+                NONCE_RETRY_FLAG if cfg!(target_os = "linux") && !options.nonce_retry => {
+                    options.nonce_retry = true;
+                }
                 "--core-dir" if options.core_dir.is_none() => {
                     let dir = PathBuf::from(args.next().ok_or(StartupFailure::InvalidArguments)?);
                     if !dir.is_absolute() || dir.components().any(|p| p == Component::ParentDir) {
@@ -311,6 +316,7 @@ impl GatewayOptions {
             }
         }
         if (!options.launch.is_empty() && options.launch.len() != 7)
+            || (options.nonce_retry && options.mock_discord.is_some())
             || (options.local_control
                 && (!options.launch.is_empty() || options.mock_discord.is_some()))
             || (options.core_dir.is_some() && (options.local_control || !cfg!(unix)))
@@ -505,7 +511,15 @@ async fn run_standby(
             "待機Gatewayを有効にしました（epoch {epoch}、保留 {} 件）",
             backlog.len()
         );
-        let result = live_events(shard, http, manager.clone(), backlog, shutdown).await;
+        let result = live_events(
+            shard,
+            http,
+            manager.clone(),
+            backlog,
+            shutdown,
+            options.nonce_retry,
+        )
+        .await;
         let _ = manager.shutdown().await;
         result
     }
@@ -1178,6 +1192,7 @@ async fn run() -> Result<(), AppError> {
             manager.clone(),
             std::collections::VecDeque::new(),
             shutdown_requested(shutdown),
+            options.nonce_retry,
         )
         .await
     };
@@ -1243,6 +1258,7 @@ async fn live_events(
     manager: Arc<worker::Manager>,
     mut backlog: std::collections::VecDeque<ShardEvent>,
     shutdown: impl std::future::Future<Output = ()>,
+    nonce_retry: bool,
 ) -> Result<(), AppError> {
     let capacity = Arc::new(Semaphore::new(64));
     let mut requests = JoinSet::new();
@@ -1331,21 +1347,20 @@ async fn live_events(
                 let http = http.clone();
                 requests.spawn(async move {
                     let _permit = permit;
-                    // No @everyone/@here/role/user pings from any Bot-authored message.
-                    let no_mentions = AllowedMentions::default();
                     if message.content.trim() == "!workers" {
                         let content = clamp_reply(&manager.describe_workers().await);
                         if !manager.workers_reply_allowed().await {
                             return;
                         }
-                        if !confirmed_response(
-                            std::time::Duration::from_secs(10),
-                            http.create_message(message.channel_id)
-                                .content(&content)
-                                .allowed_mentions(Some(&no_mentions))
-                                .into_future(),
+                        if send_text_message(
+                            &http,
+                            message.channel_id,
+                            TextMessageKind::WorkersInfo,
+                            &content,
+                            nonce_retry,
                         )
                         .await
+                        .is_none()
                         {
                             eprintln!("Worker情報の送信エラーまたはタイムアウト（結果不明）");
                         }
@@ -1375,17 +1390,14 @@ async fn live_events(
                     {
                         Ok(Some(content)) => {
                             let content = clamp_reply(&content);
-                            let status = tokio::time::timeout(
-                                Duration::from_secs(10),
-                                http.create_message(message.channel_id)
-                                    .content(&content)
-                                    .allowed_mentions(Some(&no_mentions))
-                                    .into_future(),
+                            let status = send_text_message(
+                                &http,
+                                message.channel_id,
+                                TextMessageKind::TrackedPrefixReply,
+                                &content,
+                                nonce_retry,
                             )
-                            .await
-                            .ok()
-                            .and_then(Result::ok)
-                            .map(|response| response.status().get());
+                            .await;
                             if manager
                                 .finish_response(response_guard, api_outcome(status))
                                 .await

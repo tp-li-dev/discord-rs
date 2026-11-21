@@ -56,6 +56,6 @@ control_distinct_message_id=true
 result=not_deduplicated
 ```
 
-遅延試行では `post3_start_elapsed_ms`、`post3`、`third_same_as_first`、`third_same_as_second` が追加される。この 1 回の観測から正確な保持期間は決められない。失敗や対照が成立しない場合は `result=inconclusive` になる。429 や、HTTP ステータスが得られる前の期限切れでは、後続の投稿を止め、レート制限を迂回しないよう削除も見送る。応答を失った POST は ID が分からないことがあるため、チャンネルで実行時に表示した本文を照合し、残っている試験投稿を許可の範囲で削除する。
+遅延試行では `post3_start_elapsed_ms`、`post3`、`third_same_as_first`、`third_same_as_second` が追加される。`result=deduplicated` は最初の 2 回と対照試験の判定を示し、遅延試行の判定には `third_same_as_first` を使う。この 1 回の観測から正確な保持期間は決められない。POST が失敗した場合や対照が成立しない場合は `result=inconclusive` になる。429 や、HTTP ステータスが得られる前の期限切れでは、後続の投稿を止め、レート制限を迂回しないよう削除も見送る。応答を失った POST は ID が分からないことがあるため、チャンネルで実行時に表示した本文を照合し、残っている試験投稿を許可の範囲で削除する。
 
 報告には `post1`、経過時間、`post2`、遅延試行を使った場合の `post3`、`control`、ID の比較、`result`、削除結果の行と、目視した投稿数を貼る。チャンネル ID やメッセージ ID を伏せる場合は、同一の ID を同一の別名に置き換える。Bot token は共有しない。条件を満たした結果を確認するまで運用の再試行フラグは無効のままにする。
