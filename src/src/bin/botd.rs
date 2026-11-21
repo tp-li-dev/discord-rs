@@ -909,6 +909,10 @@ async fn run() -> Result<(), &'static str> {
                         control.dispatch_manifest_update(&mut updates, update, envelope.access)
                     } else if envelope.request.command == "operation" && external_id_conflict {
                         updates.query(envelope.request.operation_id.as_deref().unwrap(), &envelope.access)
+                    } else if envelope.request.command == "restart-all"
+                        && envelope.access.allows_command(false, None, &[])
+                        && (external_id_conflict || config.bots.iter().any(|bot| updates.busy(&bot.bot_id))) {
+                        json!({"ok":false,"error":"Bot or operation ID is already busy"})
                     } else if matches!(envelope.request.command.as_str(), "start" | "stop" | "restart")
                         && (external_id_conflict || envelope.request.bot.as_deref().and_then(|selector| src::botref::resolve(&config.bots, selector).ok().map(|b| updates.busy(&b.bot_id))).unwrap_or(false)) {
                         json!({"ok":false,"error":"Bot or operation ID is already busy"})

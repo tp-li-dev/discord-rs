@@ -1119,6 +1119,7 @@ pub mod control {
                 "start" | "restart" | "gateway-prepare" | "gateway-update" => {
                     selector && id && !self.force && !self.yes
                 }
+                "restart-all" => self.bot.is_none() && id && !self.force && self.yes,
                 "core-restart" => {
                     selector
                         && id
@@ -1182,7 +1183,7 @@ pub mod control {
     pub struct OperationSnapshot {
         pub operation_id: String,
         pub command: String,
-        pub bot_id: String,
+        pub bot_id: Option<String>,
         pub state: OperationState,
         pub elapsed_ms: u128,
         pub shards: Vec<OperationShard>,
@@ -1444,7 +1445,7 @@ pub mod control {
     struct Operation {
         id: String,
         command: String,
-        bot_id: String,
+        bot_id: Option<String>,
         force: bool,
         /// The requested Shard filter (sorted), kept so a repeated ID can be checked for conflicts.
         shards: Option<Vec<u32>>,
@@ -1466,7 +1467,7 @@ pub mod control {
     impl Operation {
         fn new(
             request: &CommandRequest,
-            bot_id: String,
+            bot_id: Option<String>,
             targets: Vec<ShardKey>,
             waiting: HashSet<ShardKey>,
             phase: Phase,
@@ -1491,6 +1492,10 @@ pub mod control {
                 #[cfg(unix)]
                 core_restart: None,
             }
+        }
+
+        fn is_restart(&self) -> bool {
+            matches!(self.command.as_str(), "restart" | "restart-all")
         }
     }
 
@@ -2298,10 +2303,9 @@ pub mod control {
             if self.operation_exists(&request.operation_id) {
                 return Self::error("operation ID conflicts with an earlier request");
             }
-            let busy = self
-                .operations
-                .values()
-                .any(|op| op.bot_id == request.bot && op.finished.is_none());
+            let busy = self.operations.values().any(|op| {
+                op.finished.is_none() && op.targets.iter().any(|key| key.bot_id == request.bot)
+            });
             updates.admit(request, access, busy)
         }
 
@@ -2361,7 +2365,7 @@ pub mod control {
                     .operation_id
                     .as_ref()
                     .and_then(|id| self.operations.get(id))
-                    .map(|op| op.bot_id.clone())
+                    .and_then(|op| op.bot_id.clone())
             } else {
                 request
                     .bot
@@ -2679,7 +2683,7 @@ pub mod control {
                 return reject(self, reply, &recovery, "total_shards_mismatch", None);
             }
             if let Some(old) = self.operations.get(id) {
-                if old.bot_id == key.bot_id
+                if old.bot_id.as_deref() == Some(key.bot_id.as_str())
                     && old.shards == request.shard_filter()
                     && old.force == force
                     && old.core_restart.as_ref().is_some_and(|previous| {
@@ -2780,7 +2784,7 @@ pub mod control {
             }
             let mut op = Operation::new(
                 request,
-                key.bot_id.clone(),
+                Some(key.bot_id.clone()),
                 vec![key],
                 HashSet::new(),
                 Phase::CoreRestart,
@@ -3241,6 +3245,9 @@ pub mod control {
             let failed = snapshot.state == OperationState::Failed;
             let first_error = op.errors.values().next().copied();
             op.finished = Some(snapshot);
+            if op.is_restart() {
+                self.daemon.release_restart_identify(&op.targets);
+            }
             if op.command != "core-restart" {
                 for key in &op.targets {
                     self.daemon.hold_restart(key, false);
@@ -3260,7 +3267,7 @@ pub mod control {
                 // The request was recorded before it started; a failure to record the
                 // outcome cannot undo it, so it is only reported.
                 if let Ok(record) =
-                    Self::audit_record(event, &op.id, Some(&op.bot_id), actor, first_error)
+                    Self::audit_record(event, &op.id, op.bot_id.as_deref(), actor, first_error)
                 {
                     self.write_terminal_audit(record);
                 }
@@ -3448,7 +3455,7 @@ pub mod control {
                     }).collect();
                     json!({"ok": true, "offline": false, "note": NOTE, "bot_id": bot.bot_id, "name": bot.name, "shards": shards})
                 }
-                _ => self.admit(request, selected.expect("validated selector").bot_id),
+                _ => self.admit(request, selected.map(|bot| bot.bot_id)),
             }
         }
 
@@ -3460,7 +3467,7 @@ pub mod control {
             })
         }
 
-        fn admit(&mut self, request: &CommandRequest, bot_id: String) -> Value {
+        fn admit(&mut self, request: &CommandRequest, bot_id: Option<String>) -> Value {
             if let Some(response) = self.replay_retry_response() {
                 return response;
             }
@@ -3486,13 +3493,17 @@ pub mod control {
             }
             let mut targets: Vec<_> = self
                 .daemon
-                .snapshots()
-                .into_iter()
-                .filter(|s| s.key.bot_id == bot_id)
-                .map(|s| s.key)
+                .entries
+                .keys()
+                .filter(|key| bot_id.as_ref().is_none_or(|bot| key.bot_id == *bot))
+                .cloned()
                 .collect();
             if targets.is_empty() {
-                return Self::error("bot has no local shards");
+                return Self::error(if bot_id.is_some() {
+                    "bot has no local shards"
+                } else {
+                    "no bot has local shards"
+                });
             }
             if let Some(wanted) = request.shard_filter() {
                 // A Shard that is not local is an error, never silently skipped: the operator
@@ -3511,11 +3522,17 @@ pub mod control {
             if self.core_restart_busy(&targets) {
                 return Self::error("busy");
             }
+            let target_bots: HashSet<_> = targets.iter().map(|key| &key.bot_id).collect();
             let active: Vec<_> = self
                 .operations
                 .iter()
                 .filter(|(_, op)| {
-                    op.bot_id == bot_id && op.finished.is_none() && op.command != "core-restart"
+                    op.finished.is_none()
+                        && op.command != "core-restart"
+                        && op
+                            .targets
+                            .iter()
+                            .any(|key| target_bots.contains(&key.bot_id))
                 })
                 .map(|(id, _)| id.clone())
                 .collect();
@@ -3523,22 +3540,24 @@ pub mod control {
                 return Self::error("bot already has an operation in progress");
             }
             // Superseding an operation also changes its other shards' restart holds and
-            // candidate lifetimes. A filtered force stop must authorize that entire effect.
+            // candidate lifetimes. A force stop must authorize that entire effect.
             // Refuse before finishing anything or installing new holds.
-            if request.shards.is_some()
-                && active.iter().any(|id| {
-                    self.operations[id]
-                        .targets
-                        .iter()
-                        .any(|key| !targets.contains(key))
-                })
-            {
-                return Self::error("another operation is running on other shards of this bot");
+            if active.iter().any(|id| {
+                self.operations[id]
+                    .targets
+                    .iter()
+                    .any(|key| !targets.contains(key))
+            }) {
+                return Self::error(if request.shards.is_some() {
+                    "another operation is running on other shards of this bot"
+                } else {
+                    "restart-all is in progress"
+                });
             }
-            if matches!(
-                request.command.as_str(),
-                "start" | "restart" | "gateway-update"
-            ) && self.daemon.gateway_update_fallback_pending(&bot_id)
+            if matches!(request.command.as_str(), "start" | "gateway-update")
+                && bot_id
+                    .as_deref()
+                    .is_some_and(|bot| self.daemon.gateway_update_fallback_pending(bot))
             {
                 // A new operation must not hold the shard with reserved recovery.
                 return Self::error("gateway fallback recovery pending; retry after recovery");
@@ -3553,6 +3572,11 @@ pub mod control {
                 }
                 self.finish(&mut old);
                 self.operations.insert(id, old);
+            }
+            if matches!(request.command.as_str(), "restart" | "restart-all")
+                && let Err(error) = self.daemon.reserve_restart_identify(&targets)
+            {
+                return Self::error(&format!("{error:?}"));
             }
             let waiting = if request.command == "start" || request.command == "gateway-update" {
                 HashSet::new()
@@ -3801,7 +3825,12 @@ pub mod control {
                 let key = &op.targets[op.next];
                 op.next += 1;
                 let result = if op.phase == Phase::Starting {
-                    self.daemon.start(key, credentials)
+                    if op.is_restart() {
+                        self.daemon
+                            .start_inner(key, credentials, StartKind::Restart)
+                    } else {
+                        self.daemon.start(key, credentials)
+                    }
                 } else {
                     if self.daemon.has_child(key) {
                         op.waiting.insert(key.clone());
@@ -3815,6 +3844,10 @@ pub mod control {
                 match result {
                     Err(error) => {
                         op.errors.insert(key.clone(), error);
+                        if op.phase == Phase::Stopping && op.is_restart() {
+                            self.finish(op);
+                            return;
+                        }
                         // A failed manual start must not secretly succeed later
                         // through an automatically scheduled restart.
                         if op.phase == Phase::Starting
@@ -3861,7 +3894,7 @@ pub mod control {
                 if !op.waiting.is_empty() {
                     return;
                 }
-                if op.command == "restart" && op.errors.is_empty() {
+                if op.is_restart() && op.errors.is_empty() {
                     op.phase = Phase::Starting;
                     op.next = 0;
                     return;
@@ -6380,6 +6413,12 @@ pub mod control {
         #[tokio::test]
         async fn abnormal_exit_after_admission_cannot_be_reported_as_a_successful_restart() {
             let mut plane = plane(1, 1);
+            plane
+                .daemon
+                .set_local_identify_policy(crate::local_identify::LocalIdentifyPolicy {
+                    min_interval: Duration::ZERO,
+                    ..Default::default()
+                });
             let key = ShardKey {
                 bot_id: "id-0".into(),
                 shard_id: 0,
@@ -6900,7 +6939,7 @@ pub mod control {
             // Call ControlPlane admission directly; no separated Core or child is needed.
             let retry = request("gateway-update", 0, 92);
             for _ in 0..2 {
-                let response = plane.admit(&retry, "id-0".into());
+                let response = plane.admit(&retry, Some("id-0".into()));
                 assert_eq!(response["ok"], false);
                 assert_eq!(
                     response["error"],
@@ -6917,7 +6956,7 @@ pub mod control {
                 assert!(plane.daemon.entries[&protected].update_fallback_reserved);
             }
             // A different Bot can proceed without holding the protected Bot's shards.
-            let other = plane.admit(&request("gateway-update", 1, 93), "id-1".into());
+            let other = plane.admit(&request("gateway-update", 1, 93), Some("id-1".into()));
             assert_eq!(other["ok"], true);
             for entry in plane.daemon.entries.values() {
                 assert_eq!(entry.restart_held, entry.snapshot.key.bot_id == "id-1");
@@ -6930,7 +6969,7 @@ pub mod control {
                 .get_mut(&protected)
                 .unwrap()
                 .update_fallback_reserved = false;
-            let admitted = plane.admit(&retry, "id-0".into());
+            let admitted = plane.admit(&retry, Some("id-0".into()));
             assert_eq!(admitted["ok"], true);
             assert_eq!(plane.operations.len(), 2);
             assert!(
@@ -6982,6 +7021,7 @@ pub mod control {
                 instance: daemon.instance,
                 sequence: &mut daemon.sequence,
                 manual: Some(&other),
+                reserved_restart: None,
                 now: Duration::from_secs(60),
                 local_identify: &mut daemon.local_identify,
                 errors: BTreeMap::new(),
@@ -7036,53 +7076,95 @@ pub mod control {
         }
 
         #[cfg(unix)]
-        #[tokio::test]
-        async fn manual_restart_reports_identify_exhaustion_and_leaves_no_retry() {
-            let mut plane = plane(1, 1);
-            let key = ShardKey {
-                bot_id: "id-0".into(),
-                shard_id: 0,
-            };
-            let entry = plane.daemon.entries.get_mut(&key).unwrap();
-            entry.spec.gateway.program = "/bin/sh".into();
-            entry.spec.gateway.args = ["-c", "IFS= read -r line"].map(OsString::from).to_vec();
-            plane
-                .daemon
-                .set_local_identify_policy(crate::local_identify::LocalIdentifyPolicy {
-                    min_interval: Duration::ZERO,
-                    max_per_window: 1,
+        mod restart_identify {
+            use super::*;
+            use crate::local_identify::LocalIdentifyPolicy;
+
+            fn fixture(
+                bots: usize,
+                shards: u32,
+                max_per_window: u32,
+            ) -> (ControlPlane, tokio::sync::watch::Sender<Duration>) {
+                let mut plane = plane(bots, shards);
+                let specs = plane
+                    .daemon
+                    .entries
+                    .values()
+                    .map(|entry| {
+                        let mut spec = entry.spec.clone();
+                        spec.gateway.program = "/bin/sh".into();
+                        spec.gateway.args =
+                            ["-c", "IFS= read -r line"].map(OsString::from).to_vec();
+                        spec
+                    })
+                    .collect();
+                let (time, clock) = tokio::sync::watch::channel(Duration::ZERO);
+                plane.daemon = Daemon::with_clock(
+                    specs,
+                    RestartPolicy::default(),
+                    MonotonicClock::with_manual_time(clock),
+                )
+                .unwrap();
+                plane.daemon.set_local_identify_policy(LocalIdentifyPolicy {
+                    max_per_window,
                     ..Default::default()
                 });
-            let credential = |_: &str| Some(OsString::from("fixture-only"));
-            assert_eq!(plane.request(&request("start", 0, 1))["ok"], true);
-            plane.tick(&credential).await;
-            plane.tick(&credential).await;
-            assert_eq!(plane.request(&query(1))["operation"]["state"], "succeeded");
-            let original = plane.daemon.snapshots()[0].identity.clone();
+                (plane, time)
+            }
 
-            assert_eq!(plane.request(&request("restart", 0, 2))["ok"], true);
-            tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    plane.tick(&credential).await;
-                    let result = plane.request(&query(2));
-                    if result["operation"]["state"] == "failed" {
-                        assert_eq!(
-                            result["operation"]["shards"][0]["error"],
-                            "IdentifyUnavailable"
-                        );
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(5)).await;
+            fn credentials(_: &str) -> Option<OsString> {
+                Some("fixture-only".into())
+            }
+
+            fn key(bot: usize, shard_id: u32) -> ShardKey {
+                ShardKey {
+                    bot_id: format!("id-{bot}"),
+                    shard_id,
                 }
-            })
-            .await
-            .unwrap();
-            plane.tick(&credential).await;
-            assert!(!plane.daemon.has_child(&key));
-            let stopped = &plane.daemon.snapshots()[0];
-            assert!(!stopped.desired_running);
-            assert!(stopped.retry_at_ms.is_none());
-            assert_eq!(stopped.identity, original);
+            }
+
+            fn running_pid(plane: &ControlPlane, key: &ShardKey) -> u32 {
+                let entry = &plane.daemon.entries[key];
+                assert!(entry.snapshot.desired_running);
+                assert!(matches!(entry.snapshot.state, ProcessState::Running));
+                assert!(entry.snapshot.retry_at_ms.is_none());
+                let live = plane
+                    .daemon
+                    .recovery
+                    .snapshot(entry.recovery_key)
+                    .unwrap()
+                    .pid
+                    .unwrap();
+                assert_eq!(entry.snapshot.identity.as_ref().unwrap().pid, live);
+                live
+            }
+
+            async fn cleanup(plane: &mut ControlPlane) {
+                assert!(
+                    plane
+                        .shutdown_children(&credentials, Duration::from_secs(5))
+                        .await
+                        .is_empty()
+                );
+            }
+
+            #[tokio::test]
+            async fn manual_restart_reports_identify_exhaustion_and_leaves_no_retry() {
+                let (mut plane, time) = fixture(1, 1, 1);
+                let key = key(0, 0);
+                plane.daemon.start(&key, &credentials).unwrap();
+                let pid = running_pid(&plane, &key);
+                time.send_replace(Duration::from_secs(30));
+
+                let rejected = plane.request(&request("restart", 0, 2));
+                assert_eq!(rejected["ok"], false);
+                assert_eq!(rejected["error"], "IdentifyUnavailable");
+                plane.tick(&credentials).await;
+                assert!(plane.operations.is_empty());
+                assert!(!plane.daemon.entries[&key].restart_held);
+                assert_eq!(running_pid(&plane, &key), pid);
+                cleanup(&mut plane).await;
+            }
         }
 
         #[test]
@@ -7098,7 +7180,7 @@ pub mod control {
             plane
                 .audit_gateway_update("requested", &id, Some("id-0"), &actor, None)
                 .unwrap();
-            assert_eq!(plane.admit(&req, "id-0".to_owned())["ok"], true);
+            assert_eq!(plane.admit(&req, Some("id-0".into()))["ok"], true);
             plane.gateway_update_actors.insert(id.clone(), actor);
             plane.set_gateway_update_audit(dir.clone());
             let mut op = plane.operations.remove(&id).unwrap();
@@ -7794,6 +7876,13 @@ enum GatewayLaunch {
     Standby,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StartKind {
+    Automatic,
+    Manual,
+    Restart,
+}
+
 impl Entry {
     fn acquire_identify(
         &self,
@@ -7840,6 +7929,7 @@ struct ProcessRecoveryHost<'a, S> {
     instance: [u8; 16],
     sequence: &'a mut u64,
     manual: Option<&'a ShardKey>,
+    reserved_restart: Option<&'a ShardKey>,
     now: Duration,
     local_identify: &'a mut crate::local_identify::LocalIdentifyRegistry,
     errors: BTreeMap<ShardKey, DaemonError>,
@@ -7900,7 +7990,13 @@ impl<S: CredentialSource> RecoveryHost for ProcessRecoveryHost<'_, S> {
         let since = *entry
             .admission_since
             .get_or_insert_with(std::time::Instant::now);
-        let decision = if blocked {
+        let decision = if self.reserved_restart == Some(&entry.snapshot.key) {
+            if entry.mock_discord.is_none() {
+                self.local_identify
+                    .consume_restart(&entry.snapshot.key.bot_id, self.now);
+            }
+            LocalAdmission::Granted
+        } else if blocked {
             LocalAdmission::Pending {
                 retry_after: Duration::ZERO,
             }
@@ -8278,6 +8374,51 @@ impl<C: Clock> Daemon<C> {
         self.entries
             .values()
             .any(|entry| entry.snapshot.key.bot_id == bot_id && entry.update_fallback_reserved)
+    }
+
+    fn reserve_restart_identify(&mut self, targets: &[ShardKey]) -> Result<(), DaemonError> {
+        use crate::local_identify::LocalAdmission;
+        let now = self.now()?;
+        let mut slots_by_bot = BTreeMap::new();
+        for key in targets {
+            let entry = &self.entries[key];
+            if self.gateway_update_fallback_pending(&key.bot_id) {
+                return Err(DaemonError::IdentifyDeferred);
+            }
+            #[cfg(unix)]
+            if entry
+                .cores
+                .as_ref()
+                .is_some_and(|cores| cores.manual_restart_reserved())
+            {
+                return Err(DaemonError::IdentifyDeferred);
+            }
+            if entry.mock_discord.is_none() {
+                *slots_by_bot.entry(key.bot_id.as_str()).or_insert(0) += 1;
+            }
+        }
+        let mut reserved = Vec::new();
+        for (bot, slots) in slots_by_bot {
+            let error = match self.local_identify.reserve_restart(bot, now, slots) {
+                LocalAdmission::Granted => {
+                    reserved.push(bot);
+                    continue;
+                }
+                LocalAdmission::Pending { .. } => DaemonError::IdentifyDeferred,
+                LocalAdmission::Exhausted { .. } => DaemonError::IdentifyUnavailable,
+            };
+            for bot in reserved {
+                self.local_identify.release_restart(bot);
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn release_restart_identify(&mut self, targets: &[ShardKey]) {
+        for key in targets {
+            self.local_identify.release_restart(&key.bot_id);
+        }
     }
 
     /// Starts a standby Gateway for `key` from the same program path (the operator has put
@@ -8757,7 +8898,7 @@ impl<C: Clock> Daemon<C> {
             .collect::<Vec<_>>();
         let mut error = None;
         for key in keys {
-            if let Err(e) = self.start_inner(&key, credentials, false) {
+            if let Err(e) = self.start_inner(&key, credentials, StartKind::Automatic) {
                 error.get_or_insert(e);
             }
         }
@@ -8782,14 +8923,14 @@ impl<C: Clock> Daemon<C> {
         key: &ShardKey,
         credentials: &impl CredentialSource,
     ) -> Result<(), DaemonError> {
-        self.start_inner(key, credentials, true)
+        self.start_inner(key, credentials, StartKind::Manual)
     }
 
     fn start_inner(
         &mut self,
         key: &ShardKey,
         credentials: &impl CredentialSource,
-        manual: bool,
+        kind: StartKind,
     ) -> Result<(), DaemonError> {
         self.now()?;
         if self.has_child(key) {
@@ -8815,10 +8956,10 @@ impl<C: Clock> Daemon<C> {
         self.recovery
             .hold(entry.recovery_key, false)
             .map_err(|_| DaemonError::InvalidState)?;
-        let result = self.poll_recovery(credentials, Some(key), manual);
+        let result = self.poll_recovery(credentials, Some(key), kind);
         let entry = &self.entries[key];
         let _ = self.recovery.hold(entry.recovery_key, entry.restart_held);
-        if manual
+        if kind == StartKind::Manual
             && matches!(
                 result,
                 Err(DaemonError::IdentifyDeferred | DaemonError::IdentifyUnavailable)
@@ -9022,7 +9163,7 @@ impl<C: Clock> Daemon<C> {
         &mut self,
         credentials: &impl CredentialSource,
         requested: Option<&ShardKey>,
-        manual: bool,
+        kind: StartKind,
     ) -> Result<(), DaemonError> {
         let mut first_error = self.now().err();
         #[cfg(unix)]
@@ -9059,7 +9200,8 @@ impl<C: Clock> Daemon<C> {
             credentials,
             instance: self.instance,
             sequence: &mut self.sequence,
-            manual: requested.filter(|_| manual),
+            manual: requested.filter(|_| kind != StartKind::Automatic),
+            reserved_restart: requested.filter(|_| kind == StartKind::Restart),
             now: self.last_now,
             local_identify: &mut self.local_identify,
             errors: BTreeMap::new(),
@@ -9181,7 +9323,7 @@ impl<C: Clock> Daemon<C> {
     /// Only ChildRecovery observes exits and schedules retries. OS liveness is
     /// distinct from authenticated Ready; this legacy wire cannot confirm Ready.
     pub fn poll(&mut self, credentials: &impl CredentialSource) -> Result<(), DaemonError> {
-        self.poll_recovery(credentials, None, false)
+        self.poll_recovery(credentials, None, StartKind::Automatic)
     }
 
     /// Cancellation-safe: retain the owned Child until poll reaps its exit.

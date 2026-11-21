@@ -83,6 +83,14 @@ impl LocalIdentifyAdmission {
     /// Decide and record a single grant. A standby also needs capacity for a
     /// subsequent fallback, which will request its own grant if needed.
     fn try_acquire_slots(&mut self, now: Duration, required_slots: usize) -> LocalAdmission {
+        let admission = self.check_slots(now, required_slots);
+        if admission == LocalAdmission::Granted {
+            self.push(now);
+        }
+        admission
+    }
+
+    fn check_slots(&mut self, now: Duration, required_slots: usize) -> LocalAdmission {
         self.prune(now);
         let capacity = (self.policy.max_per_window as usize).min(MAX_RECORDS);
         if required_slots > capacity {
@@ -111,7 +119,6 @@ impl LocalIdentifyAdmission {
                 retry_after: cooldown,
             };
         }
-        self.push(now);
         LocalAdmission::Granted
     }
 
@@ -154,13 +161,14 @@ impl LocalIdentifyAdmission {
 pub struct LocalIdentifyRegistry {
     policy: LocalIdentifyPolicy,
     bots: HashMap<String, LocalIdentifyAdmission>,
+    restart_slots: HashMap<String, usize>,
 }
 
 impl LocalIdentifyRegistry {
     pub fn with_policy(policy: LocalIdentifyPolicy) -> Self {
         Self {
             policy,
-            bots: HashMap::new(),
+            ..Self::default()
         }
     }
 
@@ -177,11 +185,70 @@ impl LocalIdentifyRegistry {
     }
 
     pub fn try_acquire(&mut self, bot_id: &str, now: Duration) -> LocalAdmission {
-        self.bot(bot_id).try_acquire(now)
+        self.try_acquire_slots(bot_id, now, 1)
     }
 
     pub(crate) fn try_acquire_standby(&mut self, bot_id: &str, now: Duration) -> LocalAdmission {
-        self.bot(bot_id).try_acquire_slots(now, 2)
+        self.try_acquire_slots(bot_id, now, 2)
+    }
+
+    fn try_acquire_slots(
+        &mut self,
+        bot_id: &str,
+        now: Duration,
+        required_slots: usize,
+    ) -> LocalAdmission {
+        if self.restart_slots.contains_key(bot_id) {
+            return LocalAdmission::Pending {
+                retry_after: Duration::ZERO,
+            };
+        }
+        self.bot(bot_id).try_acquire_slots(now, required_slots)
+    }
+
+    /// Reserve every replacement without recording a launch. The daemon is
+    /// the single owner, so it can reserve several Bots in one admission.
+    pub(crate) fn reserve_restart(
+        &mut self,
+        bot_id: &str,
+        now: Duration,
+        slots: usize,
+    ) -> LocalAdmission {
+        if self.restart_slots.contains_key(bot_id) {
+            return LocalAdmission::Pending {
+                retry_after: Duration::ZERO,
+            };
+        }
+        let admission = self.bot(bot_id).check_slots(now, slots);
+        if admission != LocalAdmission::Granted {
+            return admission;
+        }
+        if slots > 1 && !self.policy.min_interval.is_zero() {
+            return LocalAdmission::Pending {
+                retry_after: self.policy.min_interval,
+            };
+        }
+        self.restart_slots.insert(bot_id.to_owned(), slots);
+        LocalAdmission::Granted
+    }
+
+    /// Charge at the replacement's launch boundary, even if spawn then fails.
+    pub(crate) fn consume_restart(&mut self, bot_id: &str, now: Duration) {
+        let slots = self
+            .restart_slots
+            .get_mut(bot_id)
+            .expect("reserved restart");
+        *slots -= 1;
+        if *slots == 0 {
+            self.release_restart(bot_id);
+        }
+        let history = self.bot(bot_id);
+        history.prune(now);
+        history.push(now);
+    }
+
+    pub(crate) fn release_restart(&mut self, bot_id: &str) {
+        self.restart_slots.remove(bot_id);
     }
 
     #[cfg(test)]
@@ -196,6 +263,39 @@ mod tests {
 
     fn secs(s: u64) -> Duration {
         Duration::from_secs(s)
+    }
+
+    #[test]
+    fn restart_reservation_blocks_other_launches_until_release_or_consumption() {
+        let mut registry = LocalIdentifyRegistry::default();
+        assert_eq!(registry.try_acquire("A", secs(0)), LocalAdmission::Granted);
+        assert_eq!(
+            registry.reserve_restart("A", secs(30), 1),
+            LocalAdmission::Granted
+        );
+        assert!(matches!(
+            registry.try_acquire("A", secs(30)),
+            LocalAdmission::Pending { .. }
+        ));
+        assert!(matches!(
+            registry.try_acquire_standby("A", secs(30)),
+            LocalAdmission::Pending { .. }
+        ));
+        assert_eq!(registry.try_acquire("B", secs(30)), LocalAdmission::Granted);
+
+        registry.release_restart("A");
+        assert_eq!(
+            registry.reserve_restart("A", secs(30), 1),
+            LocalAdmission::Granted
+        );
+        registry.consume_restart("A", secs(60));
+        assert_eq!(
+            registry.try_acquire("A", secs(89)),
+            LocalAdmission::Pending {
+                retry_after: secs(1)
+            }
+        );
+        assert_eq!(registry.try_acquire("A", secs(90)), LocalAdmission::Granted);
     }
 
     #[test]

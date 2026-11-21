@@ -678,13 +678,26 @@ fn operation_state<'a>(value: &'a Value, id: &str, command: &str) -> Result<&'a 
     if operation["command"] == "core-restart" {
         return core_recovery_state(value);
     }
-    if !operation["bot_id"].is_string()
+    let valid_bot = if operation["command"] == "restart-all" {
+        operation.get("bot_id").is_some_and(Value::is_null)
+    } else {
+        operation["bot_id"].is_string()
+    };
+    if !valid_bot
         || operation["elapsed_ms"].as_u64().is_none()
         || !operation["shards"].is_array()
         || !operation["failed_shards"].is_array()
         || !matches!(
             operation["command"].as_str(),
-            Some("start" | "stop" | "restart" | "update" | "rollback" | "gateway-update")
+            Some(
+                "start"
+                    | "stop"
+                    | "restart"
+                    | "restart-all"
+                    | "update"
+                    | "rollback"
+                    | "gateway-update"
+            )
         )
     {
         return Err("daemon operation has no valid result metadata");
@@ -1323,11 +1336,21 @@ async fn run_all(options: Options) -> Value {
 // Keep the one-shot stdin capability alive for the complete batch; per-Bot calls
 // must neither reread stdin nor silently switch credentials between targets.
 async fn run_all_loaded(
-    options: Options,
+    mut options: Options,
     bootstrap: &Bootstrap,
     started: Instant,
     list_deadline: Instant,
 ) -> Value {
+    if options.command == "restart" && !options.all_dry_run {
+        // The daemon reserves the complete local batch in one request. It
+        // selects the live targets itself, so no listing can go stale.
+        options.command = "restart-all";
+        let deadline = Instant::now() + options.timeout;
+        let mut result = run_live(options, None, deadline, Some(bootstrap)).await;
+        result["all"] = json!(true);
+        result["command"] = json!("restart");
+        return result;
+    }
     let listing = Request {
         secret: &bootstrap.secret,
         command: "ps",
@@ -1424,7 +1447,7 @@ async fn run_live_inner(
 ) -> Value {
     let mutation = matches!(
         options.command,
-        "start" | "stop" | "restart" | "update" | "rollback" | "gateway-update"
+        "start" | "stop" | "restart" | "restart-all" | "update" | "rollback" | "gateway-update"
     );
     if mutation && options.operation_id.is_none() {
         options.operation_id = match new_operation_id() {
