@@ -94,7 +94,7 @@ sudo install -o root -g discord-rs -m 0640 src/examples/placement.toml /etc/disc
 `/etc/discord-rs/bots.toml` の書式は [運用ガイド](operator-guide.md) の例と
 `src/examples/placement.toml` を参照してください。`node.id` に一致する primary の Shard だけがそのホストで
 起動します。`bot_id` は u64 の正規 10 進文字列（Discord の ID。先頭ゼロや符号は不可）、`token_env` は Bot ごとに別名にします。
-同梱の Gateway（`src`）は、`--bot-id` が正規の数値でないと `invalid gateway launch arguments [launch_invalid]` で即座に終了します。botd はこれを事前に検出せず（`--gateway-program` は差し替え可能なため）、子が起動のたびに落ちて再起動を繰り返します。`status` の `processes` に `startup_failures` が増え続け、`state` が `Failed`（`ChildExited`、`code` 1）になっていたら、まず `bot_id` を確認してください。子の標準エラーは botd が破棄するので journald には出ません。
+同梱の Gateway（`src`）は、`--bot-id` が正規の数値でないと `invalid gateway launch arguments [launch_invalid]` で即座に終了します。botd はこれを事前に検出せず（`--gateway-program` は差し替え可能なため）、子が起動のたびに落ちて再起動を繰り返します。`status` の `processes` に `startup_failures` が増え続け、`state` が `Failed`（`ChildExited`、`code` 1）になっていたら、まず `bot_id` を確認してください。子の標準エラーは Shard の `gateway.log` で確認できます。ログを開けない場合のみ出力は破棄されます。
 編集後にオフライン検査します（daemon へ接続せず、token や Discord 接続は確認しません）。
 
 ```sh
@@ -311,7 +311,7 @@ journalctl --disk-usage                             # 容量確認
 | 直後に失敗して再起動を繰り返す | `StartLimitBurst` 超過で停止する。原因を直し `sudo systemctl reset-failed botd` の後に起動 |
 | env ファイル関連 | `/etc/discord-rs/botd.env` の存在・権限・変数名が `token_env` と一致するか。値が空でないか |
 | `Permission denied` | `/var/lib/discord-rs` の所有者 `discord-rs`・0700、`/opt` の実行権、`ProtectSystem=strict` で書込が必要な別パスがないか |
-| Gateway 子（`src`）が起動しない | `--gateway-program` が絶対パスの実行ファイルか。`ps -C src`。Gateway のログは保存されない（制約 3） |
+| Gateway 子（`src`）が起動しない | `--gateway-program` が絶対パスの実行ファイルか。`ps -C src`。Shard の `gateway.log` を確認する（制約 3） |
 | 再起動後に Bot が起動しない／重複起動拒否 | 予約が残り、その Shard の Gateway が `/proc` 上で生きている（または判定できない）場合に拒否される。生きていなければ botd が予約を自動削除して起動する（stderr に Shard キーと世代を 1 行出力）。孤児の再採用は未実装なので、`ps -C src` で孤児（Bot がオンラインのまま残った子）を確認し、運用者が整理する（運用ガイド「daemon終了時」）。unit の `--stop-children-on-exit` を使えば停止時に子も止まる |
 | Discord に接続できない | ネットワーク/DNS、token 失効、Intent 設定、Identify 制限。READY は botd では観測できないため、Discord 側の状態で確認する |
 | ファイル数不足 | `systemctl show botd -p LimitNOFILE`、`ls /proc/PID/fd | wc -l` |
