@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use src::daemon::control::{AUDIT_ACK_TIMEOUT, CommandRequest, ControlPlane, NOTE};
 use src::daemon::update_control::{ControlAccess, UpdateHub};
+use src::discord_message::NONCE_RETRY_FLAG;
 use src::{cluster::NodeId, cluster_runtime::RaftRuntimeOptions, raft_quorum::StorageMode};
 use src::{local_control::DaemonControlEnvelope, update_rollback::UpdateControlRequest};
 use std::{
@@ -22,7 +23,7 @@ use tokio::{
 const REQUEST_LIMIT: u64 = 4096;
 const RESPONSE_LIMIT: usize = 64 * 1024;
 const DEADLINE: Duration = Duration::from_secs(3);
-const USAGE: &str = "usage: botd --file F --runtime-root ABS --gateway-program ABS (--bootstrap-stdin | --secret-file ABS [--control-port PORT]) [--no-autostart] [--stop-children-on-exit] [--core-mode embedded|separate] [--mock-discord LOOPBACK_IP:PORT] [--allow-test-quorum] [--allow-raft-quorum --raft-store ABS --raft-rpc-listen LOOPBACK_IP:PORT --raft-rpc-peer ID=LOOPBACK_IP:PORT ... [--raft-create] [--raft-bootstrap]] [--allow-test-gateway-switch --mock-identify-budget F]";
+const USAGE: &str = "usage: botd --file F --runtime-root ABS --gateway-program ABS (--bootstrap-stdin | --secret-file ABS [--control-port PORT]) [--no-autostart] [--stop-children-on-exit] [--core-mode embedded|separate] [--enable-create-message-nonce-retry] [--mock-discord LOOPBACK_IP:PORT] [--allow-test-quorum] [--allow-raft-quorum --raft-store ABS --raft-rpc-listen LOOPBACK_IP:PORT --raft-rpc-peer ID=LOOPBACK_IP:PORT ... [--raft-create] [--raft-bootstrap]] [--allow-test-gateway-switch --mock-identify-budget F]";
 
 struct Options {
     file: PathBuf,
@@ -36,6 +37,7 @@ struct Options {
     core_status_allow_non_tmpfs: bool,
     core_status_interval_ms: Option<u64>,
     mock_discord: Option<SocketAddr>,
+    nonce_retry: bool,
     allow_test_quorum: bool,
     raft: Option<RaftRuntimeOptions>,
     allow_test_gateway_switch: bool,
@@ -58,6 +60,7 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
     let mut core_status_allow_non_tmpfs = false;
     let mut core_status_interval_ms = None;
     let mut mock_discord = None;
+    let mut nonce_retry = false;
     let mut allow_test_quorum = false;
     let mut allow_raft_quorum = false;
     let mut raft_store = None;
@@ -72,6 +75,10 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
     let mut control_port = None;
     while let Some(arg) = args.next() {
         let target = match arg.to_str() {
+            Some(NONCE_RETRY_FLAG) if cfg!(target_os = "linux") && !nonce_retry => {
+                nonce_retry = true;
+                continue;
+            }
             Some("--core-status-dir") if core_status_dir.is_none() => &mut core_status_dir,
             // Test overrides must be rejected by release binaries.
             Some("--core-status-allow-non-tmpfs")
@@ -209,6 +216,9 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
         }
         *target = Some(PathBuf::from(value));
     }
+    if nonce_retry && mock_discord.is_some() {
+        return Err("Create Message nonce retry requires live Discord");
+    }
     let raft = if allow_raft_quorum {
         if mock_discord.is_none() {
             return Err("Raft quorum requires --mock-discord; production is disabled");
@@ -267,6 +277,7 @@ fn parse_options(args: impl IntoIterator<Item = OsString>) -> Result<Options, &'
         core_status_allow_non_tmpfs,
         core_status_interval_ms,
         mock_discord,
+        nonce_retry,
         allow_test_quorum,
         raft,
         allow_test_gateway_switch,
@@ -775,6 +786,11 @@ async fn run() -> Result<(), &'static str> {
     daemon
         .set_gateway_program(&options.gateway_program)
         .map_err(|_| "invalid gateway program")?;
+    if options.nonce_retry {
+        daemon
+            .enable_create_message_nonce_retry()
+            .map_err(|_| "cannot configure Create Message nonce retry")?;
+    }
     #[cfg(unix)]
     if options.separate_cores {
         daemon
@@ -1969,5 +1985,24 @@ mod tests {
         let (_client, server) = duplex(128);
         let result = read_bootstrap(server).await;
         assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::TimedOut));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nonce_retry_flag_is_off_by_default_and_live_only() {
+        assert!(!parse_options(options(&[])).unwrap().nonce_retry);
+        assert!(
+            parse_options(options(&[NONCE_RETRY_FLAG]))
+                .unwrap()
+                .nonce_retry
+        );
+        assert!(
+            parse_options(options(&[
+                NONCE_RETRY_FLAG,
+                "--mock-discord",
+                "127.0.0.1:8000"
+            ]))
+            .is_err()
+        );
     }
 }

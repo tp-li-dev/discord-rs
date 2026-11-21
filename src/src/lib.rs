@@ -14,6 +14,7 @@ pub mod core_status;
 pub mod core_units;
 pub mod daemon;
 pub mod daemon_metrics;
+pub mod discord_message;
 pub mod drain;
 pub mod durable_jobs;
 pub mod event_seq;
