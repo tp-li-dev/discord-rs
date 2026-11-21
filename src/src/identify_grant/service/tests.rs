@@ -434,26 +434,52 @@ fn torn_tail_and_corrupt_complete_record_both_fail_closed() {
     assert!(root.budget(BOOT, 3601, 1).is_err());
 }
 
-#[test]
-fn missing_final_delimiter_preserves_an_acknowledged_reidentify_charge() {
+#[tokio::test]
+async fn missing_final_delimiter_preserves_an_acknowledged_reidentify_charge() {
     let root = Root::new();
     let active = gateway(0, 1);
-    {
-        // Budget without an async writer returns the permit only after sync_all.
-        let mut budget = root.budget(BOOT, 0, 2).unwrap();
-        assert_eq!(
-            budget.launch(active.clone(), secs(0), 1),
-            LocalAdmission::Granted
+    let policy = LocalIdentifyPolicy {
+        min_interval: Duration::ZERO,
+        max_per_window: 2,
+        ..Default::default()
+    };
+    let budget = Budget::open(&root.0, BOOT, boot_now().unwrap(), policy).unwrap();
+    let mut service = Service::with_writer(budget, || {}).unwrap();
+    let launch = |service: &mut Service| {
+        service.launch(&active.key, active.generation.clone(), false, false)
+    };
+    assert!(launch(&mut service).is_err());
+    assert!(service.wait_for_write());
+    assert_eq!(launch(&mut service).unwrap(), LocalAdmission::Granted);
+    let mut gateway_socket = service
+        .attach(
+            &mut Command::new("/bin/true"),
+            &active.key,
+            active.generation,
+            false,
+        )
+        .unwrap();
+    gateway_socket.set_read_timeout(Some(secs(1))).unwrap();
+    let mut request = || {
+        gateway_socket.write_all(&[VERSION]).unwrap();
+        service.poll(|_| (false, false));
+        assert!(
+            service.wait_for_write(),
+            "request did not submit a durable grant"
         );
-        assert!(matches!(
-            budget.identify(&active, secs(0), true, false, false),
-            (State::Granted, Reply::Permit(_))
-        ));
-        assert!(matches!(
-            budget.identify(&active, secs(32), false, false, false),
-            (State::Granted, Reply::Permit(_))
-        ));
+        let mut bytes = [0; 10];
+        gateway_socket.read_exact(&mut bytes).unwrap();
+        let Reply::Permit(expires) = Reply::decode(bytes) else {
+            panic!("expected a permit after the writer acknowledged the grant");
+        };
+        Duration::from_nanos(expires)
+    };
+    let first_expiry = request();
+    while let Some(remaining) = first_expiry.checked_sub(boot_now().unwrap()) {
+        tokio::time::sleep(remaining + Duration::from_millis(1)).await;
     }
+    request();
+    drop(service);
     let original = std::fs::read(root.path()).unwrap();
     let without_delimiter = original.strip_suffix(b"\n").unwrap();
     let last = without_delimiter.rsplit(|&b| b == b'\n').next().unwrap();
@@ -465,10 +491,22 @@ fn missing_final_delimiter_preserves_an_acknowledged_reidentify_charge() {
         }
     ));
     std::fs::write(root.path(), without_delimiter).unwrap();
-    let mut budget = root.budget(BOOT, 33, 2).unwrap();
+    let mut budget = tokio::time::timeout(secs(2), async {
+        loop {
+            match Budget::open(&root.0, BOOT, boot_now().unwrap(), policy) {
+                // The detached writer can still be releasing its cloned file lock.
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                result => break result.unwrap(),
+            }
+        }
+    })
+    .await
+    .unwrap();
     assert_eq!(std::fs::read(root.path()).unwrap(), original);
     assert!(matches!(
-        budget.check("42", secs(33), 1),
+        budget.check("42", boot_now().unwrap(), 1),
         LocalAdmission::Exhausted { .. }
     ));
 }

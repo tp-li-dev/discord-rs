@@ -235,6 +235,12 @@ impl Budget {
             }
             budget.replay(record)?;
         }
+        let same_boot = budget.boot.as_deref() == Some(boot);
+        if same_boot {
+            budget.observe(now)?;
+        } else if !valid_boot_id(boot) {
+            return Err(invalid_journal());
+        }
         if needs_delimiter {
             // A missing delimiter can follow an already acknowledged grant.
             // Only repair after verifying the entire file, including that record.
@@ -245,12 +251,7 @@ impl Budget {
             budget.journal.sync_all()?;
             budget.len += 1;
         }
-        if budget.boot.as_deref() == Some(boot) {
-            budget.observe(now)?;
-        } else {
-            if !valid_boot_id(boot) {
-                return Err(invalid_journal());
-            }
+        if !same_boot {
             let hold_until_ns = nanos(budget.boot_hold_until(now));
             budget.append(
                 now,
