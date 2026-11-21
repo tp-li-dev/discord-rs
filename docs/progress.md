@@ -710,3 +710,7 @@ Linux と GitHub Actions での実行確認、実 Discord での接続・登録�
 - 稼働中の Gateway は無効なセッションを受けた後、同じプロセス世代で再 Identify できる。上記の Oracle 観測で世代数が変わらなかったことから、追加の Identify がなかったとは判断できない。該当する観測区間の Identify 回数は不明。
 - 上記 77 時間の「すべて OK」は当時の出力。現在の `soak-diff.sh` は切断ログの増加を WATCH と判定するため、`closes` 27→56 は **WATCH** になる。
 - 当時の `worker_unavailable` は `unavailable` を含む全行の集計だった。現行のスナップショットでは Worker の診断と Identify 送信許可チャネルの失敗をそれぞれ数える。
+
+## 2026-11-21 静的セキュリティスキャンの結果を受領
+- ユーザーが提供した Codex Security のスキャン結果（リビジョン `5b60670` 対象、6 件：高 1、中 4、低 1）を、`docs/security-scan-2026-11-21.md` に要約した。**最優先は高の #2（管理用の秘密を、サーバーの確認前に、固定ポートへ送る）。** `work/ctl`（相互の challenge-response、認証前の枠の分離）と `work/buildenv`（旧式ビルドの環境の遮断）を Sol に依頼した。#4（結果不明の解消操作）と #5（REST 予算の統合）は、管理経路の変更が入ってから着手する。#3（実験用の Raft）は既知の制約。
+- 同日の Astra の大規模監査（12 件）の指摘のうち、token がログに出得る問題（環境変数名 `LD_PRELOAD` など）は `work/fixa` で修正済み（main に統合）。確認の監査を実行中。
