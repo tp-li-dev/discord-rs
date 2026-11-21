@@ -32,6 +32,9 @@ jobs:
         working-directory: src
     steps:
       - uses: actions/checkout@v4
+      - name: Check documented botd ExecStart overrides
+        working-directory: .
+        run: python3 .github/scripts/check-botd-execstart.py
       - uses: dtolnay/rust-toolchain@1.90.0
         with:
           components: rustfmt
