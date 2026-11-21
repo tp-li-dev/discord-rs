@@ -7224,6 +7224,31 @@ pub mod control {
             }
 
             #[tokio::test]
+            async fn launch_rejects_a_denied_reference_even_after_spec_validation() {
+                let (mut plane, _) = fixture(1, 1, 10);
+                let key = key(0, 0);
+                // Emulate an invalid runtime spec reaching the launch boundary
+                // after the normal planner and daemon validation have run.
+                plane
+                    .daemon
+                    .entries
+                    .get_mut(&key)
+                    .unwrap()
+                    .spec
+                    .gateway
+                    .environment
+                    .credential_refs[0] = "LD_PRELOAD".into();
+                let forbidden_read = |_: &str| -> Option<OsString> {
+                    panic!("launch read an invalid credential reference")
+                };
+                assert_eq!(
+                    plane.daemon.start(&key, &forbidden_read),
+                    Err(DaemonError::InvalidSpec)
+                );
+                assert!(!plane.daemon.has_child(&key));
+            }
+
+            #[tokio::test]
             async fn recovery_pass_stall_does_not_backdate_the_next_identify_launch() {
                 use std::sync::Arc;
                 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -9898,6 +9923,7 @@ impl<C: Clock> Daemon<C> {
                 DaemonError::ReservationExists
                     | DaemonError::ReservationIo
                     | DaemonError::InvalidProgram
+                    | DaemonError::InvalidSpec
                     | DaemonError::NoRuntime
                     | DaemonError::GenerationExhausted
                     | DaemonError::TimeOverflow

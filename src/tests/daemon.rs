@@ -1111,7 +1111,7 @@ fn configuration_rejects_a_credential_alias_even_for_a_nonlocal_bot() {
     other.name = "second".into();
     other.bot_id = "B".into();
     other.application_id = "2".into();
-    other.token_env = "token_a".into();
+    other.token_env = "TOKEN_A".into();
     for p in &mut other.shard_placement {
         p.primary = "elsewhere".into();
     }

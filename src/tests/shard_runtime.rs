@@ -204,8 +204,8 @@ fn invalid_and_ambiguous_inputs_fail_without_echoing_input() {
         );
     }
     assert!(plan(&[valid.clone(), valid.clone()], &root()).is_err());
-    assert!(plan(&[valid.clone(), intent("B", 0, "a_token")], &root()).is_err());
-    assert!(plan(&[valid.clone(), intent("A", 1, "OTHER")], &root()).is_err());
+    assert!(plan(&[valid.clone(), intent("B", 0, "A_TOKEN")], &root()).is_err());
+    assert!(plan(&[valid.clone(), intent("A", 1, "OTHER_TOKEN")], &root()).is_err());
     let mut other = intent("A", 1, "A_TOKEN");
     other.total_shards = 3;
     assert!(plan(&[valid.clone(), other], &root()).is_err());
