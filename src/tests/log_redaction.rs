@@ -127,6 +127,12 @@ fn management_reply_errors_and_log_display_are_masked() {
         serde_json::to_vec(&serde_json::json!({"port":port,"secret":admin})).unwrap(),
     )
     .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.join("core.json"), std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+    }
     let server = std::thread::spawn(move || {
         for ok in [true, false] {
             let (socket, _) = listener.accept().unwrap();
