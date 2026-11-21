@@ -1,6 +1,76 @@
 #!/usr/bin/env bash
 # Check separate-mode shards on Ubuntu; run as root.
 # Use botctl and the running botd from the same release.
+
+update_reply() {
+  python3 -c '
+import json, re, sys
+try:
+    reply = json.load(sys.stdin)
+except ValueError:
+    sys.exit()
+if not isinstance(reply, dict):
+    sys.exit()
+op = reply.get("operation")
+op_id = reply.get("operation_id")
+if not isinstance(op_id, str) or not re.fullmatch(r"[a-f0-9]{32}", op_id):
+    op_id = ""
+state = ""
+reason = reply.get("error")
+if (op_id and isinstance(op, dict)
+        and op.get("operation_id") == op_id and op.get("command") == "gateway-update"):
+    op_state = op.get("state")
+    if op_state in ("running", "failed") or (op_state == "succeeded" and reply.get("ok") is True):
+        state = op_state
+        reason = op.get("waiting_reason") or reason
+        if not reason and state == "failed" and isinstance(op.get("shards"), list):
+            reason = next((row["error"] for row in op["shards"]
+                           if isinstance(row, dict) and row.get("error")), None)
+print(op_id)
+print(state)
+print("unknown" if reply.get("ok") is False and reply.get("outcome_unknown") is True else "")
+print(reason if isinstance(reason, str) else "")
+'
+}
+
+check_gateway_update() {
+  local round=$1
+  shift
+  local start=$SECONDS initial response state reason
+  local -a fields=()
+  initial=$(ctl "$@") || :
+  mapfile -t fields < <(update_reply <<< "$initial")
+  id=${fields[0]:-}
+  state=${fields[1]:-}
+  reason=$(printf '%s\n' "${fields[@]:3}")
+
+  if [ -z "$state" ] && { [ -z "$id" ] || [ "${fields[2]:-}" != unknown ]; }; then
+    record FAIL "R$round update" "${reason:-no confirmed operation or queryable outcome}"
+    return 1
+  fi
+
+  while [ $((SECONDS-start)) -lt 310 ] && [ "$state" != succeeded ] && [ "$state" != failed ]; do
+    response=$(ctl operation "$id") || :
+    mapfile -t fields < <(update_reply <<< "$response")
+    if [ "${fields[0]:-}" = "$id" ] && [ -n "${fields[1]:-}" ]; then
+      state=${fields[1]}
+      reason=$(printf '%s\n' "${fields[@]:3}")
+    fi
+    case "$state" in succeeded|failed) break;; esac
+    sleep 0.5
+  done
+  echo "Operation elapsed: $((SECONDS-start)) s"
+  if [ "$state" = succeeded ]; then
+    record PASS "R$round update" 'operation succeeded'
+  else
+    record FAIL "R$round update" "operation state: ${state:-unknown}${reason:+ ($reason)}"
+  fi
+  return 0
+}
+
+# Let the self-test exercise the update request and polling without live processes.
+if [[ ${BASH_SOURCE[0]} != "$0" ]]; then return 0; fi
+
 set -u
 set -o pipefail
 USER_NAME=discord-rs
@@ -152,33 +222,9 @@ for ((round=1; round<=repeat; round++)); do
     break
   fi
   before_warnings=$(warnings) || before_warnings=unknown
-  start=$SECONDS
   update_args=(gateway-update "$bot")
   [ "$shard_given" -eq 0 ] || update_args+=(--shard "$selected_shard")
-  response=$(ctl "${update_args[@]}") || :
-  id=$(json_string operation_id "$response")
-  state=unknown
-  if [[ "$id" =~ ^[a-fA-F0-9]{32}$ ]]; then
-    state=$(json_string state "$response" | tr '[:upper:]' '[:lower:]')
-    while [ $((SECONDS-start)) -lt 310 ] && [ "$state" != succeeded ] && [ "$state" != failed ]; do
-      response=$(ctl operation "$id") || :
-      state=$(json_string state "$response" | tr '[:upper:]' '[:lower:]')
-      case "$state" in succeeded|failed) break;; esac
-      sleep 0.5
-    done
-  fi
-  echo "Operation elapsed: $((SECONDS-start)) s"
-  if [ "$state" = succeeded ]; then
-    record PASS "R$round update" 'operation succeeded'
-  else
-    reason=$(json_string error "$response")
-    case "$reason" in
-      IdentifyDeferred|IdentifyUnavailable) ;;
-      *) reason=$(json_string waiting_reason "$response")
-         [ "$reason" = IdentifyBudget ] || reason= ;;
-    esac
-    record FAIL "R$round update" "operation state: ${state:-unknown}${reason:+ ($reason)}"
-  fi
+  check_gateway_update "$round" "${update_args[@]}" || break
   # The old Gateway is asked to exit after the hand-over and is killed after 30 s: wait for it
   # to be gone before taking the "after" snapshot, so the new Gateway cannot be mistaken for it.
   deadline=$((SECONDS+40))
