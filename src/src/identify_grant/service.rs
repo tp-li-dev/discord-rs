@@ -14,6 +14,9 @@ use std::{
 };
 use tokio::process::Command;
 
+#[cfg(test)]
+mod tests;
+
 const JOURNAL_NAME: &str = "identify-send-grants.jsonl";
 const MAX_JOURNAL: u64 = 16 * 1024 * 1024;
 const MAX_LINE: usize = 4096;
@@ -83,7 +86,7 @@ impl Budget {
         now: Duration,
         policy: LocalIdentifyPolicy,
     ) -> io::Result<Self> {
-        std::fs::create_dir_all(root)?;
+        create_runtime_root(root)?;
         let mut journal = crate::core_units::open_append_private(&root.join(JOURNAL_NAME))?;
         // One service per journal, including while verifying and repairing it.
         if unsafe { libc::flock(journal.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
@@ -184,12 +187,13 @@ impl Budget {
     }
 
     fn launch(&mut self, gateway: Gateway, now: Duration, slots: usize) -> LocalAdmission {
-        match self.check(&gateway.key.bot_id, now, slots) {
-            LocalAdmission::Granted if self.append(now, Action::Launch { gateway }).is_err() => {
-                UNAVAILABLE
-            }
-            result => result,
+        let admission = self.check(&gateway.key.bot_id, now, slots);
+        if admission == LocalAdmission::Granted
+            && self.append(now, Action::Launch { gateway }).is_err()
+        {
+            return UNAVAILABLE;
         }
+        admission
     }
 
     fn identify(
@@ -201,6 +205,9 @@ impl Budget {
         fallback_reserved: bool,
     ) -> (State, Reply) {
         let admission = self.available(now);
+        if self.failed {
+            return (State::Unavailable, Reply::Unavailable);
+        }
         if admission != LocalAdmission::Granted {
             return denial(admission);
         }
@@ -224,7 +231,7 @@ impl Budget {
             converts_launch,
         };
         if self.append(now, action).is_err() {
-            return denial(UNAVAILABLE);
+            return (State::Unavailable, Reply::Unavailable);
         }
         (State::Granted, Reply::Permit(expires_ns))
     }
@@ -314,9 +321,25 @@ fn invalid_journal() -> io::Error {
     io::Error::other("invalid Identify grant journal")
 }
 
+fn create_runtime_root(root: &Path) -> io::Result<()> {
+    let mut missing = Vec::new();
+    for path in root.ancestors() {
+        match path.metadata() {
+            Ok(_) => break,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => missing.push(path),
+            Err(error) => return Err(error),
+        }
+    }
+    std::fs::create_dir_all(root)?;
+    // If this invocation created directories, persist their entries too.
+    for path in missing {
+        File::open(path.parent().ok_or_else(invalid_journal)?)?.sync_all()?;
+    }
+    Ok(())
+}
+
 fn denial(admission: LocalAdmission) -> (State, Reply) {
     match admission {
-        UNAVAILABLE => (State::Unavailable, Reply::Unavailable),
         LocalAdmission::Pending { retry_after } => {
             (State::Waiting, Reply::Wait(nanos(retry_after)))
         }
@@ -462,7 +485,7 @@ impl Service {
                 Ok(now) => budget.identify(&peer.gateway, now, peer.first, restart, fallback),
                 Err(_) => {
                     budget.failed = true;
-                    denial(UNAVAILABLE)
+                    (State::Unavailable, Reply::Unavailable)
                 }
             };
             peer.state = state;

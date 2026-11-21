@@ -24,7 +24,7 @@ use tokio::{
 use twilight_gateway::{
     ConfigBuilder, Event, EventTypeFlags, Intents, Shard, ShardId, StreamExt as _,
 };
-use twilight_gateway_queue::InMemoryQueue;
+use twilight_gateway_queue::{InMemoryQueue, Queue};
 use twilight_http::Client;
 use twilight_model::gateway::SessionStartLimit;
 use twilight_model::{
@@ -1214,7 +1214,7 @@ enum GatewayQueue {
     Managed(src::identify_grant::GrantQueue),
 }
 
-impl twilight_gateway_queue::Queue for GatewayQueue {
+impl Queue for GatewayQueue {
     fn enqueue(&self, shard: u32) -> oneshot::Receiver<()> {
         match self {
             Self::Local(queue) => queue.enqueue(shard),

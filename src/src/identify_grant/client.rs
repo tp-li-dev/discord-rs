@@ -145,3 +145,22 @@ async fn exchange(socket: &mut UnixStream) -> io::Result<Reply> {
     socket.read_exact(&mut bytes).await?;
     Ok(Reply::decode(bytes))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_permit_is_single_use_and_expired_permits_are_refused_at_the_sink() {
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let queue = GrantQueue::new(InMemoryQueue::default(), socket, 0);
+        let now = boot_now().unwrap();
+        queue
+            .deadline
+            .store(nanos(now + Duration::from_secs(10)), Ordering::Release);
+        assert!(queue.take_permit());
+        assert!(!queue.take_permit());
+        queue.deadline.store(nanos(now), Ordering::Release);
+        assert!(!queue.take_permit());
+    }
+}
