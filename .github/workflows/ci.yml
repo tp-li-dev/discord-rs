@@ -80,9 +80,11 @@ jobs:
         run: cargo fetch --locked
       - name: Check vendored twilight-gateway
         if: matrix.shard == 'rest'
+        env:
+          CARGO_HOME: ${{ runner.temp }}/vendor-check-cargo
         run: |
           version=$(bash deploy/dev/check-vendor.sh --version)
-          # The workspace patch is a path dependency, so cargo fetch does not cache its crates.io archive.
+          # Fetch the reference archive separately from the test dependency cache.
           (cd "$RUNNER_TEMP" && cargo info --registry crates-io "twilight-gateway@$version")
           bash deploy/dev/check-vendor.sh --offline
       - name: Test shard
