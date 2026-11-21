@@ -262,7 +262,12 @@ impl LocalIdentifyRegistry {
                     retry_after: Duration::ZERO,
                 };
             }
-            let admission = service.launch(key, _generation, if standby { 2 } else { 1 });
+            let admission = service.launch(
+                key,
+                _generation,
+                if standby { 2 } else { 1 },
+                reserved_restart,
+            );
             if admission == LocalAdmission::Granted && reserved_restart {
                 self.take_restart_slot(bot);
             }

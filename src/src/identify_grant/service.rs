@@ -5,7 +5,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::File,
     io::{self, Read, Write},
     os::{fd::AsRawFd, unix::net::UnixStream},
@@ -20,6 +20,7 @@ mod tests;
 const JOURNAL_NAME: &str = "identify-send-grants.jsonl";
 const MAX_JOURNAL: u64 = 16 * 1024 * 1024;
 const MAX_LINE: usize = 4096;
+const RECORD_SPACE: u64 = MAX_LINE as u64 + 1;
 const JOURNAL_VERSION: u8 = 2;
 const UNAVAILABLE: LocalAdmission = LocalAdmission::Exhausted {
     retry_after: Duration::MAX,
@@ -91,6 +92,9 @@ enum Action {
 struct Budget {
     journal: File,
     len: u64,
+    limit: u64,
+    restart_space: HashSet<ShardKey>,
+    first_grant_space: HashMap<ShardKey, LaunchGeneration>,
     policy: LocalIdentifyPolicy,
     history: HashMap<String, LocalIdentifyAdmission>,
     boot: Option<String>,
@@ -124,6 +128,9 @@ impl Budget {
         let mut budget = Self {
             journal,
             len: complete as u64,
+            limit: MAX_JOURNAL,
+            restart_space: HashSet::new(),
+            first_grant_space: HashMap::new(),
             policy,
             history: HashMap::new(),
             boot: None,
@@ -209,14 +216,58 @@ impl Budget {
         }
     }
 
+    fn unreserved_bytes(&self) -> u64 {
+        let records = 2 * self.restart_space.len() + self.first_grant_space.len();
+        self.limit
+            .saturating_sub(self.len + RECORD_SPACE * records as u64)
+    }
+
+    fn reserve_restart_space(&mut self, targets: &[ShardKey]) -> bool {
+        if self.failed
+            || self.unreserved_bytes() < 2 * RECORD_SPACE * targets.len() as u64
+            || targets.iter().any(|key| self.restart_space.contains(key))
+        {
+            return false;
+        }
+        self.restart_space.extend(targets.iter().cloned());
+        true
+    }
+
+    #[cfg(test)]
     fn launch(&mut self, gateway: Gateway, now: Duration, slots: usize) -> LocalAdmission {
+        self.launch_with_reservation(gateway, now, slots, false)
+    }
+
+    fn launch_with_reservation(
+        &mut self,
+        gateway: Gateway,
+        now: Duration,
+        slots: usize,
+        reserved_restart: bool,
+    ) -> LocalAdmission {
         let admission = self.check(&gateway.key.bot_id, now, slots);
-        if admission == LocalAdmission::Granted
-            && self.append(now, Action::Launch { gateway }).is_err()
+        if admission != LocalAdmission::Granted {
+            return admission;
+        }
+        if reserved_restart && !self.restart_space.remove(&gateway.key) {
+            return UNAVAILABLE;
+        }
+        if self
+            .append(
+                now,
+                Action::Launch {
+                    gateway: gateway.clone(),
+                },
+            )
+            .is_err()
         {
             return UNAVAILABLE;
         }
-        admission
+        if reserved_restart {
+            self.first_grant_space
+                .insert(gateway.key, gateway.generation);
+        }
+        LocalAdmission::Granted
     }
 
     fn identify(
@@ -253,26 +304,34 @@ impl Budget {
             expires_ns,
             converts_launch,
         };
+        self.release_first_grant_space(&gateway.key, &gateway.generation);
         if self.append(now, action).is_err() {
             return (State::Unavailable, Reply::Unavailable);
         }
         (State::Granted, Reply::Permit(expires_ns))
     }
 
+    fn release_first_grant_space(&mut self, key: &ShardKey, generation: &LaunchGeneration) {
+        if self.first_grant_space.get(key) == Some(generation) {
+            self.first_grant_space.remove(key);
+        }
+    }
+
     fn append(&mut self, at: Duration, action: Action) -> io::Result<()> {
+        let mut record = Record {
+            version: JOURNAL_VERSION,
+            at_ns: nanos(at),
+            action,
+            sha256: String::new(),
+        };
+        record.sha256 = record.checksum()?;
+        let mut bytes = serde_json::to_vec(&record)?;
+        if bytes.len() > MAX_LINE || bytes.len() as u64 + 1 > self.unreserved_bytes() {
+            // Full unreserved space must not disable another Bot's reserved writes.
+            return Err(io::Error::other("Identify grant journal full"));
+        }
+        bytes.push(b'\n');
         let result = (|| {
-            let mut record = Record {
-                version: JOURNAL_VERSION,
-                at_ns: nanos(at),
-                action,
-                sha256: String::new(),
-            };
-            record.sha256 = record.checksum()?;
-            let mut bytes = serde_json::to_vec(&record)?;
-            if bytes.len() > MAX_LINE || self.len + bytes.len() as u64 + 1 > MAX_JOURNAL {
-                return Err(io::Error::other("Identify grant journal full"));
-            }
-            bytes.push(b'\n');
             self.journal.write_all(&bytes)?;
             self.journal.sync_all()?;
             self.len += bytes.len() as u64;
@@ -406,18 +465,43 @@ impl Service {
         key: &ShardKey,
         generation: LaunchGeneration,
         slots: usize,
+        reserved_restart: bool,
     ) -> LocalAdmission {
         let Some(now) = self.observe_clock() else {
             return UNAVAILABLE;
         };
-        self.budget.launch(
+        self.budget.launch_with_reservation(
             Gateway {
                 key: key.clone(),
                 generation,
             },
             now,
             slots,
+            reserved_restart,
         )
+    }
+
+    pub(crate) fn reserve_restart_space(&mut self, targets: &[ShardKey]) -> bool {
+        self.budget.reserve_restart_space(targets)
+    }
+
+    pub(crate) fn release_restart_space(&mut self, targets: &[ShardKey]) {
+        for key in targets {
+            self.budget.restart_space.remove(key);
+        }
+    }
+
+    pub(crate) fn release_first_grant_space(
+        &mut self,
+        key: &ShardKey,
+        generation: &LaunchGeneration,
+    ) {
+        self.budget.release_first_grant_space(key, generation);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn limit_journal_remaining(&mut self, records: u64) {
+        self.budget.limit = self.budget.len + RECORD_SPACE * records;
     }
 
     fn observe_clock(&mut self) -> Option<Duration> {
@@ -472,6 +556,8 @@ impl Service {
                 peer.standby = false;
                 true
             } else {
+                self.budget
+                    .release_first_grant_space(&peer.gateway.key, &peer.gateway.generation);
                 false
             }
         });
@@ -500,7 +586,10 @@ impl Service {
                 {
                     return true;
                 }
-                _ => return false,
+                _ => {
+                    budget.release_first_grant_space(&peer.gateway.key, &peer.gateway.generation);
+                    return false;
+                }
             }
             let (restart, fallback) = reservations(&peer.gateway.key.bot_id);
             let (state, reply) = match now() {
@@ -514,7 +603,12 @@ impl Service {
             if state == State::Granted {
                 peer.first = false;
             }
-            peer.socket.write_all(&reply.encode()).is_ok() && state != State::Unavailable
+            let keep =
+                peer.socket.write_all(&reply.encode()).is_ok() && state != State::Unavailable;
+            if !keep {
+                budget.release_first_grant_space(&peer.gateway.key, &peer.gateway.generation);
+            }
+            keep
         });
     }
 

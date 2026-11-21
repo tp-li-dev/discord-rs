@@ -7213,6 +7213,107 @@ pub mod control {
             }
 
             #[tokio::test]
+            async fn lifetime_restart_limit_refuses_restart_and_restart_all_before_any_stop() {
+                let (mut plane, time) = fixture(2, 1, 10);
+                let first = key(0, 0);
+                let limited = key(1, 0);
+                plane.daemon.start(&first, &credentials).unwrap();
+                plane.daemon.start(&limited, &credentials).unwrap();
+                let max = RestartPolicy::default().max_restarts as usize;
+                for attempt in 1..=max {
+                    time.send_replace(Duration::from_secs(31 * attempt as u64));
+                    assert_eq!(plane.request(&request("restart", 1, attempt))["ok"], true);
+                    assert_eq!(
+                        complete(&mut plane, attempt).await["operation"]["state"],
+                        "succeeded"
+                    );
+                }
+                let state = plane
+                    .daemon
+                    .recovery
+                    .snapshot(plane.daemon.entries[&limited].recovery_key)
+                    .unwrap();
+                assert_eq!(state.restart.restarts as usize, max);
+                let pids = [running_pid(&plane, &first), running_pid(&plane, &limited)];
+                time.send_replace(Duration::from_secs(3600));
+
+                assert_eq!(
+                    plane.request(&request("restart", 1, 100))["error"],
+                    "RestartBudget"
+                );
+                assert_eq!(plane.request(&restart_all(101))["error"], "RestartBudget");
+                plane.tick(&credentials).await;
+                assert_eq!(plane.operations.len(), max);
+                assert!(
+                    plane
+                        .daemon
+                        .entries
+                        .values()
+                        .all(|entry| !entry.restart_held)
+                );
+                assert_eq!(
+                    [running_pid(&plane, &first), running_pid(&plane, &limited)],
+                    pids
+                );
+                cleanup(&mut plane).await;
+            }
+
+            #[cfg(target_os = "linux")]
+            #[tokio::test]
+            async fn restart_all_refuses_when_only_one_replacement_fits_in_the_journal() {
+                let (mut plane, _) = fixture(2, 1, 10);
+                plane.daemon.set_local_identify_policy(LocalIdentifyPolicy {
+                    min_interval: Duration::ZERO,
+                    ..Default::default()
+                });
+                let root =
+                    std::env::temp_dir().join(format!("igr-r-{:016x}", getrandom::u64().unwrap()));
+                plane.daemon.enable_identify_send_grants(&root).unwrap();
+                let first = key(0, 0);
+                let second = key(1, 0);
+                plane.daemon.start(&first, &credentials).unwrap();
+                plane.daemon.start(&second, &credentials).unwrap();
+                let pids = [running_pid(&plane, &first), running_pid(&plane, &second)];
+                plane
+                    .daemon
+                    .local_identify
+                    .send_grants
+                    .as_mut()
+                    .unwrap()
+                    .limit_journal_remaining(2);
+
+                assert_eq!(
+                    plane.request(&restart_all(1))["error"],
+                    "IdentifyUnavailable"
+                );
+                plane.tick(&credentials).await;
+                assert!(plane.operations.is_empty());
+                assert!(
+                    plane
+                        .daemon
+                        .entries
+                        .values()
+                        .all(|entry| !entry.restart_held)
+                );
+                assert_eq!(
+                    [running_pid(&plane, &first), running_pid(&plane, &second)],
+                    pids
+                );
+
+                // The denial rolled back both Bots' reservations. One replacement fits.
+                assert_eq!(plane.request(&request("restart", 0, 2))["ok"], true);
+                assert_eq!(
+                    complete(&mut plane, 2).await["operation"]["state"],
+                    "succeeded"
+                );
+                assert_ne!(running_pid(&plane, &first), pids[0]);
+                assert_eq!(running_pid(&plane, &second), pids[1]);
+                cleanup(&mut plane).await;
+                drop(plane);
+                std::fs::remove_dir_all(root).unwrap();
+            }
+
+            #[tokio::test]
             async fn manual_restart_reports_identify_exhaustion_and_leaves_no_retry() {
                 let (mut plane, time) = fixture(1, 1, 1);
                 let key = key(0, 0);
@@ -7912,6 +8013,8 @@ pub enum DaemonError {
     InvalidState,
     IdentifyDeferred,
     IdentifyUnavailable,
+    RestartBudget,
+    RestartDeferred,
     NoRuntime,
     MissingCredential,
     MissingSystemEnvironment,
@@ -8322,11 +8425,17 @@ impl<S: CredentialSource> RecoveryHost for ProcessRecoveryHost<'_, S> {
             Ok(child) => Ok(child),
             Err(error) => {
                 #[cfg(target_os = "linux")]
-                if self.local_identify.send_grants.is_some() && *self.sequence == previous_sequence
-                {
-                    // Admission already recorded this generation, even if validation
-                    // failed before launch could allocate it.
-                    *self.sequence = previous_sequence.saturating_add(1);
+                if let Some(service) = &mut self.local_identify.send_grants {
+                    // This generation was charged even if validation failed before spawn.
+                    let sequence = previous_sequence.saturating_add(1);
+                    *self.sequence = sequence;
+                    service.release_first_grant_space(
+                        &entry.snapshot.key,
+                        &LaunchGeneration {
+                            daemon_instance: self.instance,
+                            sequence,
+                        },
+                    );
                 }
                 self.errors.insert(entry.snapshot.key.clone(), error);
                 Err(std::io::Error::other("child launch failed"))
@@ -8719,9 +8828,20 @@ impl<C: Clock> Daemon<C> {
     fn reserve_restart_identify(&mut self, targets: &[ShardKey]) -> Result<(), DaemonError> {
         use crate::local_identify::LocalAdmission;
         let now = self.now()?;
+        self.sequence
+            .checked_add(targets.len() as u64)
+            .ok_or(DaemonError::GenerationExhausted)?;
         let mut slots_by_bot = BTreeMap::new();
         for key in targets {
             let entry = &self.entries[key];
+            self.recovery
+                .check_replacement(entry.recovery_key, now)
+                .map_err(|reason| match reason {
+                    DegradedReason::RestartBudget => DaemonError::RestartBudget,
+                    DegradedReason::RestartWindow => DaemonError::RestartDeferred,
+                    DegradedReason::GenerationExhausted => DaemonError::GenerationExhausted,
+                    _ => DaemonError::InvalidState,
+                })?;
             if self.gateway_update_fallback_pending(&key.bot_id) {
                 return Err(DaemonError::IdentifyDeferred);
             }
@@ -8752,10 +8872,23 @@ impl<C: Clock> Daemon<C> {
             }
             return Err(error);
         }
+        #[cfg(target_os = "linux")]
+        if let Some(service) = &mut self.local_identify.send_grants
+            && !service.reserve_restart_space(targets)
+        {
+            for bot in reserved {
+                self.local_identify.release_restart(bot);
+            }
+            return Err(DaemonError::IdentifyUnavailable);
+        }
         Ok(())
     }
 
     fn release_restart_identify(&mut self, targets: &[ShardKey]) {
+        #[cfg(target_os = "linux")]
+        if let Some(service) = &mut self.local_identify.send_grants {
+            service.release_restart_space(targets);
+        }
         for key in targets {
             self.local_identify.release_restart(&key.bot_id);
         }

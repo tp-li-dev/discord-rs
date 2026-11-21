@@ -59,6 +59,38 @@ fn gateway(shard_id: u32, sequence: u64) -> Gateway {
 }
 
 #[test]
+fn other_records_cannot_consume_restart_launch_and_first_grant_space() {
+    let root = Root::new();
+    let mut budget = root.budget(BOOT, 0, 4).unwrap();
+    let replacement = gateway(0, 1);
+    let mut unrelated = gateway(0, 2);
+    unrelated.key.bot_id = "43".into();
+    budget.limit = budget.len + 2 * RECORD_SPACE;
+    assert!(budget.reserve_restart_space(std::slice::from_ref(&replacement.key)));
+    assert_eq!(budget.launch(unrelated.clone(), secs(0), 1), UNAVAILABLE);
+    assert_eq!(
+        budget.launch_with_reservation(replacement.clone(), secs(0), 1, true),
+        LocalAdmission::Granted
+    );
+    assert_eq!(
+        budget.first_grant_space.get(&replacement.key),
+        Some(&replacement.generation)
+    );
+
+    // Use the rest of the unreserved space. The first grant must still fit.
+    budget.limit = budget.len + RECORD_SPACE;
+    assert_eq!(
+        budget.identify(&unrelated, secs(0), false, false, false).0,
+        State::Unavailable
+    );
+    assert_eq!(
+        budget.identify(&replacement, secs(0), true, false, false).0,
+        State::Granted
+    );
+    assert!(budget.first_grant_space.is_empty());
+}
+
+#[test]
 fn first_send_replaces_its_launch_even_if_hello_arrives_after_another_shard() {
     let root = Root::new();
     let mut budget = root.budget(BOOT, 0, 2).unwrap();
