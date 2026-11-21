@@ -6,6 +6,9 @@ use std::{
     sync::OnceLock,
 };
 
+#[path = "fixture_manifest.rs"]
+mod fixture_manifest;
+
 /// Keep all generated files beside the running test's build artifacts. This
 /// also works with a custom CARGO_TARGET_DIR and a target-triple subdirectory.
 pub fn artifact_root() -> PathBuf {
@@ -55,39 +58,12 @@ fn build_application_worker() -> PathBuf {
         std::process::id(),
         getrandom::u64().expect("fixture binary nonce")
     );
-    let mut manifest: toml::Value = toml::from_str(
-        r#"
-[package]
-name = "hot-swap-application-fixture"
-version = "0.0.0"
-edition = "2024"
-publish = false
-[workspace]
-[dependencies]
-src = { path = "" }
-bot-framework = { path = "" }
-tokio = { version = "1", features = ["macros", "rt", "time"] }
-[[bin]]
-name = ""
-path = ""
-"#,
-    )
-    .expect("fixture manifest template");
-    manifest["dependencies"]["src"]["path"] = path_value(source_root);
-    manifest["dependencies"]["bot-framework"]["path"] = path_value(&source_root.join("framework"));
-    manifest["bin"][0]["name"] = toml::Value::String(binary_name.clone());
-    manifest["bin"][0]["path"] =
-        path_value(&source_root.join("tests/fixtures/hot_swap_handler.rs"));
-    let manifest_path = project.join("Cargo.toml");
-    std::fs::write(
-        &manifest_path,
-        toml::to_string(&manifest).expect("serialize fixture manifest"),
-    )
-    .expect("write fixture manifest");
-    // Seed resolution with the exact workspace lock, rather than selecting a
-    // newer cached dependency. Cargo only adds this test package to its copy.
-    std::fs::copy(source_root.join("Cargo.lock"), project.join("Cargo.lock"))
-        .expect("copy workspace dependency lock for fixture");
+    let manifest_path = fixture_manifest::write_fixture_project(
+        &project,
+        "hot-swap-application-fixture",
+        &binary_name,
+        "tests/fixtures/hot_swap_handler.rs",
+    );
     let target = artifact_root()
         .parent()
         .and_then(Path::parent)
@@ -116,14 +92,6 @@ path = ""
         .expect("Cargo must identify exactly one application fixture executable");
     assert!(binary.is_file(), "Cargo fixture executable is missing");
     binary
-}
-
-fn path_value(path: &Path) -> toml::Value {
-    toml::Value::String(
-        path.to_str()
-            .expect("fixture Cargo manifest path must be Unicode")
-            .to_owned(),
-    )
 }
 
 fn executable_from_messages(output: &[u8], name: &str) -> Result<PathBuf, &'static str> {
