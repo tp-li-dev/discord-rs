@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use src::build_env::{cargo_command, cargo_reload_command};
 use src::local_control::GatewayControl;
 use src::metrics::MetricsRegistry;
 use src::rbac_audit::{
@@ -561,7 +562,7 @@ async fn request(command: &str) -> Result<String, ErrorBox> {
 async fn build() -> Result<PathBuf, ErrorBox> {
     let target = root().join("target").join("reload-build");
     println!("Botをビルドしています...");
-    let result = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+    let result = Command::from(cargo_command())
         .current_dir(root())
         .args([
             "build",
@@ -572,8 +573,6 @@ async fn build() -> Result<PathBuf, ErrorBox> {
             "--target-dir",
         ])
         .arg(&target)
-        .env_remove("DISCORD_BUILD_ID")
-        .env_remove("DISCORD_TOKEN")
         .output()
         .await?;
     report_output("build", &result);
@@ -788,8 +787,10 @@ async fn core(binary: PathBuf) -> Result<(), ErrorBox> {
                 }
                 "update" => {
                     if bot.is_none() { return Err(failure(Diagnostic::BotStopped)); }
-                    let output = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into())).current_dir(root())
-                        .args(["run", "--offline", "--bin", "reload", "--", "general"]).env_remove("DISCORD_TOKEN").output().await?;
+                    let output = Command::from(cargo_reload_command())
+                        .current_dir(root())
+                        .output()
+                        .await?;
                     let reason = report_output("reload", &output);
                     if !output.status.success() { return Err(Box::new(ProtectedFailure(reason)) as ErrorBox); }
                     Ok("更新が完了しました".into())

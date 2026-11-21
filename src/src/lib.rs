@@ -1,4 +1,5 @@
 pub mod botref;
+pub mod build_env;
 pub mod cert_policy;
 pub mod child_recovery;
 pub mod cluster;
