@@ -8427,6 +8427,7 @@ fn validate_specs(specs: &[ShardRuntimeSpec]) -> Result<(), DaemonError> {
                 if !env_name(name)
                     || value.contains('\0')
                     || name.eq_ignore_ascii_case("SYSTEMROOT")
+                    || name.eq_ignore_ascii_case(crate::placement::GATEWAY_TOKEN_ENV)
                     || credential_names.contains(&name.to_ascii_uppercase())
                     || !names.insert(name.to_ascii_uppercase())
                 {
@@ -8822,7 +8823,12 @@ impl<C: Clock> Daemon<C> {
             // admission followed by a missing credential or a spawn error.
             self.sequence = sequence;
         }
-        let name = &spec.environment.credential_refs[0];
+        let [name] = spec.environment.credential_refs.as_slice() else {
+            return Err(DaemonError::InvalidSpec);
+        };
+        if !crate::placement::valid_token_env(name) {
+            return Err(DaemonError::InvalidSpec);
+        }
         // The explicit loopback simulation takes no credential, exactly like a normal launch.
         let credential = if entry.mock_discord.is_none() {
             Some(
@@ -8881,9 +8887,9 @@ impl<C: Clock> Daemon<C> {
                 .arg("--mock-discord")
                 .arg(address.to_string())
                 .env_remove("DISCORD_TOKEN")
-                .env_remove(name);
+                .env_remove(crate::placement::GATEWAY_TOKEN_ENV);
         } else if let Some(credential) = credential {
-            command.env(name, credential);
+            command.env(crate::placement::GATEWAY_TOKEN_ENV, credential);
         }
         #[cfg(target_os = "linux")]
         let grant_fd = self
@@ -9375,7 +9381,12 @@ impl<C: Clock> Daemon<C> {
         if !safe_path(Path::new(&spec.program)) {
             return Err(DaemonError::InvalidProgram);
         }
-        let name = &spec.environment.credential_refs[0];
+        let [name] = spec.environment.credential_refs.as_slice() else {
+            return Err(DaemonError::InvalidSpec);
+        };
+        if !crate::placement::valid_token_env(name) {
+            return Err(DaemonError::InvalidSpec);
+        }
         let credential = if entry.mock_discord.is_none() {
             Some(
                 credentials
@@ -9493,9 +9504,9 @@ impl<C: Clock> Daemon<C> {
                 .arg("--mock-discord")
                 .arg(address.to_string())
                 .env_remove("DISCORD_TOKEN")
-                .env_remove(name);
+                .env_remove(crate::placement::GATEWAY_TOKEN_ENV);
         } else if let Some(credential) = credential {
-            command.env(name, credential);
+            command.env(crate::placement::GATEWAY_TOKEN_ENV, credential);
         }
         // Terminal Ctrl-C must target the daemon's foreground group, not its
         // independently supervised Gateway units. This is not a service manager

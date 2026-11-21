@@ -344,11 +344,7 @@ impl GatewayOptions {
         }
         if let Some(value) = options.launch.get("--token-env") {
             let value = value.to_str().ok_or(StartupFailure::InvalidArguments)?;
-            let mut bytes = value.bytes();
-            if !bytes
-                .next()
-                .is_some_and(|b| b == b'_' || b.is_ascii_alphabetic())
-                || !bytes.all(|b| b == b'_' || b.is_ascii_alphanumeric())
+            if value != src::placement::GATEWAY_TOKEN_ENV && !src::placement::valid_token_env(value)
             {
                 return Err(StartupFailure::InvalidArguments);
             }

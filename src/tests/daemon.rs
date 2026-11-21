@@ -168,12 +168,13 @@ fn fixture_process() {
         return;
     };
     let label = std::env::var("FIXTURE_LABEL").unwrap();
-    let expected_name = format!("TOKEN_{label}");
     let expected = format!("dummy-{label}");
-    let isolated = std::env::var(&expected_name).ok().as_deref() == Some(expected.as_str())
+    let isolated = std::env::var(src::placement::GATEWAY_TOKEN_ENV)
+        .ok()
+        .as_deref()
+        == Some(expected.as_str())
         && ["TOKEN_A", "TOKEN_B"]
             .iter()
-            .filter(|n| **n != expected_name)
             .all(|n| std::env::var_os(n).is_none())
         && std::env::var_os("DISCORD_TOKEN").is_none()
         && std::env::var_os("PATH").is_none();
@@ -266,7 +267,7 @@ fn nonce_retry_placement() -> String {
     let mut text = String::from("[cluster]\nid='local'\nmode='standalone'\n[node]\nid='one'\n");
     for bot in ["101", "202"] {
         text.push_str(&format!(
-            "[[bots]]\nname='bot{bot}'\nbot_id='{bot}'\napplication_id='{bot}'\ntoken_env='FIXTURE_{bot}'\ntotal_shards=1\n[[bots.shard_placement]]\nshard_id=0\nprimary='one'\n"
+            "[[bots]]\nname='bot{bot}'\nbot_id='{bot}'\napplication_id='{bot}'\ntoken_env='FIXTURE_TOKEN_{bot}'\ntotal_shards=1\n[[bots.shard_placement]]\nshard_id=0\nprimary='one'\n"
         ));
     }
     text
@@ -1343,9 +1344,11 @@ fn main() {
     let args = args.chunks_exact(2).map(|v| (v[0].clone(), v[1].clone())).collect::<HashMap<_, _>>();
     let bot = &args["--bot-id"];
     let token_name = &args["--token-env"];
-    let token_ok = token_name == &format!("TOKEN_{bot}")
-        && std::env::var(token_name).ok().as_deref() == Some(format!("dummy-{bot}").as_str());
-    let foreign_absent = ["TOKEN_A", "TOKEN_B"].iter().filter(|n| **n != token_name)
+    let expected = format!("dummy-{bot}");
+    let token_ok = token_name == "DISCORD_RS_GATEWAY_TOKEN"
+        && std::env::var(token_name).ok().as_deref() == Some(expected.as_str())
+        && std::env::vars_os().all(|(name, value)| value != expected.as_str() || name == token_name.as_str());
+    let foreign_absent = ["TOKEN_A", "TOKEN_B"].iter()
         .all(|name| std::env::var_os(name).is_none());
     let isolated = token_ok && foreign_absent && std::env::var_os("DISCORD_TOKEN").is_none()
         && std::env::var_os("PATH").is_none();

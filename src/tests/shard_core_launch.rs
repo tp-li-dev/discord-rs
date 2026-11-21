@@ -18,7 +18,7 @@ fn spec() -> src::shard_runtime::ShardRuntimeSpec {
             bot_id: "101".into(),
             shard_id: 1,
             total_shards: 2,
-            token_env: "CORE_MUST_NOT_INHERIT_THIS".into(),
+            token_env: "CORE_MUST_NOT_INHERIT_THIS_TOKEN".into(),
         }],
         &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("unused core paths"),
     )
@@ -74,7 +74,7 @@ fn core_arguments_use_placement_identity_and_reject_tampered_specs() {
     assert!(
         !args
             .iter()
-            .any(|arg| arg == "--token-env" || arg == "CORE_MUST_NOT_INHERIT_THIS")
+            .any(|arg| arg == "--token-env" || arg == "CORE_MUST_NOT_INHERIT_THIS_TOKEN")
     );
     let mut changed = spec();
     changed.core.args[1] = "102".into();

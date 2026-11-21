@@ -2,6 +2,7 @@
 
 use src::{
     discord_message::{AttemptError, create_payload, new_nonce, single_attempt},
+    placement::valid_token_env,
     redact::install_panic_hook,
 };
 use std::{
@@ -52,12 +53,7 @@ fn parse(args: Vec<OsString>) -> Result<Plan, &'static str> {
                     .next()
                     .and_then(|value| value.into_string().ok())
                     .ok_or("invalid_token_env_name")?;
-                let mut bytes = name.bytes();
-                if !bytes
-                    .next()
-                    .is_some_and(|b| b == b'_' || b.is_ascii_alphabetic())
-                    || !bytes.all(|b| b == b'_' || b.is_ascii_alphanumeric())
-                {
+                if !valid_token_env(&name) {
                     return Err("invalid_token_env_name");
                 }
                 token_env = Some(name);
@@ -272,6 +268,22 @@ async fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probe_rejects_process_environment_names_before_reading_credentials() {
+        for name in [
+            "LD_PRELOAD",
+            "LD_CUSTOM_TOKEN",
+            "NODE_OPTIONS",
+            "PYTHON_TOKEN",
+        ] {
+            let args = ["--token-env", name, "--channel-id", "1", "--yes-post"];
+            assert!(matches!(
+                parse(args.into_iter().map(OsString::from).collect()),
+                Err("invalid_token_env_name")
+            ));
+        }
+    }
 
     #[test]
     fn posting_requires_explicit_consent() {

@@ -152,7 +152,7 @@ mod linux {
                 bot_id: key().bot_id,
                 shard_id: 0,
                 total_shards: 1,
-                token_env: "GRANT_FIXTURE_UNUSED".into(),
+                token_env: "GRANT_FIXTURE_TOKEN_UNUSED".into(),
             }],
             &root.0,
         )

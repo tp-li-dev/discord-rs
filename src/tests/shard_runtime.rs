@@ -94,7 +94,10 @@ fn multiple_bots_and_shards_keep_credentials_and_paths_separate() {
             "B_TOKEN"
         };
         assert_eq!(spec.gateway.environment.credential_refs, [token]);
-        assert_eq!(argument(&spec.gateway.args, "--token-env"), token);
+        assert_eq!(
+            argument(&spec.gateway.args, "--token-env"),
+            src::placement::GATEWAY_TOKEN_ENV
+        );
         assert!(
             !spec
                 .core
